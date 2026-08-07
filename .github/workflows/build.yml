@@ -1,4 +1,4 @@
-name: Build ChessHelper v3.1 Stealth
+name: Build ChessHelper v3.2
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "3.1.0"
-              CURRENT_PROJECT_VERSION: "31"
+              MARKETING_VERSION: "3.2.0"
+              CURRENT_PROJECT_VERSION: "32"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -150,7 +150,7 @@ jobs:
               ]
               static func randomUserAgent() -> String { userAgents.randomElement()! }
               static func trafficJitter() -> UInt64 { UInt64.random(in: 200_000_000...800_000_000) }
-              static func readerInterval() -> Int { Int.random(in: 400...900) }
+              static func readerInterval() -> Int { Int.random(in: 600...1200) }
               private static func randomName(prefix: String, length: Int) -> String {
                   let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
                   return prefix + String((0..<length).map { _ in chars.randomElement()! })
@@ -187,12 +187,7 @@ jobs:
               let depth: Int
           }
 
-          /// Uses stockfish.online — chess.com cannot see this traffic.
-          /// For top-N, we call the API multiple times, each time excluding
-          /// previously-found best moves (iterative exclusion / poor man's MultiPV).
           enum EngineService {
-
-              /// Single call to stockfish.online
               private static func callOnce(fen: String, depth: Int,
                                            excludeMoves: [String] = []) async throws -> (uci: String, cp: Int?, mate: Int?, depth: Int)? {
                   try? await Task.sleep(nanoseconds: StealthConfig.trafficJitter())
@@ -201,7 +196,6 @@ jobs:
                       URLQueryItem(name: "fen", value: fen),
                       URLQueryItem(name: "depth", value: "\(min(max(depth, 8), 15))")
                   ]
-                  // Some endpoints support 'exclude' — we send it as a courtesy
                   if !excludeMoves.isEmpty {
                       items.append(URLQueryItem(name: "exclude", value: excludeMoves.joined(separator: ",")))
                   }
@@ -213,7 +207,6 @@ jobs:
                   req.timeoutInterval = 12
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
                   req.setValue("https://lichess.org/", forHTTPHeaderField: "Referer")
-
                   let (data, resp) = try await URLSession.shared.data(for: req)
                   guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                       throw NSError(domain: "EngineService", code: -2, userInfo: [NSLocalizedDescriptionKey: "HTTP error"])
@@ -221,8 +214,6 @@ jobs:
                   guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                       throw NSError(domain: "EngineService", code: -3, userInfo: [NSLocalizedDescriptionKey: "Bad JSON"])
                   }
-
-                  // stockfish.online returns "bestmove b b7b5 ponder ..." format
                   let bestMoveField = (json["bestmove"] as? String) ?? ""
                   let parts = bestMoveField.split(separator: " ").map(String.init)
                   var uci = ""
@@ -231,9 +222,7 @@ jobs:
                   }
                   if uci.isEmpty { uci = parts.first ?? "" }
                   guard !uci.isEmpty else { return nil }
-                  // Skip if this move was in excludeMoves (some servers ignore the param)
                   if excludeMoves.contains(uci) { return nil }
-
                   let evalDouble = json["evaluation"] as? Double
                   let mate = json["mate"] as? Int
                   let cp: Int? = evalDouble.map { Int(($0 * 100).rounded()) }
@@ -241,49 +230,34 @@ jobs:
                   return (uci: uci, cp: cp, mate: (mate == 0 ? nil : mate), depth: d)
               }
 
-              /// Iterative exclusion: call API up to `variants` times, each time
-              /// excluding previously-found best moves. This gives real top-N.
               static func analyze(fen: String, depth: Int = 13, variants: Int = 3) async throws -> EngineAnalysis {
                   var moves: [TopMove] = []
                   var excluded: [String] = []
                   var lastDepth = depth
                   let target = max(1, min(variants, 5))
-
                   for rank in 1...target {
                       do {
                           if let result = try await callOnce(fen: fen, depth: depth, excludeMoves: excluded) {
-                              // Guard against duplicates
                               if excluded.contains(result.uci) { break }
                               moves.append(TopMove(
-                                  rank: rank,
-                                  uci: result.uci,
-                                  san: result.uci,
-                                  evaluationCp: result.cp,
-                                  mateIn: result.mate,
-                                  depth: result.depth
+                                  rank: rank, uci: result.uci, san: result.uci,
+                                  evaluationCp: result.cp, mateIn: result.mate, depth: result.depth
                               ))
                               excluded.append(result.uci)
                               lastDepth = result.depth
-                          } else {
-                              break
-                          }
+                          } else { break }
                       } catch {
-                          // If first call fails, throw. If later calls fail, just return what we have.
                           if rank == 1 { throw error } else { break }
                       }
                   }
-
                   return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: lastDepth)
               }
 
-              /// Decoy request to obfuscate traffic patterns
               static func fireDecoyRequest() async {
                   let decoyFens = [
                       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
                       "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
                       "rnbqkb1r/pppp1ppp/5n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
-                      "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
-                      "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
                   ]
                   guard let fen = decoyFens.randomElement() else { return }
                   _ = try? await callOnce(fen: fen, depth: 10)
@@ -302,11 +276,10 @@ jobs:
               @Published var minimalMode = false
               @Published var isBeingRecorded = false
               @Published var lastHideReason = ""
-              @Published var lastActivity: Date = Date()
               private var cancellables = Set<AnyCancellable>()
-              private var idleTimer: Timer?
 
               init() {
+                  // Screen recording safety
                   NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)
                       .sink { [weak self] _ in
                           guard let self = self else { return }
@@ -314,36 +287,24 @@ jobs:
                           self.isBeingRecorded = c
                           if c { self.hide(reason: "screen recording") }
                       }.store(in: &cancellables)
-                  NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)
-                      .sink { [weak self] _ in self?.hide(reason: "backgrounded") }
-                      .store(in: &cancellables)
+                  // Screenshot safety
                   NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)
                       .sink { [weak self] _ in self?.hide(reason: "screenshot") }
                       .store(in: &cancellables)
+                  // Shake = ONLY toggle
                   NotificationCenter.default.publisher(for: .stealthPanic)
                       .sink { [weak self] _ in self?.toggleOverlay() }
                       .store(in: &cancellables)
                   isBeingRecorded = UIScreen.main.isCaptured
-                  if isBeingRecorded { hide(reason: "screen recording") }
-                  idleTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-                      Task { @MainActor in self?.checkIdle() }
-                  }
               }
-              private func checkIdle() {
-                  // 5 minutes idle → hide (long enough for real thinking)
-                  if overlayVisible && Date().timeIntervalSince(lastActivity) > 300 {
-                      hide(reason: "idle 5min")
-                  }
-              }
-              func recordActivity() { lastActivity = Date() }
+
               func toggleOverlay() {
                   overlayVisible.toggle()
-                  lastHideReason = overlayVisible ? "" : "panic"
-                  if overlayVisible { recordActivity() }
+                  lastHideReason = overlayVisible ? "" : "shake"
               }
               func hide(reason: String) { overlayVisible = false; lastHideReason = reason }
-              func show() { overlayVisible = true; lastHideReason = ""; recordActivity() }
-              func toggleMinimalMode() { minimalMode.toggle(); recordActivity() }
+              func show() { overlayVisible = true; lastHideReason = "" }
+              func toggleMinimalMode() { minimalMode.toggle() }
           }
 
           extension UIWindow {
@@ -356,33 +317,6 @@ jobs:
           }
           extension Notification.Name {
               static let stealthPanic = Notification.Name("StealthPanicGesture")
-          }
-
-          struct ThreeFingerCatcher: UIViewRepresentable {
-              let action: () -> Void
-              func makeUIView(context: Context) -> UIView {
-                  let v = UIView()
-                  let tap = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.tapped))
-                  tap.numberOfTouchesRequired = 3
-                  tap.cancelsTouchesInView = false
-                  v.addGestureRecognizer(tap)
-                  v.isUserInteractionEnabled = true
-                  v.backgroundColor = .clear
-                  return v
-              }
-              func updateUIView(_ v: UIView, context: Context) {}
-              func makeCoordinator() -> Coordinator { Coordinator(action: action) }
-              final class Coordinator: NSObject {
-                  let action: () -> Void
-                  init(action: @escaping () -> Void) { self.action = action }
-                  @objc func tapped() { action() }
-              }
-          }
-          extension View {
-              func onThreeFingerPanic(_ action: @escaping () -> Void) -> some View {
-                  overlay(ThreeFingerCatcher(action: action).allowsHitTesting(true)
-                          .frame(maxWidth: .infinity, maxHeight: .infinity).opacity(0.001))
-              }
           }
           '''
 
@@ -403,23 +337,20 @@ jobs:
                               Stepper(value: $engineVariants, in: 1...5) {
                                   LabeledContent("Top moves", value: "\(engineVariants)")
                               }
-                              Text("Top moves = separate API calls (iterative exclusion). More = slower.")
-                                  .font(.caption).foregroundColor(.secondary)
                           }
-                          Section("Stealth (v3.1)") {
+                          Section("Stealth (v3.2)") {
                               Toggle("Decoy API requests", isOn: $decoyRequests)
                               Text("Session bridge: \(String(StealthConfig.bridgeName.prefix(8)))…")
                                   .font(.caption.monospaced()).foregroundColor(.secondary)
                           }
-                          Section("Panic gestures (always on)") {
-                              Label("Shake to hide/show", systemImage: "iphone.gen3.radiowaves.left.and.right")
-                              Label("3-finger tap to hide/show", systemImage: "hand.tap.fill")
+                          Section("Panic gesture (ONLY way to hide)") {
+                              Label("Shake to hide / show", systemImage: "iphone.gen3.radiowaves.left.and.right")
+                              Text("Overlay stays visible always. Shake phone to toggle.")
+                                  .font(.caption).foregroundColor(.secondary)
                           }
-                          Section("Auto-hide (always on)") {
-                              Label("On background", systemImage: "iphone.slash")
+                          Section("Safety auto-hide (unavoidable)") {
                               Label("On screen recording", systemImage: "record.circle")
                               Label("On screenshot", systemImage: "camera.viewfinder")
-                              Label("After 5 min idle", systemImage: "clock.arrow.circlepath")
                               Toggle("Minimal mode (tiny dot)", isOn: $stealth.minimalMode)
                           }
                           Section("Status") {
@@ -432,7 +363,7 @@ jobs:
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "3.1.0 (31)")
+                              LabeledContent("Version", value: "3.2.0 (32)")
                               LabeledContent("Engine", value: "Stockfish (stockfish.online)")
                           }
                       }
@@ -513,9 +444,6 @@ jobs:
                   lastMoveUCI = p.lastMoveUCI
                   plyCount = p.plyCount
                   confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  // TRUST the board detection when confident.
-                  // If the auto-detected color disagrees with the manual override,
-                  // clear the manual override — the board doesn't lie.
                   if p.flippedConfident {
                       let detected = p.flipped ? "b" : "w"
                       detectedPlayerColor = detected
@@ -681,7 +609,7 @@ jobs:
                   HStack(spacing: 8) {
                       btn("house.fill", "Home") { router.openInPlay("https://www.chess.com/") }
                       btn("globe", "Online") { router.openInPlay("https://www.chess.com/play/online/new") }
-                      btn("cpu", "Bots") { router.openInPlay("https://www.chess.com/play/computer") }
+                      btn("cpu", "Bots") { router.openInPlay("https://www.chess.com/play/computer/bots") }
                       btn("puzzlepiece.fill", "Puzzles") { router.openInPlay("https://www.chess.com/puzzles") }
                       btn("chart.line.uptrend.xyaxis", "Analysis") { router.openInPlay("https://www.chess.com/analysis") }
                   }
@@ -704,8 +632,8 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v3.1").font(.title2.bold())
-                      Text("STEALTH MODE\n\n• Top-3 moves (iterative exclusion)\n• stockfish.online engine\n• Random JS bridge names\n• Decoy API requests\n• Panic: shake or 3-finger tap\n• Auto-hide on record/screenshot/background\n• Auto-hide after 5 min idle\n\nYou play at your own pace.\nUse responsibly.")
+                      Text("Chess Helper v3.2").font(.title2.bold())
+                      Text("STEALTH MODE\n\n• Top-3 moves (iterative exclusion)\n• stockfish.online engine\n• Overlay stays visible always\n• SHAKE phone to hide/show\n• Auto-hide on screenshot/recording only\n\nMinimal ad-block for smooth Bots page.\nUse responsibly.")
                           .font(.footnote).foregroundColor(.white.opacity(0.85))
                           .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -730,20 +658,20 @@ jobs:
                       if stealth.overlayVisible {
                           if stealth.minimalMode { dot } else { panel }
                       } else {
-                          // Hidden state: subtle but tappable reveal dot
+                          // Big obvious button to bring overlay back
                           Button { stealth.show() } label: {
-                              Circle().fill(Color.green.opacity(0.4))
-                                  .frame(width: 30, height: 30)
-                                  .overlay(
-                                      Image(systemName: "eye.fill")
-                                          .font(.caption).foregroundColor(.white.opacity(0.9))
-                                  )
-                                  .shadow(color: .black.opacity(0.5), radius: 4)
+                              HStack(spacing: 6) {
+                                  Image(systemName: "eye.fill").font(.body)
+                                  Text("Show Helper").font(.footnote.bold())
+                              }
+                              .padding(.horizontal, 14).padding(.vertical, 10)
+                              .background(Color.green)
+                              .foregroundColor(.white)
+                              .cornerRadius(20)
+                              .shadow(color: .black.opacity(0.5), radius: 6, y: 2)
                           }
                       }
                   }
-                  .onThreeFingerPanic { stealth.toggleOverlay() }
-                  .onTapGesture { stealth.recordActivity() }
               }
               private var dot: some View {
                   Button { stealth.toggleMinimalMode() } label: {
@@ -779,9 +707,6 @@ jobs:
                       Spacer()
                       Button { stealth.toggleMinimalMode() } label: {
                           Image(systemName: stealth.minimalMode ? "eye.slash.fill" : "eye.fill").font(.footnote)
-                      }
-                      Button { stealth.hide(reason: "manual") } label: {
-                          Image(systemName: "xmark.circle.fill").font(.footnote).foregroundColor(.red.opacity(0.7))
                       }
                       Toggle("", isOn: $engine.enabled).labelsHidden().scaleEffect(0.8)
                       Button { withAnimation { expanded.toggle() } } label: {
@@ -840,7 +765,6 @@ jobs:
                           ForEach(Array(engine.topMoves.enumerated()), id: \.element.id) { idx, m in
                               moveRow(rank: idx + 1, move: m, isSelected: selectedMoveIdx == idx)
                                   .onTapGesture {
-                                      stealth.recordActivity()
                                       selectedMoveIdx = (selectedMoveIdx == idx) ? nil : idx
                                   }
                           }
@@ -1023,8 +947,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>3.1.0</string>
-            <key>CFBundleVersion</key><string>31</string>
+            <key>CFBundleShortVersionString</key><string>3.2.0</string>
+            <key>CFBundleVersion</key><string>32</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -1038,7 +962,7 @@ jobs:
           </plist>
           EOF
 
-      - name: Write reader.js
+      - name: Write reader.js (throttled MutationObserver for Bots page)
         run: |
           cat > Resources/reader.js <<'EOF'
           (function(){
@@ -1086,7 +1010,6 @@ jobs:
               var o=b.getAttribute('orientation');
               if(o==='black'){flipped=true;confident=true;}
               if(o==='white'){flipped=false;confident=true;}
-              // STRONGEST signal: white king row position
               if(grid){
                 var wkRow=-1;
                 for(var r=0;r<8;r++){ for(var c=0;c<8;c++){ if(grid[r][c]==='K'){wkRow=r;break;} } if(wkRow>=0)break; }
@@ -1145,24 +1068,36 @@ jobs:
               },
               enumerable: false, writable: false, configurable: false
             });
+            // THROTTLED MutationObserver — was calling tick() on every mutation which
+            // slowed down heavy pages like Bots. Now max 1 tick per 800ms.
+            var lastMutTick = 0;
             try {
-              var mo = new MutationObserver(function(){ try{ tick(); }catch(e){} });
-              mo.observe(document.documentElement, {childList:true, subtree:true, attributes:true});
+              var mo = new MutationObserver(function(){
+                var now = Date.now();
+                if (now - lastMutTick < 800) return;
+                lastMutTick = now;
+                try{ tick(); }catch(e){}
+              });
+              mo.observe(document.documentElement, {childList:true, subtree:true});
             } catch(e){}
-            setTimeout(function(){ try{ window['__START_FUNC__'](); }catch(e){} }, 300 + Math.floor(Math.random()*400));
+            setTimeout(function(){ try{ window['__START_FUNC__'](); }catch(e){} }, 500 + Math.floor(Math.random()*500));
           })();
           EOF
 
-      - name: Write adblock_css.css
+      - name: Write adblock_css.css (MINIMAL — only real ads, keeps Bots page working)
         run: |
           cat > Resources/adblock_css.css <<'EOF'
-          [id*="google_ads"],[id^="div-gpt-ad"],iframe[src*="doubleclick"],iframe[src*="googlesyndication"],
-          ins.adsbygoogle,.ad-container,.ad-slot,.ads,.ad,.advertisement,.house-ad,.google-ad,
-          .diamond-membership-modal,[data-ad-slot],[data-ad-unit],.cookie-banner-component,
-          .cookie-consent,#onetrust-banner-sdk,.notifications-component,.upgrade-banner,
-          .upsell-banner,.membership-billing-banner,.trial-cta,.diamond-upgrade,.premium-upgrade,
-          .sidebar-ad,.leaderboard-ad,.right-rail-ad,.top-banner-component,.header-notification,.marketing-banner
-          {display:none!important;height:0!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important;}
+          /* Minimal ad blocker — only kill obvious ad iframes and cookie banners.
+             Do NOT hide layout containers because that breaks Bots + Play pages. */
+          iframe[src*="doubleclick.net"],
+          iframe[src*="googlesyndication"],
+          ins.adsbygoogle,
+          [id^="div-gpt-ad"],
+          #onetrust-banner-sdk,
+          .cookie-banner-component,
+          .cookie-consent {
+            display: none !important;
+          }
           EOF
 
       - name: Show file tree
