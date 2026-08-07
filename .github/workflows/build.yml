@@ -12,7 +12,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -30,10 +30,6 @@ jobs:
             bundleIdPrefix: com.chesshelper
             deploymentTarget: { iOS: "16.0" }
             createIntermediateGroups: true
-          packages:
-            Stockfish:
-              url: https://github.com/AndrewNKane/StockfishChessEngine
-              branch: main
           settings:
             base:
               MARKETING_VERSION: "2.0.0"
@@ -46,9 +42,6 @@ jobs:
               type: application
               platform: iOS
               sources: [ { path: Sources }, { path: Resources } ]
-              dependencies:
-                - package: Stockfish
-                  product: StockfishChessEngine
               info:
                 path: Resources/Info.plist
                 properties:
@@ -76,10 +69,9 @@ jobs:
         shell: bash
         run: |
           python3 <<'PYEOF'
-          import os, base64
+          import os, textwrap
           files = {}
 
-          # ============ ChessHelperApp.swift ============
           files["Sources/ChessHelperApp.swift"] = r'''
           import SwiftUI
           @main
@@ -90,7 +82,6 @@ jobs:
           }
           '''
 
-          # ============ AppRouter.swift ============
           files["Sources/AppRouter.swift"] = r'''
           import SwiftUI
           @MainActor
@@ -104,7 +95,6 @@ jobs:
           }
           '''
 
-          # ============ ContentView.swift ============
           files["Sources/ContentView.swift"] = r'''
           import SwiftUI
           struct ContentView: View {
@@ -127,7 +117,6 @@ jobs:
                           .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
                   }
                   .tint(.green)
-                  .task { await StockfishEngine.shared.start() }
               }
           }
           struct SimpleTabView: View {
@@ -137,7 +126,7 @@ jobs:
                       VStack(spacing: 20) {
                           Image(systemName: icon).font(.system(size: 60)).foregroundColor(.green)
                           Text(title).font(.largeTitle.bold())
-                          Text("Coming soon in v2.1").foregroundColor(.secondary)
+                          Text("Coming in v2.1").foregroundColor(.secondary)
                       }
                       .navigationTitle(title)
                   }
@@ -145,10 +134,8 @@ jobs:
           }
           '''
 
-          # ============ StockfishEngine.swift ============
-          files["Sources/StockfishEngine.swift"] = r'''
+          files["Sources/EngineService.swift"] = r'''
           import Foundation
-          import StockfishChessEngine
 
           struct TopMove: Identifiable, Equatable {
               let id = UUID()
@@ -176,98 +163,66 @@ jobs:
               let depth: Int
           }
 
-          @MainActor
-          final class StockfishEngine {
-              static let shared = StockfishEngine()
-              private let sf = StockfishChessEngine.Stockfish()
-              private var isReady = false
-              private var currentContinuation: CheckedContinuation<EngineAnalysis, Error>?
-              private var buckets: [Int:(uci: String, cp: Int?, mate: Int?, depth: Int)] = [:]
-              private var currentDepth = 0
-
-              private init() {}
-
-              func start() async {
-                  guard !isReady else { return }
-                  sf.setResponseHandler { [weak self] line in
-                      Task { @MainActor in self?.handleLine(line) }
+          /// Uses stockfish.online free public API (no key, no chess.com traffic).
+          /// Only external endpoint used by the app; nothing goes to chess.com.
+          enum EngineService {
+              static func analyze(fen: String, depth: Int = 15) async throws -> EngineAnalysis {
+                  var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
+                  comps.queryItems = [
+                      URLQueryItem(name: "fen", value: fen),
+                      URLQueryItem(name: "depth", value: "\(min(depth, 15))")
+                  ]
+                  guard let url = comps.url else {
+                      throw NSError(domain: "EngineService", code: -1,
+                                    userInfo: [NSLocalizedDescriptionKey: "Bad URL"])
                   }
-                  sf.start()
-                  send("uci")
-                  send("setoption name Threads value 3")
-                  send("setoption name Hash value 64")
-                  send("setoption name MultiPV value 3")
-                  send("isready")
-                  isReady = true
-              }
+                  var req = URLRequest(url: url)
+                  req.timeoutInterval = 10
+                  req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
 
-              func stop() { send("stop") }
-
-              func analyze(fen: String, multiPV: Int = 3, depth: Int = 20, movetime: Int = 2000) async throws -> EngineAnalysis {
-                  if !isReady { await start() }
-                  if let c = currentContinuation { currentContinuation = nil; c.resume(throwing: CancellationError()) }
-                  buckets.removeAll()
-                  currentDepth = 0
-                  send("stop")
-                  send("setoption name MultiPV value \(multiPV)")
-                  send("position fen \(fen)")
-                  send("go depth \(depth) movetime \(movetime)")
-                  return try await withCheckedThrowingContinuation { cont in
-                      self.currentContinuation = cont
+                  let (data, resp) = try await URLSession.shared.data(for: req)
+                  guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                      throw NSError(domain: "EngineService", code: -2,
+                                    userInfo: [NSLocalizedDescriptionKey: "Bad response"])
                   }
-              }
-
-              private func send(_ cmd: String) { sf.sendCommand(command: cmd) }
-
-              private func handleLine(_ raw: String) {
-                  let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                  if line.hasPrefix("info ") { parseInfo(line) }
-                  else if line.hasPrefix("bestmove ") { finalize() }
-              }
-
-              private func parseInfo(_ line: String) {
-                  let parts = line.split(separator: " ").map(String.init)
-                  var pv = 1, depth = 0, cp: Int? = nil, mate: Int? = nil, firstMove = ""
-                  var i = 0
-                  while i < parts.count {
-                      let t = parts[i]
-                      switch t {
-                      case "depth":
-                          if i+1 < parts.count, let d = Int(parts[i+1]) { depth = d; i += 2; continue }
-                      case "multipv":
-                          if i+1 < parts.count, let m = Int(parts[i+1]) { pv = m; i += 2; continue }
-                      case "score":
-                          if i+2 < parts.count, let v = Int(parts[i+2]) {
-                              if parts[i+1] == "cp" { cp = v } else if parts[i+1] == "mate" { mate = v }
-                              i += 3; continue
-                          }
-                      case "pv":
-                          if i+1 < parts.count { firstMove = parts[i+1] }
-                          i = parts.count; continue
-                      default: break
-                      }
-                      i += 1
+                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                      throw NSError(domain: "EngineService", code: -3,
+                                    userInfo: [NSLocalizedDescriptionKey: "Bad JSON"])
                   }
-                  currentDepth = max(currentDepth, depth)
-                  if !firstMove.isEmpty {
-                      buckets[pv] = (uci: firstMove, cp: cp, mate: mate, depth: depth)
-                  }
-              }
 
-              private func finalize() {
-                  guard let cont = currentContinuation else { return }
-                  currentContinuation = nil
-                  let sorted = buckets.sorted { $0.key < $1.key }
-                  let moves: [TopMove] = sorted.enumerated().map { (idx, kv) in
-                      TopMove(rank: idx+1, uci: kv.value.uci, san: kv.value.uci,
-                              evaluationCp: kv.value.cp, mateIn: kv.value.mate, depth: kv.value.depth)
+                  let bestmoveField = (json["bestmove"] as? String) ?? ""
+                  let evalCp = json["evaluation"] as? Double
+                  let mate = json["mate"] as? Int
+                  let continuation = (json["continuation"] as? String) ?? ""
+
+                  var bestUci = ""
+                  let parts = bestmoveField.split(separator: " ").map(String.init)
+                  for (i, p) in parts.enumerated() where p == "bestmove" && i + 1 < parts.count {
+                      bestUci = parts[i+1]
+                      break
                   }
-                  cont.resume(returning: EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: currentDepth))
+                  if bestUci.isEmpty { bestUci = parts.first ?? "" }
+
+                  var moves: [TopMove] = []
+                  if !bestUci.isEmpty {
+                      let cpInt = evalCp.map { Int(($0 * 100).rounded()) }
+                      moves.append(TopMove(rank: 1, uci: bestUci, san: bestUci,
+                                           evaluationCp: cpInt, mateIn: mate, depth: depth))
+                  }
+
+                  // Add secondary options from continuation line
+                  let contMoves = continuation.split(separator: " ").map(String.init)
+                  for (idx, mv) in contMoves.prefix(2).enumerated() where !mv.isEmpty && mv != bestUci {
+                      moves.append(TopMove(rank: idx + 2, uci: mv, san: mv,
+                                           evaluationCp: nil, mateIn: nil, depth: depth))
+                      if moves.count >= 3 { break }
+                  }
+
+                  return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: depth)
               }
           }
           '''
 
-          # ============ StealthManager.swift ============
           files["Sources/StealthManager.swift"] = r'''
           import SwiftUI
           import UIKit
@@ -352,27 +307,20 @@ jobs:
           }
           '''
 
-          # ============ SettingsView.swift ============
           files["Sources/SettingsView.swift"] = r'''
           import SwiftUI
           struct SettingsView: View {
               @ObservedObject var stealth: StealthManager
-              @AppStorage("engineDepth")    private var engineDepth = 20
-              @AppStorage("engineMovetime") private var engineMovetime = 2000
-              @AppStorage("multiPV")        private var multiPV = 3
+              @AppStorage("engineDepth") private var engineDepth = 15
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine — Stockfish 16 (on-device)") {
-                              Stepper(value: $engineDepth, in: 10...25) {
+                          Section("Engine — stockfish.online API") {
+                              Stepper(value: $engineDepth, in: 8...15) {
                                   LabeledContent("Depth", value: "\(engineDepth)")
                               }
-                              Stepper(value: $engineMovetime, in: 500...5000, step: 250) {
-                                  LabeledContent("Max think", value: "\(engineMovetime) ms")
-                              }
-                              Stepper(value: $multiPV, in: 1...5) {
-                                  LabeledContent("Top moves", value: "\(multiPV)")
-                              }
+                              Text("Depth 15 ≈ ~2500 Elo. Requires internet.")
+                                  .font(.caption).foregroundColor(.secondary)
                           }
                           Section("Stealth — Panic gestures (always on)") {
                               Label("Shake to hide", systemImage: "iphone.gen3.radiowaves.left.and.right")
@@ -397,14 +345,14 @@ jobs:
                               HStack {
                                   Image(systemName: "lock.shield.fill").foregroundColor(.green)
                                   VStack(alignment: .leading) {
-                                      Text("Zero external requests").bold()
-                                      Text("100% on-device analysis").font(.caption).foregroundColor(.secondary)
+                                      Text("Zero chess.com API requests").bold()
+                                      Text("Engine calls go only to stockfish.online").font(.caption).foregroundColor(.secondary)
                                   }
                               }
                           }
                           Section("About") {
                               LabeledContent("Version", value: "2.0.0 (20)")
-                              LabeledContent("Engine", value: "Stockfish 16")
+                              LabeledContent("Engine", value: "Stockfish (online)")
                           }
                       }
                       .navigationTitle("Settings")
@@ -413,7 +361,6 @@ jobs:
           }
           '''
 
-          # ============ LocalOpeningBook.swift ============
           files["Sources/LocalOpeningBook.swift"] = r'''
           import Foundation
           enum LocalOpeningBook {
@@ -447,7 +394,6 @@ jobs:
           }
           '''
 
-          # ============ EngineViewModel.swift ============
           files["Sources/EngineViewModel.swift"] = r'''
           import Foundation
           import SwiftUI
@@ -530,7 +476,7 @@ jobs:
               private func queueAnalyze(fen: String, immediate: Bool = false) {
                   debounceTask?.cancel()
                   debounceTask = Task { [weak self] in
-                      if !immediate { try? await Task.sleep(nanoseconds: 300_000_000) }
+                      if !immediate { try? await Task.sleep(nanoseconds: 400_000_000) }
                       if Task.isCancelled { return }
                       await self?.run(fen: fen)
                   }
@@ -542,14 +488,12 @@ jobs:
                   analysisTask?.cancel()
                   isThinking = true
                   errorMessage = ""
-                  let ud = UserDefaults.standard
-                  let d = ud.integer(forKey: "engineDepth") > 0 ? ud.integer(forKey: "engineDepth") : 20
-                  let mt = ud.integer(forKey: "engineMovetime") > 0 ? ud.integer(forKey: "engineMovetime") : 2000
-                  let mp = ud.integer(forKey: "multiPV") > 0 ? ud.integer(forKey: "multiPV") : 3
+                  let d = UserDefaults.standard.integer(forKey: "engineDepth") > 0
+                      ? UserDefaults.standard.integer(forKey: "engineDepth") : 15
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
-                          let a = try await StockfishEngine.shared.analyze(fen: fen, multiPV: mp, depth: d, movetime: mt)
+                          let a = try await EngineService.analyze(fen: fen, depth: d)
                           if Task.isCancelled { return }
                           await MainActor.run {
                               self.topMoves = a.topMoves
@@ -629,7 +573,6 @@ jobs:
           }
           '''
 
-          # ============ PlayView.swift ============
           files["Sources/PlayView.swift"] = r'''
           import SwiftUI
           struct PlayView: View {
@@ -692,7 +635,6 @@ jobs:
           }
           '''
 
-          # ============ HelperOverlay.swift ============
           files["Sources/HelperOverlay.swift"] = r'''
           import SwiftUI
           struct HelperOverlay: View {
@@ -880,7 +822,6 @@ jobs:
           }
           '''
 
-          # ============ ChessWebView.swift ============
           files["Sources/ChessWebView.swift"] = r'''
           import SwiftUI
           import WebKit
@@ -966,15 +907,12 @@ jobs:
           }
           '''
 
-          # Write all Swift files, stripping leading indent from raw strings
-          import textwrap
           for path, content in files.items():
               content = textwrap.dedent(content).strip() + "\n"
               os.makedirs(os.path.dirname(path), exist_ok=True)
-              with open(path, "w") as f:
-                  f.write(content)
-              print(f"  ✅ {path} ({len(content)} bytes)")
-          print(f"\nWrote {len(files)} Swift files")
+              with open(path, "w") as f: f.write(content)
+              print(f"  ✅ {path}")
+          print(f"\nWrote {len(files)} files")
           PYEOF
 
       - name: Write Info.plist
@@ -1083,11 +1021,6 @@ jobs:
 
       - name: Generate Xcode project
         run: xcodegen generate
-
-      - name: Resolve Swift packages
-        run: |
-          xcodebuild -resolvePackageDependencies \
-            -project ChessHelper.xcodeproj -scheme ChessHelper
 
       - name: Build unsigned .app
         run: |
