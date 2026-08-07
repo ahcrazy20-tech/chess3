@@ -1,4 +1,4 @@
-name: Build ChessHelper v2
+name: Build ChessHelper v2.1
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "2.0.0"
-              CURRENT_PROJECT_VERSION: "20"
+              MARKETING_VERSION: "2.1.0"
+              CURRENT_PROJECT_VERSION: "21"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -126,7 +126,7 @@ jobs:
                       VStack(spacing: 20) {
                           Image(systemName: icon).font(.system(size: 60)).foregroundColor(.green)
                           Text(title).font(.largeTitle.bold())
-                          Text("Coming in v2.1").foregroundColor(.secondary)
+                          Text("Coming in v2.2").foregroundColor(.secondary)
                       }
                       .navigationTitle(title)
                   }
@@ -163,62 +163,72 @@ jobs:
               let depth: Int
           }
 
-          /// Uses stockfish.online free public API (no key, no chess.com traffic).
-          /// Only external endpoint used by the app; nothing goes to chess.com.
+          /// Uses chess-api.com free public API — returns real top-N via MultiPV variants.
+          /// Chess.com CANNOT see this traffic (different domain, encrypted).
           enum EngineService {
-              static func analyze(fen: String, depth: Int = 15) async throws -> EngineAnalysis {
-                  var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
-                  comps.queryItems = [
-                      URLQueryItem(name: "fen", value: fen),
-                      URLQueryItem(name: "depth", value: "\(min(depth, 15))")
-                  ]
-                  guard let url = comps.url else {
+              static func analyze(fen: String, depth: Int = 13, variants: Int = 3) async throws -> EngineAnalysis {
+                  guard let url = URL(string: "https://chess-api.com/v1") else {
                       throw NSError(domain: "EngineService", code: -1,
                                     userInfo: [NSLocalizedDescriptionKey: "Bad URL"])
                   }
                   var req = URLRequest(url: url)
-                  req.timeoutInterval = 10
-                  req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+                  req.httpMethod = "POST"
+                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  req.timeoutInterval = 12
+                  let body: [String: Any] = [
+                      "fen": fen,
+                      "depth": min(depth, 18),
+                      "variants": max(1, min(variants, 5)),
+                      "maxThinkingTime": 50
+                  ]
+                  req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
                   let (data, resp) = try await URLSession.shared.data(for: req)
                   guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                       throw NSError(domain: "EngineService", code: -2,
-                                    userInfo: [NSLocalizedDescriptionKey: "Bad response"])
+                                    userInfo: [NSLocalizedDescriptionKey: "HTTP error"])
                   }
                   guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                       throw NSError(domain: "EngineService", code: -3,
                                     userInfo: [NSLocalizedDescriptionKey: "Bad JSON"])
                   }
 
-                  let bestmoveField = (json["bestmove"] as? String) ?? ""
-                  let evalCp = json["evaluation"] as? Double
-                  let mate = json["mate"] as? Int
-                  let continuation = (json["continuation"] as? String) ?? ""
-
-                  var bestUci = ""
-                  let parts = bestmoveField.split(separator: " ").map(String.init)
-                  for (i, p) in parts.enumerated() where p == "bestmove" && i + 1 < parts.count {
-                      bestUci = parts[i+1]
-                      break
-                  }
-                  if bestUci.isEmpty { bestUci = parts.first ?? "" }
-
+                  let d = (json["depth"] as? Int) ?? depth
                   var moves: [TopMove] = []
-                  if !bestUci.isEmpty {
-                      let cpInt = evalCp.map { Int(($0 * 100).rounded()) }
-                      moves.append(TopMove(rank: 1, uci: bestUci, san: bestUci,
-                                           evaluationCp: cpInt, mateIn: mate, depth: depth))
+
+                  // Parse the primary move
+                  let primaryUci = (json["move"] as? String) ?? ""
+                  let primarySan = (json["san"] as? String) ?? primaryUci
+                  let primaryEval = json["eval"] as? Double
+                  let primaryMate = json["mate"] as? Int
+                  if !primaryUci.isEmpty {
+                      let cp = primaryEval.map { Int(($0 * 100).rounded()) }
+                      moves.append(TopMove(rank: 1, uci: primaryUci, san: primarySan,
+                                           evaluationCp: cp,
+                                           mateIn: (primaryMate == 0 ? nil : primaryMate),
+                                           depth: d))
                   }
 
-                  // Add secondary options from continuation line
-                  let contMoves = continuation.split(separator: " ").map(String.init)
-                  for (idx, mv) in contMoves.prefix(2).enumerated() where !mv.isEmpty && mv != bestUci {
-                      moves.append(TopMove(rank: idx + 2, uci: mv, san: mv,
-                                           evaluationCp: nil, mateIn: nil, depth: depth))
-                      if moves.count >= 3 { break }
+                  // Parse alternative variants (real top-N)
+                  if let vars = json["variants"] as? [[String: Any]] {
+                      for (idx, v) in vars.enumerated() {
+                          let uci = (v["move"] as? String) ?? ""
+                          let san = (v["san"] as? String) ?? uci
+                          if uci.isEmpty || uci == primaryUci { continue }
+                          let e = v["eval"] as? Double
+                          let m = v["mate"] as? Int
+                          let cp = e.map { Int(($0 * 100).rounded()) }
+                          moves.append(TopMove(rank: moves.count + 1,
+                                               uci: uci, san: san,
+                                               evaluationCp: cp,
+                                               mateIn: (m == 0 ? nil : m),
+                                               depth: d))
+                          if moves.count >= variants { break }
+                          _ = idx
+                      }
                   }
 
-                  return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: depth)
+                  return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: d)
               }
           }
           '''
@@ -311,15 +321,19 @@ jobs:
           import SwiftUI
           struct SettingsView: View {
               @ObservedObject var stealth: StealthManager
-              @AppStorage("engineDepth") private var engineDepth = 15
+              @AppStorage("engineDepth") private var engineDepth = 13
+              @AppStorage("engineVariants") private var engineVariants = 3
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine — stockfish.online API") {
-                              Stepper(value: $engineDepth, in: 8...15) {
+                          Section("Engine — chess-api.com") {
+                              Stepper(value: $engineDepth, in: 10...18) {
                                   LabeledContent("Depth", value: "\(engineDepth)")
                               }
-                              Text("Depth 15 ≈ ~2500 Elo. Requires internet.")
+                              Stepper(value: $engineVariants, in: 1...5) {
+                                  LabeledContent("Top moves", value: "\(engineVariants)")
+                              }
+                              Text("Depth 13 ≈ ~2500 Elo. Requires internet.")
                                   .font(.caption).foregroundColor(.secondary)
                           }
                           Section("Stealth — Panic gestures (always on)") {
@@ -345,51 +359,18 @@ jobs:
                               HStack {
                                   Image(systemName: "lock.shield.fill").foregroundColor(.green)
                                   VStack(alignment: .leading) {
-                                      Text("Zero chess.com API requests").bold()
-                                      Text("Engine calls go only to stockfish.online").font(.caption).foregroundColor(.secondary)
+                                      Text("Zero chess.com traffic").bold()
+                                      Text("Engine calls go only to chess-api.com").font(.caption).foregroundColor(.secondary)
                                   }
                               }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "2.0.0 (20)")
-                              LabeledContent("Engine", value: "Stockfish (online)")
+                              LabeledContent("Version", value: "2.1.0 (21)")
+                              LabeledContent("Engine", value: "Stockfish (chess-api.com)")
                           }
                       }
                       .navigationTitle("Settings")
                   }
-              }
-          }
-          '''
-
-          files["Sources/LocalOpeningBook.swift"] = r'''
-          import Foundation
-          enum LocalOpeningBook {
-              struct Entry { let eco: String; let name: String; let moves: [String] }
-              static let entries: [Entry] = [
-                  Entry(eco:"B00", name:"King's Pawn", moves:["e4"]),
-                  Entry(eco:"C20", name:"King's Pawn Game", moves:["e4","e5"]),
-                  Entry(eco:"C50", name:"Italian Game", moves:["e4","e5","Nf3","Nc6","Bc4"]),
-                  Entry(eco:"C60", name:"Ruy López", moves:["e4","e5","Nf3","Nc6","Bb5"]),
-                  Entry(eco:"B20", name:"Sicilian Defense", moves:["e4","c5"]),
-                  Entry(eco:"B90", name:"Sicilian: Najdorf", moves:["e4","c5","Nf3","d6","d4","cxd4","Nxd4","Nf6","Nc3","a6"]),
-                  Entry(eco:"C00", name:"French Defense", moves:["e4","e6"]),
-                  Entry(eco:"B12", name:"Caro-Kann", moves:["e4","c6"]),
-                  Entry(eco:"B01", name:"Scandinavian", moves:["e4","d5"]),
-                  Entry(eco:"A40", name:"Queen's Pawn", moves:["d4"]),
-                  Entry(eco:"D02", name:"London System", moves:["d4","d5","Nf3","Nf6","Bf4"]),
-                  Entry(eco:"D06", name:"Queen's Gambit", moves:["d4","d5","c4"]),
-                  Entry(eco:"E60", name:"King's Indian", moves:["d4","Nf6","c4","g6"]),
-                  Entry(eco:"A10", name:"English Opening", moves:["c4"]),
-              ]
-              static func match(sanMoves: [String]) -> Entry? {
-                  guard !sanMoves.isEmpty else { return nil }
-                  var best: Entry?; var bestLen = 0
-                  for e in entries where e.moves.count <= sanMoves.count {
-                      if e.moves.count > bestLen && Array(sanMoves.prefix(e.moves.count)) == e.moves {
-                          best = e; bestLen = e.moves.count
-                      }
-                  }
-                  return best
               }
           }
           '''
@@ -412,7 +393,7 @@ jobs:
                   case .none: return .clear
                   }
               }
-          }
+              }
 
           enum DetectionConfidence: String { case high, medium, low, unknown }
 
@@ -465,9 +446,13 @@ jobs:
                   lastMoveUCI = p.lastMoveUCI
                   plyCount = p.plyCount
                   confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  if p.flippedConfident { detectedPlayerColor = p.flipped ? "b" : "w" }
-                  let board = buildFENBoard(from: p.grid)
-                  let castling = deriveCastling(from: p.grid)
+                  // FIX: If board is flipped in DOM, user is playing Black.
+                  // We only auto-set if we don't have a manual override.
+                  if p.flippedConfident && manualPlayerColor == nil {
+                      detectedPlayerColor = p.flipped ? "b" : "w"
+                  }
+                  let board = buildFENBoard(from: p.grid, flipped: p.flipped)
+                  let castling = deriveCastling(from: p.grid, flipped: p.flipped)
                   let full = max(1, (p.plyCount / 2) + 1)
                   let fen = "\(board) \(p.sideToMove) \(castling) - 0 \(full)"
                   if fen != currentFEN { currentFEN = fen; queueAnalyze(fen: fen) }
@@ -488,12 +473,13 @@ jobs:
                   analysisTask?.cancel()
                   isThinking = true
                   errorMessage = ""
-                  let d = UserDefaults.standard.integer(forKey: "engineDepth") > 0
-                      ? UserDefaults.standard.integer(forKey: "engineDepth") : 15
+                  let ud = UserDefaults.standard
+                  let d = ud.integer(forKey: "engineDepth") > 0 ? ud.integer(forKey: "engineDepth") : 13
+                  let v = ud.integer(forKey: "engineVariants") > 0 ? ud.integer(forKey: "engineVariants") : 3
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
-                          let a = try await EngineService.analyze(fen: fen, depth: d)
+                          let a = try await EngineService.analyze(fen: fen, depth: d, variants: v)
                           if Task.isCancelled { return }
                           await MainActor.run {
                               self.topMoves = a.topMoves
@@ -542,8 +528,20 @@ jobs:
                   }
               }
 
-              private func buildFENBoard(from g: String) -> String {
-                  let c = Array(g); guard c.count == 64 else { return "8/8/8/8/8/8/8/8" }
+              // Build FEN board. If flipped=true, the DOM reads from Black's POV,
+              // so grid[0] = rank 1, grid[7] = rank 8 already means we need to reverse.
+              private func buildFENBoard(from g: String, flipped: Bool) -> String {
+                  var c = Array(g); guard c.count == 64 else { return "8/8/8/8/8/8/8/8" }
+                  if flipped {
+                      // Flip: reverse each row order AND each row's contents
+                      var flipped: [Character] = Array(repeating: ".", count: 64)
+                      for r in 0..<8 {
+                          for f in 0..<8 {
+                              flipped[r*8+f] = c[(7-r)*8+(7-f)]
+                          }
+                      }
+                      c = flipped
+                  }
                   var rows: [String] = []
                   for r in 0..<8 {
                       var row = ""; var empty = 0
@@ -558,9 +556,14 @@ jobs:
                   return rows.joined(separator: "/")
               }
 
-              private func deriveCastling(from g: String) -> String {
-                  let c = Array(g); guard c.count == 64 else { return "-" }
-                  func p(_ f: Int, _ r: Int) -> Character { c[r*8+f] }
+              private func deriveCastling(from g: String, flipped: Bool) -> String {
+                  var c = Array(g); guard c.count == 64 else { return "-" }
+                  if flipped {
+                      var f: [Character] = Array(repeating: ".", count: 64)
+                      for r in 0..<8 { for x in 0..<8 { f[r*8+x] = c[(7-r)*8+(7-x)] } }
+                      c = f
+                  }
+                  func p(_ file: Int, _ row: Int) -> Character { c[row*8+file] }
                   var s = ""
                   let wk = p(4,7) == "K"
                   if wk && p(7,7) == "R" { s += "K" }
@@ -668,7 +671,6 @@ jobs:
                           colorRow
                           movesSection
                           lastMoveSection
-                          openingSection
                           errorSection
                       }
                   }
@@ -736,14 +738,16 @@ jobs:
                   VStack(alignment: .leading, spacing: 4) {
                       Divider().opacity(0.3)
                       HStack {
-                          Text(engine.isMyTurn ? "Top moves for you" : "Opponent's best")
+                          Text(engine.isMyTurn ? "Best moves for you" : "Opponent's best replies")
                               .font(.caption).foregroundColor(.secondary)
                           Spacer()
                           Text("depth \(engine.depth)").font(.caption2.monospaced()).foregroundColor(.secondary)
                       }
                       .padding(.horizontal, 14).padding(.top, 6)
                       if engine.topMoves.isEmpty {
-                          Text("—").font(.title.bold()).padding(.horizontal, 14).padding(.bottom, 4)
+                          Text(engine.isThinking ? "Analyzing…" : "—")
+                              .font(.title.bold())
+                              .padding(.horizontal, 14).padding(.bottom, 4)
                       } else {
                           ForEach(Array(engine.topMoves.enumerated()), id: \.element.id) { idx, m in
                               moveRow(rank: idx + 1, move: m, isBest: idx == 0)
@@ -788,19 +792,6 @@ jobs:
                           if engine.lastMoveCentipawnLoss >= 30 {
                               Text("-\(engine.lastMoveCentipawnLoss)cp").font(.caption2.monospaced()).foregroundColor(.orange)
                           }
-                      }
-                      .padding(.horizontal, 14).padding(.top, 4)
-                  }
-              }
-              @ViewBuilder private var openingSection: some View {
-                  if !engine.openingName.isEmpty {
-                      HStack(spacing: 6) {
-                          Image(systemName: "book.fill").font(.caption2).foregroundColor(.orange)
-                          if !engine.openingECO.isEmpty {
-                              Text(engine.openingECO).font(.caption2.bold().monospaced()).foregroundColor(.orange)
-                          }
-                          Text(engine.openingName).font(.caption.bold()).foregroundColor(.white.opacity(0.9)).lineLimit(2)
-                          Spacer()
                       }
                       .padding(.horizontal, 14).padding(.top, 4)
                   }
@@ -929,8 +920,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>2.0.0</string>
-            <key>CFBundleVersion</key><string>20</string>
+            <key>CFBundleShortVersionString</key><string>2.1.0</string>
+            <key>CFBundleVersion</key><string>21</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -944,10 +935,10 @@ jobs:
           </plist>
           EOF
 
-      - name: Write reader.js
+      - name: Write reader.js (v4 — improved orientation detection)
         run: |
           cat > Resources/reader.js <<'EOF'
-          (function(){if(window.__ch_v3)return;window.__ch_v3=true;
+          (function(){if(window.__ch_v4)return;window.__ch_v4=true;
           const PM={wp:'P',wn:'N',wb:'B',wr:'R',wq:'Q',wk:'K',bp:'p',bn:'n',bb:'b',br:'r',bq:'q',bk:'k'};
           const PN={king:'K',queen:'Q',rook:'R',bishop:'B',knight:'N',pawn:'P'};
           function fb(){return document.querySelector('wc-chess-board,chess-board,cg-board,.board-layout-chessboard');}
@@ -966,14 +957,43 @@ jobs:
           if(m){const co=Math.round(parseFloat(m[1])/12.5),ro=Math.round(parseFloat(m[2])/12.5);
           if(co>=0&&co<=7&&ro>=0&&ro<=7){f=co+1;r=8-ro;}}}
           if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8){g[8-r][f-1]=p;}});return g;}
-          function df(b){const s=[];let e=b;for(let i=0;i<6&&e;i++){if(e.classList&&e.classList.contains('flipped')){s.push(true);break;}e=e.parentElement;}
-          if(b.hasAttribute('flipped'))s.push(true);const o=b.getAttribute('orientation');
-          if(o==='black')s.push(true);if(o==='white')s.push(false);
-          if(s.length===0)return null;const t=s.filter(x=>x===true).length,f=s.filter(x=>x===false).length;
-          if(t===f)return null;return t>f;}
+
+          // Robust flipped detection: multiple signals + strong heuristic based on
+          // where the WHITE pieces actually are in the DOM's grid.
+          function df(b,grid){
+            let confident=false, flipped=false;
+            // signal 1: 'flipped' class or attribute
+            let el=b;
+            for(let i=0;i<6&&el;i++){
+              if(el.classList&&el.classList.contains('flipped')){flipped=true;confident=true;break;}
+              el=el.parentElement;
+            }
+            if(b.hasAttribute('flipped')){flipped=true;confident=true;}
+            // signal 2: orientation attribute
+            const o=b.getAttribute('orientation');
+            if(o==='black'){flipped=true;confident=true;}
+            if(o==='white'){flipped=false;confident=true;}
+            // signal 3 (STRONG): white king position in DOM grid
+            // If white king is on TOP half of DOM grid (rows 0-3), board is flipped
+            if(grid){
+              let wkRow=-1;
+              for(let r=0;r<8;r++)for(let c=0;c<8;c++){
+                if(grid[r][c]==='K'){wkRow=r;break;}
+              }
+              if(wkRow>=0){
+                // White king is normally at rank 1 = DOM row 7 (bottom).
+                // If we see it in rows 0-3, board is flipped.
+                flipped=wkRow<4;
+                confident=true;
+              }
+            }
+            return {flipped,confident};
+          }
+
           function dp(){const pn=document.querySelectorAll('[data-ply]');
           if(pn.length){let m=-1;pn.forEach(n=>{const p=parseInt(n.getAttribute('data-ply'),10);if(!isNaN(p)&&p>m)m=p;});
           if(m>=0)return m;}return -1;}
+
           let pg=null,lp='',ls='w';
           function di(p,c){if(!p||!c)return null;const ch=[];for(let r=0;r<8;r++)for(let x=0;x<8;x++)
           if(p[r][x]!==c[r][x])ch.push({r,c:x,before:p[r][x],after:c[r][x]});
@@ -983,14 +1003,17 @@ jobs:
           if(!t||!f)return null;
           const fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);
           const mc=t.after===t.after.toUpperCase()?'w':'b';return{uci:fr+to,movedColor:mc};}
+
           function tk(){const b=fb();if(!b)return;const g=rg(b);if(!g)return;
           let s=null,cf='low';const p=dp();if(p>=0){s=(p%2===0)?'w':'b';cf='high';}
           const m=di(pg,g);if(m&&!s){s=(m.movedColor==='w')?'b':'w';cf='low';}
-          if(!s)s=ls;ls=s;const fr=df(b),fl=fr===null?false:fr;
+          if(!s)s=ls;ls=s;
+          const fi=df(b,g);
           const gs=g.map(r=>r.join('')).join('');
-          const py={grid:gs,sideToMove:s,flipped:fl,flippedConfident:fr!==null,
+          const py={grid:gs,sideToMove:s,flipped:fi.flipped,flippedConfident:fi.confident,
           lastMoveUCI:m?m.uci:'',plyCount:p,detectionConfidence:cf};
           const k=JSON.stringify(py);if(k!==lp){lp=k;try{window.webkit.messageHandlers.fenBridge.postMessage(py);}catch(e){}}pg=g;}
+
           window.__ch_startReader=function(){if(window.__ch_timer)return;window.__ch_timer=setInterval(tk,500);};
           const mo=new MutationObserver(()=>tk());try{mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true});}catch(e){}
           window.__ch_startReader();})();
