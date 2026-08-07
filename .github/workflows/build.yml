@@ -1,0 +1,1868 @@
+name: Build ChessHelper v2 (Stealth + Embedded Stockfish)
+
+on:
+  push:
+    branches: [ main ]
+    tags:     [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean any stale source folders
+        run: |
+          rm -rf Sources Resources ChessHelper.xcodeproj build Payload
+          rm -f  chess-helper.manifest.json
+          mkdir -p Sources Resources
+
+      # ============================================================
+      #  Write project.yml
+      # ============================================================
+      - name: Write project.yml
+        run: |
+          cat > project.yml <<'PROJECT_EOF'
+          name: ChessHelper
+          options:
+            bundleIdPrefix: com.chesshelper
+            deploymentTarget:
+              iOS: "16.0"
+            createIntermediateGroups: true
+
+          packages:
+            ChessKitEngine:
+              url: https://github.com/chesskit-app/chesskit-engine
+              from: "0.7.0"
+
+          settings:
+            base:
+              MARKETING_VERSION: "2.0.0"
+              CURRENT_PROJECT_VERSION: "20"
+              SWIFT_VERSION: "5.9"
+              IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+              TARGETED_DEVICE_FAMILY: "1,2"
+
+          targets:
+            ChessHelper:
+              type: application
+              platform: iOS
+              sources:
+                - path: Sources
+                - path: Resources
+              dependencies:
+                - package: ChessKitEngine
+              info:
+                path: Resources/Info.plist
+                properties:
+                  CFBundleDisplayName: Chess Helper
+                  CFBundleShortVersionString: $(MARKETING_VERSION)
+                  CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+                  UILaunchScreen: {}
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+                  NSAppTransportSecurity:
+                    NSAllowsArbitraryLoads: true
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.chesshelper.app
+                  GENERATE_INFOPLIST_FILE: NO
+                  CODE_SIGNING_ALLOWED: NO
+                  CODE_SIGN_IDENTITY: ""
+                  CODE_SIGN_STYLE: Manual
+                  DEVELOPMENT_TEAM: ""
+                  PROVISIONING_PROFILE_SPECIFIER: ""
+          PROJECT_EOF
+
+      # ============================================================
+      #  Sources/ChessHelperApp.swift
+      # ============================================================
+      - name: Write ChessHelperApp.swift
+        run: |
+          cat > Sources/ChessHelperApp.swift <<'SWIFT_EOF'
+          import SwiftUI
+
+          @main
+          struct ChessHelperApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                          .preferredColorScheme(.dark)
+                  }
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/AppRouter.swift
+      # ============================================================
+      - name: Write AppRouter.swift
+        run: |
+          cat > Sources/AppRouter.swift <<'SWIFT_EOF'
+          import SwiftUI
+
+          @MainActor
+          final class AppRouter: ObservableObject {
+              @Published var selectedTab: Int = 0
+              @Published var chessURL: URL = URL(string: "https://www.chess.com/")!
+              @Published var navigateTrigger: Int = 0
+
+              func openInPlay(_ urlString: String) {
+                  if let url = URL(string: urlString) {
+                      chessURL = url
+                      navigateTrigger &+= 1
+                      selectedTab = 0
+                  }
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/ContentView.swift
+      # ============================================================
+      - name: Write ContentView.swift
+        run: |
+          cat > Sources/ContentView.swift <<'SWIFT_EOF'
+          import SwiftUI
+
+          struct ContentView: View {
+              @StateObject private var engine  = EngineViewModel()
+              @StateObject private var stealth = StealthManager()
+              @StateObject private var router  = AppRouter()
+
+              var body: some View {
+                  TabView(selection: $router.selectedTab) {
+                      PlayView(engine: engine, stealth: stealth, router: router)
+                          .tabItem { Label("Play", systemImage: "gamecontroller.fill") }
+                          .tag(0)
+                      ReviewView(router: router)
+                          .tabItem { Label("Review", systemImage: "magnifyingglass") }
+                          .tag(1)
+                      OpeningsView(router: router)
+                          .tabItem { Label("Openings", systemImage: "book.fill") }
+                          .tag(2)
+                      PuzzlesView(router: router)
+                          .tabItem { Label("Puzzles", systemImage: "puzzlepiece.fill") }
+                          .tag(3)
+                      StatsView(router: router)
+                          .tabItem { Label("Stats", systemImage: "chart.bar.fill") }
+                          .tag(4)
+                      SettingsView(stealth: stealth)
+                          .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+                          .tag(5)
+                  }
+                  .tint(.green)
+                  .task { await StockfishEngine.shared.start() }
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/StockfishEngine.swift  (Embedded Stockfish 16)
+      # ============================================================
+      - name: Write StockfishEngine.swift
+        run: |
+          cat > Sources/StockfishEngine.swift <<'SWIFT_EOF'
+          import Foundation
+          import ChessKitEngine
+
+          struct TopMove: Identifiable, Equatable {
+              let id = UUID()
+              let rank: Int
+              let uci: String
+              let san: String
+              let evaluationCp: Int?
+              let mateIn: Int?
+              let depth: Int
+
+              var evalString: String {
+                  if let m = mateIn, m != 0 { return "M\(abs(m))" }
+                  if let cp = evaluationCp { return String(format: "%+.2f", Double(cp) / 100.0) }
+                  return "—"
+              }
+              var winChance: Double {
+                  if let m = mateIn, m != 0 { return m > 0 ? 99 : 1 }
+                  guard let cp = evaluationCp else { return 50 }
+                  return 50 + 50 * tanh(Double(cp) / 400.0)
+              }
+          }
+
+          struct EngineAnalysis {
+              let topMoves: [TopMove]
+              let bestMove: TopMove?
+              let depth: Int
+          }
+
+          @MainActor
+          final class StockfishEngine {
+              static let shared = StockfishEngine()
+
+              private let engine: Engine
+              private var isReady = false
+
+              private init() { self.engine = Engine(type: .stockfish) }
+
+              func start() async {
+                  guard !isReady else { return }
+                  await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                      engine.start { [weak self] in
+                          self?.isReady = true
+                          cont.resume()
+                      }
+                  }
+                  engine.send(command: .setoption(id: "Threads", value: "3"))
+                  engine.send(command: .setoption(id: "Hash", value: "64"))
+                  engine.send(command: .setoption(id: "MultiPV", value: "3"))
+              }
+
+              func analyze(fen: String,
+                           multiPV: Int = 3,
+                           depth: Int = 20,
+                           movetime: Int = 2000) async throws -> EngineAnalysis {
+                  if !isReady { await start() }
+                  engine.send(command: .setoption(id: "MultiPV", value: "\(multiPV)"))
+
+                  return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<EngineAnalysis, Error>) in
+                      var buckets: [Int: (uci: String, cp: Int?, mate: Int?, depth: Int)] = [:]
+                      var currentDepth = 0
+                      var didResume = false
+
+                      engine.receiveResponse = { response in
+                          switch response {
+                          case .info(let info):
+                              let pv = info.multipv ?? 1
+                              currentDepth = max(currentDepth, info.depth ?? 0)
+                              if let first = info.pv?.first {
+                                  buckets[pv] = (uci: first,
+                                                 cp: info.score?.cp,
+                                                 mate: info.score?.mate,
+                                                 depth: info.depth ?? currentDepth)
+                              }
+                          case .bestmove:
+                              guard !didResume else { return }
+                              didResume = true
+                              let sorted = buckets.sorted { $0.key < $1.key }
+                              let moves: [TopMove] = sorted.enumerated().map { (idx, kv) in
+                                  TopMove(rank: idx + 1,
+                                          uci: kv.value.uci,
+                                          san: kv.value.uci,
+                                          evaluationCp: kv.value.cp,
+                                          mateIn: kv.value.mate,
+                                          depth: kv.value.depth)
+                              }
+                              cont.resume(returning: EngineAnalysis(
+                                  topMoves: moves,
+                                  bestMove: moves.first,
+                                  depth: currentDepth
+                              ))
+                          default: break
+                          }
+                      }
+
+                      engine.send(command: .position(.fen(fen)))
+                      engine.send(command: .go(depth: depth, movetime: movetime))
+                  }
+              }
+
+              func stop() { engine.send(command: .stop) }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/StealthManager.swift
+      # ============================================================
+      - name: Write StealthManager.swift
+        run: |
+          cat > Sources/StealthManager.swift <<'SWIFT_EOF'
+          import SwiftUI
+          import UIKit
+          import Combine
+
+          @MainActor
+          final class StealthManager: ObservableObject {
+              @Published var overlayVisible: Bool = true
+              @Published var minimalMode: Bool = false
+              @Published var isBeingRecorded: Bool = false
+              @Published var lastHideReason: String = ""
+
+              private var cancellables = Set<AnyCancellable>()
+
+              init() {
+                  setupScreenCaptureDetection()
+                  setupBackgroundDetection()
+                  setupScreenshotDetection()
+                  setupPanicListener()
+              }
+
+              func toggleOverlay() {
+                  overlayVisible.toggle()
+                  lastHideReason = overlayVisible ? "" : "panic gesture"
+              }
+              func hide(reason: String) { overlayVisible = false; lastHideReason = reason }
+              func show() { overlayVisible = true; lastHideReason = "" }
+              func toggleMinimalMode() { minimalMode.toggle() }
+
+              private func setupScreenCaptureDetection() {
+                  NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)
+                      .sink { [weak self] _ in
+                          guard let self = self else { return }
+                          let captured = UIScreen.main.isCaptured
+                          self.isBeingRecorded = captured
+                          if captured { self.hide(reason: "screen recording") }
+                      }
+                      .store(in: &cancellables)
+                  isBeingRecorded = UIScreen.main.isCaptured
+                  if isBeingRecorded { hide(reason: "screen recording") }
+              }
+
+              private func setupBackgroundDetection() {
+                  NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)
+                      .sink { [weak self] _ in self?.hide(reason: "app backgrounded") }
+                      .store(in: &cancellables)
+              }
+
+              private func setupScreenshotDetection() {
+                  NotificationCenter.default.publisher(for: UIApplication.userDidTakeScreenshotNotification)
+                      .sink { [weak self] _ in self?.hide(reason: "screenshot taken") }
+                      .store(in: &cancellables)
+              }
+
+              private func setupPanicListener() {
+                  NotificationCenter.default.publisher(for: .stealthPanic)
+                      .sink { [weak self] _ in self?.toggleOverlay() }
+                      .store(in: &cancellables)
+              }
+          }
+
+          extension UIWindow {
+              open override func motionEnded(_ motion: UIEvent.EventSubtype, with event: UIEvent?) {
+                  if motion == .motionShake {
+                      NotificationCenter.default.post(name: .stealthPanic, object: nil)
+                  }
+                  super.motionEnded(motion, with: event)
+              }
+          }
+
+          extension Notification.Name {
+              static let stealthPanic = Notification.Name("StealthPanicGesture")
+          }
+
+          struct ThreeFingerCatcher: UIViewRepresentable {
+              let action: () -> Void
+              func makeUIView(context: Context) -> UIView {
+                  let v = UIView()
+                  let tap = UITapGestureRecognizer(target: context.coordinator,
+                                                   action: #selector(Coordinator.tapped))
+                  tap.numberOfTouchesRequired = 3
+                  tap.numberOfTapsRequired = 1
+                  tap.cancelsTouchesInView = false
+                  v.addGestureRecognizer(tap)
+                  v.isUserInteractionEnabled = true
+                  v.backgroundColor = .clear
+                  return v
+              }
+              func updateUIView(_ v: UIView, context: Context) {}
+              func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+              final class Coordinator: NSObject {
+                  let action: () -> Void
+                  init(action: @escaping () -> Void) { self.action = action }
+                  @objc func tapped() { action() }
+              }
+          }
+
+          extension View {
+              func onThreeFingerPanic(_ action: @escaping () -> Void) -> some View {
+                  overlay(
+                      ThreeFingerCatcher(action: action)
+                          .allowsHitTesting(true)
+                          .frame(maxWidth: .infinity, maxHeight: .infinity)
+                          .opacity(0.001)
+                  )
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/SettingsView.swift
+      # ============================================================
+      - name: Write SettingsView.swift
+        run: |
+          cat > Sources/SettingsView.swift <<'SWIFT_EOF'
+          import SwiftUI
+
+          struct SettingsView: View {
+              @ObservedObject var stealth: StealthManager
+              @AppStorage("engineDepth")    private var engineDepth: Int = 20
+              @AppStorage("engineMovetime") private var engineMovetime: Int = 2000
+              @AppStorage("multiPV")        private var multiPV: Int = 3
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          Section("Engine — Stockfish 16 (local)") {
+                              Stepper(value: $engineDepth, in: 10...25) {
+                                  LabeledContent("Search depth", value: "\(engineDepth)")
+                              }
+                              Stepper(value: $engineMovetime, in: 500...5000, step: 250) {
+                                  LabeledContent("Max think time", value: "\(engineMovetime) ms")
+                              }
+                              Stepper(value: $multiPV, in: 1...5) {
+                                  LabeledContent("Candidate moves", value: "\(multiPV)")
+                              }
+                              Text("Depth 20 ≈ ~3400 Elo. Higher = stronger but slower.")
+                                  .font(.caption).foregroundColor(.secondary)
+                          }
+
+                          Section("Stealth — Panic gestures") {
+                              Label("Shake device to hide overlay", systemImage: "iphone.gen3.radiowaves.left.and.right")
+                              Label("3-finger tap to hide overlay", systemImage: "hand.tap.fill")
+                              Text("Both gestures are always active.")
+                                  .font(.caption).foregroundColor(.secondary)
+                          }
+
+                          Section("Stealth — Auto-hide (always on)") {
+                              Label("On app background", systemImage: "iphone.slash")
+                              Label("On screen recording / mirroring", systemImage: "record.circle")
+                              Label("On screenshot", systemImage: "camera.viewfinder")
+                              Toggle("Use minimal mode (tiny dot)", isOn: $stealth.minimalMode)
+                          }
+
+                          Section("Status") {
+                              LabeledContent("Overlay visible", value: stealth.overlayVisible ? "Yes" : "No")
+                              LabeledContent("Screen captured",  value: stealth.isBeingRecorded ? "Yes" : "No")
+                              if !stealth.lastHideReason.isEmpty {
+                                  LabeledContent("Last hide reason", value: stealth.lastHideReason)
+                              }
+                              Button("Force show overlay") { stealth.show() }
+                              Button("Force hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
+                          }
+
+                          Section("Privacy") {
+                              HStack(spacing: 10) {
+                                  Image(systemName: "lock.shield.fill").foregroundColor(.green).font(.title2)
+                                  VStack(alignment: .leading, spacing: 2) {
+                                      Text("Zero external requests").font(.callout.bold())
+                                      Text("Analysis runs 100% on-device. Nothing is sent to any server.")
+                                          .font(.caption).foregroundColor(.secondary)
+                                  }
+                              }
+                          }
+
+                          Section("About") {
+                              LabeledContent("Version", value: "2.0.0 (20)")
+                              LabeledContent("Engine",  value: "Stockfish 16")
+                              LabeledContent("Build",   value: "TrollStore (unsigned)")
+                          }
+                      }
+                      .navigationTitle("Settings")
+                  }
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/LocalOpeningBook.swift
+      # ============================================================
+      - name: Write LocalOpeningBook.swift
+        run: |
+          cat > Sources/LocalOpeningBook.swift <<'SWIFT_EOF'
+          import Foundation
+
+          enum LocalOpeningBook {
+              struct Entry {
+                  let eco: String
+                  let name: String
+                  let moves: [String]
+              }
+
+              static let entries: [Entry] = [
+                  Entry(eco: "B00", name: "King's Pawn Opening",          moves: ["e4"]),
+                  Entry(eco: "C20", name: "King's Pawn Game",             moves: ["e4","e5"]),
+                  Entry(eco: "C40", name: "King's Knight Opening",        moves: ["e4","e5","Nf3"]),
+                  Entry(eco: "C44", name: "Scotch Game",                  moves: ["e4","e5","Nf3","Nc6","d4"]),
+                  Entry(eco: "C50", name: "Italian Game",                 moves: ["e4","e5","Nf3","Nc6","Bc4"]),
+                  Entry(eco: "C60", name: "Ruy López",                    moves: ["e4","e5","Nf3","Nc6","Bb5"]),
+                  Entry(eco: "C65", name: "Ruy López: Berlin",            moves: ["e4","e5","Nf3","Nc6","Bb5","Nf6"]),
+                  Entry(eco: "C78", name: "Ruy López: Morphy",            moves: ["e4","e5","Nf3","Nc6","Bb5","a6","Ba4"]),
+                  Entry(eco: "B20", name: "Sicilian Defense",             moves: ["e4","c5"]),
+                  Entry(eco: "B27", name: "Sicilian: Open",               moves: ["e4","c5","Nf3"]),
+                  Entry(eco: "B30", name: "Sicilian: Rossolimo",          moves: ["e4","c5","Nf3","Nc6","Bb5"]),
+                  Entry(eco: "B50", name: "Sicilian: Najdorf setup",      moves: ["e4","c5","Nf3","d6"]),
+                  Entry(eco: "B90", name: "Sicilian: Najdorf",            moves: ["e4","c5","Nf3","d6","d4","cxd4","Nxd4","Nf6","Nc3","a6"]),
+                  Entry(eco: "B22", name: "Sicilian: Alapin",             moves: ["e4","c5","c3"]),
+                  Entry(eco: "C00", name: "French Defense",               moves: ["e4","e6"]),
+                  Entry(eco: "C02", name: "French: Advance",              moves: ["e4","e6","d4","d5","e5"]),
+                  Entry(eco: "B12", name: "Caro-Kann Defense",            moves: ["e4","c6"]),
+                  Entry(eco: "B18", name: "Caro-Kann: Classical",         moves: ["e4","c6","d4","d5","Nc3","dxe4","Nxe4","Bf5"]),
+                  Entry(eco: "B07", name: "Pirc Defense",                 moves: ["e4","d6","d4","Nf6","Nc3","g6"]),
+                  Entry(eco: "B01", name: "Scandinavian Defense",         moves: ["e4","d5"]),
+                  Entry(eco: "B02", name: "Alekhine's Defense",           moves: ["e4","Nf6"]),
+                  Entry(eco: "A40", name: "Queen's Pawn Opening",         moves: ["d4"]),
+                  Entry(eco: "D02", name: "London System",                moves: ["d4","d5","Nf3","Nf6","Bf4"]),
+                  Entry(eco: "D00", name: "Queen's Pawn Game",            moves: ["d4","d5"]),
+                  Entry(eco: "D06", name: "Queen's Gambit",               moves: ["d4","d5","c4"]),
+                  Entry(eco: "D20", name: "Queen's Gambit Accepted",      moves: ["d4","d5","c4","dxc4"]),
+                  Entry(eco: "D30", name: "Queen's Gambit Declined",      moves: ["d4","d5","c4","e6"]),
+                  Entry(eco: "D10", name: "Slav Defense",                 moves: ["d4","d5","c4","c6"]),
+                  Entry(eco: "A45", name: "Indian Game",                  moves: ["d4","Nf6"]),
+                  Entry(eco: "E60", name: "King's Indian Defense",        moves: ["d4","Nf6","c4","g6"]),
+                  Entry(eco: "E20", name: "Nimzo-Indian Defense",         moves: ["d4","Nf6","c4","e6","Nc3","Bb4"]),
+                  Entry(eco: "E12", name: "Queen's Indian Defense",       moves: ["d4","Nf6","c4","e6","Nf3","b6"]),
+                  Entry(eco: "A80", name: "Dutch Defense",                moves: ["d4","f5"]),
+                  Entry(eco: "D70", name: "Grünfeld Defense",             moves: ["d4","Nf6","c4","g6","Nc3","d5"]),
+                  Entry(eco: "A10", name: "English Opening",              moves: ["c4"]),
+                  Entry(eco: "A04", name: "Réti Opening",                 moves: ["Nf3"]),
+              ]
+
+              static func match(sanMoves: [String]) -> Entry? {
+                  guard !sanMoves.isEmpty else { return nil }
+                  var best: Entry?
+                  var bestLen = 0
+                  for e in entries where e.moves.count <= sanMoves.count {
+                      if e.moves.count > bestLen && Array(sanMoves.prefix(e.moves.count)) == e.moves {
+                          best = e; bestLen = e.moves.count
+                      }
+                  }
+                  return best
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/ChessAPI.swift  (offline shim)
+      # ============================================================
+      - name: Write ChessAPI.swift
+        run: |
+          cat > Sources/ChessAPI.swift <<'SWIFT_EOF'
+          import Foundation
+
+          struct OpeningMove: Identifiable {
+              let id = UUID()
+              let san: String
+              let white: Int
+              let draws: Int
+              let black: Int
+              var totalGames: Int { white + draws + black }
+              var winRate: Double {
+                  totalGames == 0 ? 0 : Double(white) / Double(totalGames) * 100
+              }
+          }
+
+          enum ChessAPI {
+              struct EngineResultCompat {
+                  let move: String
+                  let san: String
+                  let ponder: String
+                  let evalString: String
+                  let winChance: Double
+                  let depth: Int
+                  let pvText: String
+              }
+
+              static func bestMove(fen: String, depth: Int = 20) async throws -> EngineResultCompat {
+                  let a = try await StockfishEngine.shared.analyze(
+                      fen: fen, multiPV: 1, depth: depth, movetime: 2000
+                  )
+                  guard let best = a.bestMove else {
+                      throw NSError(domain: "ChessAPI", code: -1,
+                                    userInfo: [NSLocalizedDescriptionKey: "Engine returned no move"])
+                  }
+                  return EngineResultCompat(
+                      move: best.uci, san: best.san, ponder: "",
+                      evalString: best.evalString, winChance: best.winChance,
+                      depth: a.depth, pvText: ""
+                  )
+              }
+
+              struct OpeningInfoCompat {
+                  let name: String
+                  let eco: String
+                  let topMoves: [OpeningMove]
+              }
+
+              static func opening(sanMoves: [String]) -> OpeningInfoCompat? {
+                  guard let e = LocalOpeningBook.match(sanMoves: sanMoves) else { return nil }
+                  return OpeningInfoCompat(name: e.name, eco: e.eco, topMoves: [])
+              }
+
+              static func opening(fen: String) async -> OpeningInfoCompat? { nil }
+          }
+          SWIFT_EOF      # ============================================================
+      #  Sources/EngineViewModel.swift
+      # ============================================================
+      - name: Write EngineViewModel.swift
+        run: |
+          cat > Sources/EngineViewModel.swift <<'SWIFT_EOF'
+          import Foundation
+          import SwiftUI
+
+          enum MoveQuality: String {
+              case brilliant  = "!! Brilliant"
+              case best       = "!  Best"
+              case good       = "   Good"
+              case inaccuracy = "?! Inaccuracy"
+              case mistake    = "?  Mistake"
+              case blunder    = "?? Blunder"
+              case none       = ""
+
+              var color: Color {
+                  switch self {
+                  case .brilliant:  return .cyan
+                  case .best:       return .green
+                  case .good:       return .green.opacity(0.7)
+                  case .inaccuracy: return .yellow
+                  case .mistake:    return .orange
+                  case .blunder:    return .red
+                  case .none:       return .clear
+                  }
+              }
+          }
+
+          enum DetectionConfidence: String { case high, medium, low, unknown }
+
+          @MainActor
+          final class EngineViewModel: ObservableObject {
+              @Published var currentFEN: String = ""
+              @Published var topMoves: [TopMove] = []
+              @Published var evaluation: String = "—"
+              @Published var winChance: Double = 50
+              @Published var depth: Int = 0
+              @Published var isThinking: Bool = false
+              @Published var errorMessage: String = ""
+
+              @Published var detectedPlayerColor: String = "w"
+              @Published var manualPlayerColor: String? = nil
+              @Published var sideToMove: String = "w"
+              @Published var lastMoveUCI: String = ""
+              @Published var plyCount: Int = -1
+              @Published var confidence: DetectionConfidence = .unknown
+              @Published var sanHistory: [String] = []
+
+              @Published var lastMoveQuality: MoveQuality = .none
+              @Published var lastMoveCentipawnLoss: Int = 0
+              @Published var lastMoveWasMine: Bool = false
+
+              @Published var openingName: String = ""
+              @Published var openingECO: String = ""
+              @Published var enabled: Bool = true
+
+              var bestMove: TopMove? { topMoves.first }
+
+              private var previousEvalWhitePOV: Double? = nil
+              private var lastAnalyzedFEN: String = ""
+              private var analysisTask: Task<Void, Never>?
+              private var debounceTask: Task<Void, Never>?
+
+              var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
+              var isMyTurn: Bool { effectivePlayerColor == sideToMove }
+
+              func setManualColor(_ color: String?) {
+                  manualPlayerColor = color
+                  if !currentFEN.isEmpty { queueAnalyze(fen: currentFEN, immediate: true) }
+              }
+              func flipColor() {
+                  setManualColor(effectivePlayerColor == "w" ? "b" : "w")
+              }
+
+              struct BoardPayload {
+                  let grid: String
+                  let sideToMove: String
+                  let flipped: Bool
+                  let flippedConfident: Bool
+                  let lastMoveUCI: String
+                  let plyCount: Int
+                  let detectionConfidence: String
+              }
+
+              func ingest(_ payload: BoardPayload) {
+                  guard enabled else { return }
+                  sideToMove = payload.sideToMove
+                  lastMoveUCI = payload.lastMoveUCI
+                  plyCount = payload.plyCount
+                  confidence = DetectionConfidence(rawValue: payload.detectionConfidence) ?? .unknown
+                  if payload.flippedConfident {
+                      detectedPlayerColor = payload.flipped ? "b" : "w"
+                  }
+                  let fenBoard = buildFENBoard(from: payload.grid)
+                  let castling = deriveCastlingRights(from: payload.grid)
+                  let fullmove = max(1, (payload.plyCount / 2) + 1)
+                  let fen = "\(fenBoard) \(payload.sideToMove) \(castling) - 0 \(fullmove)"
+                  if fen != currentFEN {
+                      currentFEN = fen
+                      queueAnalyze(fen: fen)
+                  }
+              }
+
+              private func queueAnalyze(fen: String, immediate: Bool = false) {
+                  debounceTask?.cancel()
+                  debounceTask = Task { [weak self] in
+                      if !immediate {
+                          try? await Task.sleep(nanoseconds: 300_000_000)
+                      }
+                      if Task.isCancelled { return }
+                      await self?.runAnalysis(fen: fen)
+                  }
+              }
+
+              private func runAnalysis(fen: String) async {
+                  guard fen != lastAnalyzedFEN else { return }
+                  lastAnalyzedFEN = fen
+                  analysisTask?.cancel()
+                  isThinking = true
+                  errorMessage = ""
+
+                  let ud = UserDefaults.standard
+                  let d  = ud.integer(forKey: "engineDepth")    > 0 ? ud.integer(forKey: "engineDepth")    : 20
+                  let mt = ud.integer(forKey: "engineMovetime") > 0 ? ud.integer(forKey: "engineMovetime") : 2000
+                  let mp = ud.integer(forKey: "multiPV")        > 0 ? ud.integer(forKey: "multiPV")        : 3
+
+                  analysisTask = Task { [weak self] in
+                      guard let self = self else { return }
+                      do {
+                          let a = try await StockfishEngine.shared.analyze(
+                              fen: fen, multiPV: mp, depth: d, movetime: mt
+                          )
+                          if Task.isCancelled { return }
+                          await MainActor.run {
+                              self.topMoves   = a.topMoves
+                              self.evaluation = a.bestMove?.evalString ?? "—"
+                              self.winChance  = a.bestMove?.winChance ?? 50
+                              self.depth      = a.depth
+                              self.isThinking = false
+                              let whitePOV = self.evalToWhitePOV(a.bestMove)
+                              self.computeMoveQuality(currentEvalWhitePOV: whitePOV)
+                              self.previousEvalWhitePOV = whitePOV
+                              self.updateOpening()
+                          }
+                      } catch {
+                          if Task.isCancelled { return }
+                          await MainActor.run {
+                              self.errorMessage = "Engine: \(error.localizedDescription)"
+                              self.isThinking = false
+                          }
+                      }
+                  }
+              }
+
+              private func evalToWhitePOV(_ move: TopMove?) -> Double {
+                  guard let m = move else { return 0 }
+                  if let mate = m.mateIn, mate != 0 { return mate > 0 ? 30 : -30 }
+                  let cp = Double(m.evaluationCp ?? 0) / 100.0
+                  return sideToMove == "w" ? cp : -cp
+              }
+
+              private func computeMoveQuality(currentEvalWhitePOV cur: Double) {
+                  guard let prev = previousEvalWhitePOV, !lastMoveUCI.isEmpty else {
+                      lastMoveQuality = .none; lastMoveCentipawnLoss = 0; return
+                  }
+                  let sideThatJustMoved: Double = (sideToMove == "w") ? -1 : 1
+                  let lossPawns = (prev - cur) * sideThatJustMoved
+                  let lossCP = Int((lossPawns * 100).rounded())
+                  lastMoveCentipawnLoss = max(0, lossCP)
+                  let mover = (sideToMove == "w") ? "b" : "w"
+                  lastMoveWasMine = (mover == effectivePlayerColor)
+                  switch lossCP {
+                  case ..<(-30):    lastMoveQuality = .brilliant
+                  case (-30)...15:  lastMoveQuality = .best
+                  case 16...49:     lastMoveQuality = .good
+                  case 50...99:     lastMoveQuality = .inaccuracy
+                  case 100...299:   lastMoveQuality = .mistake
+                  default:          lastMoveQuality = .blunder
+                  }
+              }
+
+              private func updateOpening() {
+                  if let info = ChessAPI.opening(sanMoves: sanHistory) {
+                      openingName = info.name; openingECO = info.eco
+                  } else {
+                      openingName = ""; openingECO = ""
+                  }
+              }
+
+              private func buildFENBoard(from grid64: String) -> String {
+                  let chars = Array(grid64)
+                  guard chars.count == 64 else { return "8/8/8/8/8/8/8/8" }
+                  var rows: [String] = []
+                  for r in 0..<8 {
+                      var row = ""; var empty = 0
+                      for c in 0..<8 {
+                          let ch = chars[r * 8 + c]
+                          if ch == "." { empty += 1 }
+                          else { if empty > 0 { row += "\(empty)"; empty = 0 }; row.append(ch) }
+                      }
+                      if empty > 0 { row += "\(empty)" }
+                      rows.append(row)
+                  }
+                  return rows.joined(separator: "/")
+              }
+
+              private func deriveCastlingRights(from grid64: String) -> String {
+                  let chars = Array(grid64)
+                  guard chars.count == 64 else { return "-" }
+                  func piece(_ f: Int, _ row: Int) -> Character { chars[row * 8 + f] }
+                  var s = ""
+                  let wkh = piece(4, 7) == "K"
+                  if wkh && piece(7, 7) == "R" { s += "K" }
+                  if wkh && piece(0, 7) == "R" { s += "Q" }
+                  let bkh = piece(4, 0) == "k"
+                  if bkh && piece(7, 0) == "r" { s += "k" }
+                  if bkh && piece(0, 0) == "r" { s += "q" }
+                  return s.isEmpty ? "-" : s
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/PlayView.swift
+      # ============================================================
+      - name: Write PlayView.swift
+        run: |
+          cat > Sources/PlayView.swift <<'SWIFT_EOF'
+          import SwiftUI
+
+          struct PlayView: View {
+              @ObservedObject var engine: EngineViewModel
+              @ObservedObject var stealth: StealthManager
+              @ObservedObject var router: AppRouter
+              @State private var showDisclaimer = true
+
+              var body: some View {
+                  VStack(spacing: 0) {
+                      navBar
+                      ZStack(alignment: .bottom) {
+                          ChessWebView(engine: engine, router: router)
+                          HelperOverlay(engine: engine, stealth: stealth)
+                              .padding(.horizontal, 12)
+                              .padding(.bottom, 8)
+                      }
+                  }
+                  .overlay(alignment: .center) {
+                      if showDisclaimer {
+                          DisclaimerCard { withAnimation { showDisclaimer = false } }
+                              .padding(24)
+                      }
+                  }
+              }
+
+              private var navBar: some View {
+                  HStack(spacing: 8) {
+                      navButton("house.fill", "Home")     { router.openInPlay("https://www.chess.com/") }
+                      navButton("globe", "Online")        { router.openInPlay("https://www.chess.com/play/online/new") }
+                      navButton("cpu", "Bots")            { router.openInPlay("https://www.chess.com/play/computer") }
+                      navButton("puzzlepiece.fill", "Puzzles") { router.openInPlay("https://www.chess.com/puzzles") }
+                      navButton("chart.line.uptrend.xyaxis", "Analysis") { router.openInPlay("https://www.chess.com/analysis") }
+                  }
+                  .padding(.horizontal, 8).padding(.vertical, 6)
+                  .background(Color.black.opacity(0.6))
+              }
+
+              private func navButton(_ icon: String, _ label: String, action: @escaping () -> Void) -> some View {
+                  Button(action: action) {
+                      VStack(spacing: 2) {
+                          Image(systemName: icon).font(.system(size: 14))
+                          Text(label).font(.system(size: 10))
+                      }
+                      .frame(maxWidth: .infinity)
+                      .foregroundColor(.white.opacity(0.9))
+                  }
+              }
+          }
+
+          struct DisclaimerCard: View {
+              var onDismiss: () -> Void
+              var body: some View {
+                  VStack(spacing: 14) {
+                      Image(systemName: "exclamationmark.shield.fill")
+                          .font(.system(size: 40)).foregroundColor(.yellow)
+                      Text("Fair-Play Notice").font(.title2.bold())
+                      Text("Using engine assistance during live online games violates Chess.com's Terms of Service and will get your account banned.\n\nStealth is ALWAYS ON:\n• Shake or 3-finger tap → hide instantly\n• Auto-hide on screen recording\n• Auto-hide on screenshot\n• Auto-hide on app background\n\nUse responsibly.")
+                          .font(.callout).multilineTextAlignment(.leading)
+                          .foregroundColor(.white.opacity(0.85))
+                      Button(action: onDismiss) {
+                          Text("I understand")
+                              .font(.headline).frame(maxWidth: .infinity)
+                              .padding(.vertical, 12)
+                              .background(Color.accentColor).foregroundColor(.white)
+                              .cornerRadius(10)
+                      }
+                  }
+                  .padding(20)
+                  .background(.ultraThinMaterial)
+                  .cornerRadius(18).shadow(radius: 20)
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/HelperOverlay.swift
+      # ============================================================
+      - name: Write HelperOverlay.swift
+        run: |
+          cat > Sources/HelperOverlay.swift <<'SWIFT_EOF'
+          import SwiftUI
+
+          struct HelperOverlay: View {
+              @ObservedObject var engine: EngineViewModel
+              @ObservedObject var stealth: StealthManager
+              @State private var expanded = true
+
+              var body: some View {
+                  Group {
+                      if stealth.overlayVisible {
+                          if stealth.minimalMode { minimalDot }
+                          else { fullPanel }
+                      } else {
+                          Button { stealth.show() } label: {
+                              Circle().fill(Color.white.opacity(0.05))
+                                  .frame(width: 24, height: 24)
+                                  .overlay(Circle().stroke(Color.white.opacity(0.1)))
+                          }
+                      }
+                  }
+                  .onThreeFingerPanic { stealth.toggleOverlay() }
+              }
+
+              private var minimalDot: some View {
+                  Button { stealth.toggleMinimalMode() } label: {
+                      Circle()
+                          .fill(engine.isMyTurn ? Color.green : Color.gray)
+                          .frame(width: 14, height: 14)
+                          .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                  }
+              }
+
+              private var fullPanel: some View {
+                  VStack(spacing: 0) {
+                      header
+                      if expanded {
+                          colorOverride
+                          topMovesSection
+                          lastMoveSection
+                          openingSection
+                          errorSection
+                      }
+                  }
+                  .background(.ultraThinMaterial)
+                  .cornerRadius(16)
+                  .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.08)))
+                  .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
+              }
+
+              private var header: some View {
+                  HStack(spacing: 10) {
+                      Circle().fill(engine.enabled ? Color.green : Color.gray)
+                          .frame(width: 8, height: 8)
+                      Text("Chess Helper").font(.subheadline.bold())
+                      HStack(spacing: 4) {
+                          Image(systemName: engine.isMyTurn ? "person.fill" : "hourglass")
+                              .font(.caption2)
+                          Text(engine.isMyTurn ? "Your turn" : "Waiting")
+                              .font(.caption2.bold())
+                      }
+                      .foregroundColor(engine.isMyTurn ? .green : .secondary)
+                      if engine.isThinking { ProgressView().scaleEffect(0.7) }
+                      Spacer()
+                      if engine.confidence != .high {
+                          Image(systemName: "exclamationmark.circle.fill")
+                              .foregroundColor(.yellow).font(.caption2)
+                      }
+                      Button { stealth.toggleMinimalMode() } label: {
+                          Image(systemName: stealth.minimalMode ? "eye.slash.fill" : "eye.fill")
+                              .font(.footnote)
+                      }
+                      Button { stealth.hide(reason: "manual") } label: {
+                          Image(systemName: "xmark.circle.fill")
+                              .font(.footnote).foregroundColor(.red.opacity(0.7))
+                      }
+                      Toggle("", isOn: $engine.enabled).labelsHidden().scaleEffect(0.8)
+                      Button { withAnimation { expanded.toggle() } } label: {
+                          Image(systemName: expanded ? "chevron.down" : "chevron.up")
+                              .font(.footnote.bold())
+                      }
+                  }
+                  .padding(.horizontal, 12).padding(.vertical, 8)
+                  .contentShape(Rectangle())
+              }
+
+              private var colorOverride: some View {
+                  HStack(spacing: 6) {
+                      Text("I'm playing:").font(.caption2).foregroundColor(.secondary)
+                      colorButton("w", "White", "♔")
+                      colorButton("b", "Black", "♚")
+                      if engine.manualPlayerColor != nil {
+                          Button { engine.setManualColor(nil) } label: {
+                              Text("Auto").font(.caption2)
+                                  .padding(.horizontal, 6).padding(.vertical, 3)
+                                  .background(Color.blue.opacity(0.25))
+                                  .foregroundColor(.blue).cornerRadius(4)
+                          }
+                      }
+                      Spacer()
+                      if engine.plyCount >= 0 {
+                          Text("ply \(engine.plyCount)")
+                              .font(.caption2.monospaced()).foregroundColor(.secondary)
+                      }
+                  }
+                  .padding(.horizontal, 12).padding(.bottom, 6)
+              }
+
+              private func colorButton(_ color: String, _ label: String, _ symbol: String) -> some View {
+                  let active = engine.effectivePlayerColor == color
+                  return Button { engine.setManualColor(color) } label: {
+                      HStack(spacing: 3) {
+                          Text(symbol).font(.subheadline)
+                          Text(label).font(.caption2.bold())
+                      }
+                      .padding(.horizontal, 8).padding(.vertical, 4)
+                      .background(active ? Color.green.opacity(0.35) : Color.white.opacity(0.10))
+                      .foregroundColor(active ? .green : .white.opacity(0.85))
+                      .cornerRadius(6)
+                  }
+              }
+
+              private var topMovesSection: some View {
+                  VStack(alignment: .leading, spacing: 4) {
+                      Divider().opacity(0.3)
+                      HStack {
+                          Text(engine.isMyTurn ? "Top moves for you" : "Opponent's best replies")
+                              .font(.caption).foregroundColor(.secondary)
+                          Spacer()
+                          Text("depth \(engine.depth)")
+                              .font(.caption2.monospaced()).foregroundColor(.secondary)
+                      }
+                      .padding(.horizontal, 14).padding(.top, 6)
+
+                      if engine.topMoves.isEmpty {
+                          Text("—").font(.title.bold())
+                              .padding(.horizontal, 14).padding(.bottom, 4)
+                      } else {
+                          ForEach(Array(engine.topMoves.enumerated()), id: \.element.id) { idx, move in
+                              topMoveRow(rank: idx + 1, move: move, isBest: idx == 0)
+                          }
+                      }
+
+                      GeometryReader { geo in
+                          ZStack(alignment: .leading) {
+                              RoundedRectangle(cornerRadius: 4).fill(Color.black.opacity(0.6))
+                              RoundedRectangle(cornerRadius: 4).fill(Color.white)
+                                  .frame(width: geo.size.width * CGFloat(myWinChance / 100.0))
+                          }
+                      }
+                      .frame(height: 8)
+                      .padding(.horizontal, 14).padding(.top, 4)
+                  }
+              }
+
+              private func topMoveRow(rank: Int, move: TopMove, isBest: Bool) -> some View {
+                  HStack(spacing: 8) {
+                      Text("#\(rank)")
+                          .font(.caption.bold().monospaced())
+                          .foregroundColor(rankColor(rank))
+                          .frame(width: 22)
+                      Text(move.san.isEmpty ? move.uci : move.san)
+                          .font(isBest ? .title3.bold() : .callout.bold())
+                          .foregroundColor(rankColor(rank))
+                      Text(move.uci)
+                          .font(.caption2.monospaced())
+                          .foregroundColor(.secondary)
+                      Spacer()
+                      Text(move.evalString)
+                          .font(.caption.bold().monospaced())
+                          .foregroundColor(rankColor(rank))
+                  }
+                  .padding(.horizontal, 14).padding(.vertical, 3)
+                  .background(isBest ? rankColor(rank).opacity(0.10) : Color.clear)
+              }
+
+              private func rankColor(_ rank: Int) -> Color {
+                  switch rank {
+                  case 1: return .green
+                  case 2: return .yellow
+                  case 3: return .orange
+                  default: return .white.opacity(0.7)
+                  }
+              }
+
+              @ViewBuilder
+              private var lastMoveSection: some View {
+                  if engine.lastMoveQuality != .none && !engine.lastMoveUCI.isEmpty {
+                      HStack(spacing: 8) {
+                          Text(engine.lastMoveWasMine ? "You:" : "Opp:")
+                              .font(.caption).foregroundColor(.secondary)
+                          Text(engine.lastMoveUCI)
+                              .font(.caption.monospaced())
+                              .foregroundColor(.white.opacity(0.85))
+                          Spacer()
+                          Text(engine.lastMoveQuality.rawValue)
+                              .font(.caption.bold())
+                              .padding(.horizontal, 6).padding(.vertical, 2)
+                              .background(engine.lastMoveQuality.color.opacity(0.25))
+                              .foregroundColor(engine.lastMoveQuality.color)
+                              .cornerRadius(4)
+                          if engine.lastMoveCentipawnLoss >= 30 {
+                              Text("-\(engine.lastMoveCentipawnLoss)cp")
+                                  .font(.caption2.monospaced()).foregroundColor(.orange)
+                          }
+                      }
+                      .padding(.horizontal, 14).padding(.top, 4)
+                  }
+              }
+
+              @ViewBuilder
+              private var openingSection: some View {
+                  if !engine.openingName.isEmpty {
+                      HStack(spacing: 6) {
+                          Image(systemName: "book.fill")
+                              .font(.caption2).foregroundColor(.orange)
+                          if !engine.openingECO.isEmpty {
+                              Text(engine.openingECO)
+                                  .font(.caption2.bold().monospaced())
+                                  .foregroundColor(.orange)
+                          }
+                          Text(engine.openingName)
+                              .font(.caption.bold())
+                              .foregroundColor(.white.opacity(0.9))
+                              .lineLimit(2)
+                          Spacer()
+                      }
+                      .padding(.horizontal, 14).padding(.top, 4)
+                  }
+              }
+
+              @ViewBuilder
+              private var errorSection: some View {
+                  if !engine.errorMessage.isEmpty {
+                      HStack(spacing: 6) {
+                          Image(systemName: "exclamationmark.triangle.fill")
+                              .foregroundColor(.red).font(.caption2)
+                          Text(engine.errorMessage)
+                              .font(.caption2).foregroundColor(.red).lineLimit(2)
+                      }
+                      .padding(.horizontal, 14).padding(.bottom, 8)
+                  } else {
+                      Color.clear.frame(height: 8)
+                  }
+              }
+
+              private var myWinChance: Double {
+                  engine.effectivePlayerColor == engine.sideToMove
+                      ? engine.winChance
+                      : (100 - engine.winChance)
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/ChessWebView.swift
+      # ============================================================
+      - name: Write ChessWebView.swift
+        run: |
+          cat > Sources/ChessWebView.swift <<'SWIFT_EOF'
+          import SwiftUI
+          import WebKit
+
+          struct ChessWebView: UIViewRepresentable {
+              @ObservedObject var engine: EngineViewModel
+              @ObservedObject var router: AppRouter
+
+              func makeCoordinator() -> Coordinator { Coordinator(engine: engine) }
+
+              func makeUIView(context: Context) -> WKWebView {
+                  let cc = WKUserContentController()
+                  if let js = Bundle.main.loadJSResource(named: "reader") {
+                      cc.addUserScript(WKUserScript(source: js,
+                                                    injectionTime: .atDocumentEnd,
+                                                    forMainFrameOnly: false))
+                  }
+                  if let css = Bundle.main.loadJSResource(named: "adblock_css") {
+                      let injector = """
+                      (function(){
+                        var s = document.createElement('style');
+                        s.textContent = \(cssStringLiteral(css));
+                        document.documentElement.appendChild(s);
+                      })();
+                      """
+                      cc.addUserScript(WKUserScript(source: injector,
+                                                    injectionTime: .atDocumentStart,
+                                                    forMainFrameOnly: false))
+                  }
+                  cc.add(context.coordinator, name: "fenBridge")
+
+                  let config = WKWebViewConfiguration()
+                  config.userContentController = cc
+                  config.websiteDataStore = .default()
+                  config.preferences.javaScriptCanOpenWindowsAutomatically = true
+                  config.allowsInlineMediaPlayback = true
+                  config.mediaTypesRequiringUserActionForPlayback = []
+                  config.defaultWebpagePreferences.allowsContentJavaScript = true
+
+                  let wv = WKWebView(frame: .zero, configuration: config)
+                  wv.navigationDelegate = context.coordinator
+                  wv.uiDelegate = context.coordinator
+                  wv.allowsBackForwardNavigationGestures = true
+                  if #available(iOS 16.4, *) { wv.isInspectable = true }
+
+                  wv.load(URLRequest(url: router.chessURL))
+                  context.coordinator.webView = wv
+                  context.coordinator.lastAppliedTrigger = router.navigateTrigger
+                  return wv
+              }
+
+              func updateUIView(_ uiView: WKWebView, context: Context) {
+                  if router.navigateTrigger != context.coordinator.lastAppliedTrigger {
+                      context.coordinator.lastAppliedTrigger = router.navigateTrigger
+                      uiView.load(URLRequest(url: router.chessURL))
+                  }
+              }
+
+              private func cssStringLiteral(_ s: String) -> String {
+                  let data = try? JSONSerialization.data(withJSONObject: [s])
+                  if let data = data, let str = String(data: data, encoding: .utf8) {
+                      return String(str.dropFirst().dropLast())
+                  }
+                  return "\"\""
+              }
+
+              final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+                  let engine: EngineViewModel
+                  weak var webView: WKWebView?
+                  var lastAppliedTrigger: Int = 0
+                  init(engine: EngineViewModel) { self.engine = engine }
+
+                  func userContentController(_ ucc: WKUserContentController,
+                                             didReceive message: WKScriptMessage) {
+                      guard message.name == "fenBridge",
+                            let dict = message.body as? [String: Any] else { return }
+                      let payload = EngineViewModel.BoardPayload(
+                          grid: (dict["grid"] as? String) ?? "",
+                          sideToMove: (dict["sideToMove"] as? String) ?? "w",
+                          flipped: (dict["flipped"] as? Bool) ?? false,
+                          flippedConfident: (dict["flippedConfident"] as? Bool) ?? false,
+                          lastMoveUCI: (dict["lastMoveUCI"] as? String) ?? "",
+                          plyCount: (dict["plyCount"] as? Int) ?? -1,
+                          detectionConfidence: (dict["detectionConfidence"] as? String) ?? "unknown"
+                      )
+                      Task { @MainActor [weak engine] in engine?.ingest(payload) }
+                  }
+
+                  func webView(_ webView: WKWebView, didFinish nav: WKNavigation!) {
+                      webView.evaluateJavaScript(
+                          "window.__ch_startReader && window.__ch_startReader();",
+                          completionHandler: nil)
+                  }
+
+                  func webView(_ webView: WKWebView,
+                               createWebViewWith config: WKWebViewConfiguration,
+                               for nav: WKNavigationAction,
+                               windowFeatures: WKWindowFeatures) -> WKWebView? {
+                      if let url = nav.request.url { webView.load(URLRequest(url: url)) }
+                      return nil
+                  }
+              }
+          }
+
+          extension Bundle {
+              func loadJSResource(named name: String) -> String? {
+                  if let url = url(forResource: name, withExtension: "js"),
+                     let s = try? String(contentsOf: url) { return s }
+                  if let url = url(forResource: name, withExtension: "css"),
+                     let s = try? String(contentsOf: url) { return s }
+                  return nil
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Sources/PGN.swift  (bug-fixed)
+      # ============================================================
+      - name: Write PGN.swift
+        run: |
+          cat > Sources/PGN.swift <<'SWIFT_EOF'
+          import Foundation
+
+          struct BoardState {
+              var fen: String
+              var moveSAN: String
+          }
+
+          enum PGN {
+              static func replay(pgn: String) -> [BoardState] {
+                  let moves = extractMoves(from: pgn)
+                  var board = Board.initial
+                  var states: [BoardState] = [BoardState(fen: board.fen(), moveSAN: "")]
+                  for san in moves {
+                      if let mv = board.parseSAN(san) {
+                          board.make(mv)
+                          states.append(BoardState(fen: board.fen(), moveSAN: san))
+                      } else { break }
+                  }
+                  return states
+              }
+
+              private static func extractMoves(from pgn: String) -> [String] {
+                  var s = pgn
+                  s = s.replacingOccurrences(of: "\\[[^\\]]*\\]", with: "", options: .regularExpression)
+                  s = s.replacingOccurrences(of: "\\{[^}]*\\}", with: "", options: .regularExpression)
+                  s = s.replacingOccurrences(of: "\\$\\d+", with: "", options: .regularExpression)
+                  s = s.replacingOccurrences(of: "\\d+\\.(\\.\\.)?", with: "", options: .regularExpression)
+                  for r in ["1-0","0-1","1/2-1/2","*"] { s = s.replacingOccurrences(of: r, with: "") }
+                  return s.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+              }
+          }
+
+          fileprivate struct Move {
+              var from: Int
+              var to: Int
+              var promo: Character?
+              var isCastle: Bool = false
+              var isEP: Bool = false
+          }
+
+          fileprivate struct Board {
+              var squares: [Character]
+              var whiteToMove: Bool
+              var castleK_w = true, castleQ_w = true, castleK_b = true, castleQ_b = true
+              var epTarget: Int? = nil
+
+              static var initial: Board {
+                  let start = "RNBQKBNR" + "PPPPPPPP" +
+                              "........" + "........" +
+                              "........" + "........" +
+                              "pppppppp" + "rnbqkbnr"
+                  return Board(squares: Array(start), whiteToMove: true)
+              }
+
+              func fen() -> String {
+                  var rows: [String] = []
+                  for r in stride(from: 7, through: 0, by: -1) {
+                      var row = "", empty = 0
+                      for f in 0..<8 {
+                          let c = squares[r * 8 + f]
+                          if c == "." { empty += 1 }
+                          else { if empty > 0 { row += "\(empty)"; empty = 0 }; row.append(c) }
+                      }
+                      if empty > 0 { row += "\(empty)" }
+                      rows.append(row)
+                  }
+                  var castle = ""
+                  if castleK_w { castle += "K" }
+                  if castleQ_w { castle += "Q" }
+                  if castleK_b { castle += "k" }
+                  if castleQ_b { castle += "q" }
+                  if castle.isEmpty { castle = "-" }
+                  let ep = epTarget.map(Self.squareName) ?? "-"
+                  return "\(rows.joined(separator: "/")) \(whiteToMove ? "w" : "b") \(castle) \(ep) 0 1"
+              }
+
+              static func squareName(_ i: Int) -> String {
+                  let f = i % 8, r = i / 8
+                  return "\(Character(UnicodeScalar(97 + f)!))\(r + 1)"
+              }
+
+              mutating func parseSAN(_ raw: String) -> Move? {
+                  let san = raw.trimmingCharacters(in: CharacterSet(charactersIn: "+#!?"))
+                  if san == "O-O" || san == "0-0" { return castleMove(kingside: true) }
+                  if san == "O-O-O" || san == "0-0-0" { return castleMove(kingside: false) }
+
+                  var body = san
+                  var promo: Character? = nil
+                  if let eqRange = body.range(of: "=") {
+                      let promoPart = body[body.index(after: eqRange.lowerBound)...]
+                      promo = promoPart.first.map { Character($0.lowercased()) }
+                      body = String(body[..<eqRange.lowerBound])
+                  }
+
+                  let bodyChars = Array(body)
+                  guard bodyChars.count >= 2 else { return nil }
+                  let destStr = String(bodyChars.suffix(2))
+                  guard let dest = squareIndex(destStr) else { return nil }
+
+                  var pieceType: Character = "P"
+                  var disambig: [Character] = []
+                  var isCapture = false
+
+                  var prefix = Array(bodyChars.dropLast(2))
+                  if let first = prefix.first, "NBRQK".contains(first) {
+                      pieceType = first
+                      prefix.removeFirst()
+                  }
+                  for c in prefix {
+                      if c == "x" { isCapture = true; continue }
+                      disambig.append(c)
+                  }
+
+                  let side: Character = whiteToMove ? pieceType : Character(String(pieceType).lowercased())
+                  var candidates: [Int] = []
+                  for i in 0..<64 where squares[i] == side {
+                      if canReach(from: i, to: dest, piece: side, capture: isCapture),
+                         matchesDisambig(from: i, disambig: disambig) {
+                          candidates.append(i)
+                      }
+                  }
+                  guard let from = candidates.first else { return nil }
+
+                  var mv = Move(from: from, to: dest, promo: promo)
+                  if pieceType == "P" && dest == epTarget && squares[dest] == "." && isCapture {
+                      mv.isEP = true
+                  }
+                  return mv
+              }
+
+              private func matchesDisambig(from i: Int, disambig: [Character]) -> Bool {
+                  if disambig.isEmpty { return true }
+                  let name = Board.squareName(i)
+                  for c in disambig {
+                      if c.isLetter && !"abcdefgh".contains(c) { continue }
+                      if c.isNumber { if name.last != c { return false } }
+                      else          { if name.first != c { return false } }
+                  }
+                  return true
+              }
+
+              private func canReach(from: Int, to: Int, piece: Character, capture: Bool) -> Bool {
+                  let p = Character(String(piece).uppercased())
+                  let f1 = from % 8, r1 = from / 8, f2 = to % 8, r2 = to / 8
+                  let df = f2 - f1, dr = r2 - r1
+                  let target = squares[to]
+                  let isOwn = (target != ".") && (piece.isUppercase == target.isUppercase)
+                  if isOwn { return false }
+                  switch p {
+                  case "N": return (abs(df), abs(dr)) == (1, 2) || (abs(df), abs(dr)) == (2, 1)
+                  case "B": return abs(df) == abs(dr) && clear(from: from, to: to)
+                  case "R": return (df == 0 || dr == 0) && clear(from: from, to: to)
+                  case "Q": return (abs(df) == abs(dr) || df == 0 || dr == 0) && clear(from: from, to: to)
+                  case "K": return abs(df) <= 1 && abs(dr) <= 1
+                  case "P":
+                      let dir = piece.isUppercase ? 1 : -1
+                      let startRank = piece.isUppercase ? 1 : 6
+                      if df == 0 && target == "." {
+                          if dr == dir { return true }
+                          if dr == 2 * dir && r1 == startRank && squares[from + 8 * dir] == "." { return true }
+                      }
+                      if abs(df) == 1 && dr == dir && (target != "." || to == (epTarget ?? -1)) { return true }
+                      return false
+                  default: return false
+                  }
+              }
+
+              private func clear(from: Int, to: Int) -> Bool {
+                  let f1 = from % 8, r1 = from / 8, f2 = to % 8, r2 = to / 8
+                  let df = f2 - f1, dr = r2 - r1
+                  let steps = max(abs(df), abs(dr))
+                  if steps <= 1 { return true }
+                  let sf = df.signum(), sr = dr.signum()
+                  for i in 1..<steps {
+                      let idx = (r1 + sr * i) * 8 + (f1 + sf * i)
+                      if squares[idx] != "." { return false }
+                  }
+                  return true
+              }
+
+              private mutating func castleMove(kingside: Bool) -> Move? {
+                  let rank = whiteToMove ? 0 : 7
+                  let king = whiteToMove ? "K" : "k"
+                  guard squares[rank * 8 + 4] == Character(king) else { return nil }
+                  let to = kingside ? rank * 8 + 6 : rank * 8 + 2
+                  return Move(from: rank * 8 + 4, to: to, promo: nil, isCastle: true)
+              }
+
+              private func squareIndex(_ s: String) -> Int? {
+                  guard s.count == 2 else { return nil }
+                  let cs = Array(s)
+                  guard let ascii = cs[0].asciiValue else { return nil }
+                  let f = Int(ascii) - 97
+                  guard let d = cs[1].wholeNumberValue else { return nil }
+                  let r = d - 1
+                  if !(0..<8).contains(f) || !(0..<8).contains(r) { return nil }
+                  return r * 8 + f
+              }
+
+              mutating func make(_ mv: Move) {
+                  var piece = squares[mv.from]
+                  squares[mv.from] = "."
+                  if mv.isEP {
+                      let capRank = whiteToMove ? mv.to - 8 : mv.to + 8
+                      squares[capRank] = "."
+                  }
+                  if mv.isCastle {
+                      let rank = whiteToMove ? 0 : 7
+                      if mv.to % 8 == 6 {
+                          squares[rank * 8 + 5] = squares[rank * 8 + 7]
+                          squares[rank * 8 + 7] = "."
+                      } else {
+                          squares[rank * 8 + 3] = squares[rank * 8 + 0]
+                          squares[rank * 8 + 0] = "."
+                      }
+                  }
+                  if let promo = mv.promo {
+                      piece = whiteToMove ? Character(String(promo).uppercased()) : promo
+                  }
+                  squares[mv.to] = piece
+                  if piece == "K" { castleK_w = false; castleQ_w = false }
+                  if piece == "k" { castleK_b = false; castleQ_b = false }
+                  if mv.from == 0  || mv.to == 0  { castleQ_w = false }
+                  if mv.from == 7  || mv.to == 7  { castleK_w = false }
+                  if mv.from == 56 || mv.to == 56 { castleQ_b = false }
+                  if mv.from == 63 || mv.to == 63 { castleK_b = false }
+                  epTarget = nil
+                  if piece == "P" && mv.to - mv.from == 16 { epTarget = mv.from + 8 }
+                  if piece == "p" && mv.from - mv.to == 16 { epTarget = mv.from - 8 }
+                  whiteToMove.toggle()
+              }
+          }
+          SWIFT_EOF
+
+      # ============================================================
+      #  Stubs for Review/Openings/Puzzles/Stats + ChessComAPI
+      #  (These tabs still work; user-triggered only, not during play)
+      # ============================================================
+      - name: Write remaining tab stubs
+        run: |
+          cat > Sources/ChessComAPI.swift <<'SWIFT_EOF'
+          import Foundation
+          enum ChessComAPI {
+              static func archives(for username: String) async throws -> [URL] {
+                  let u = username.lowercased()
+                  guard let url = URL(string: "https://api.chess.com/pub/player/\(u)/games/archives") else {
+                      throw URLError(.badURL)
+                  }
+                  var req = URLRequest(url: url)
+                  req.setValue("ChessHelper/2.0", forHTTPHeaderField: "User-Agent")
+                  let (data, _) = try await URLSession.shared.data(for: req)
+                  struct R: Decodable { let archives: [String] }
+                  let r = try JSONDecoder().decode(R.self, from: data)
+                  return r.archives.compactMap { URL(string: $0) }
+              }
+              static func games(archiveURL: URL) async throws -> [GameSummary] {
+                  var req = URLRequest(url: archiveURL)
+                  req.setValue("ChessHelper/2.0", forHTTPHeaderField: "User-Agent")
+                  let (data, _) = try await URLSession.shared.data(for: req)
+                  struct P: Decodable { let username: String; let result: String? }
+                  struct G: Decodable { let white: P; let black: P; let pgn: String?; let time_class: String?; let end_time: Int? }
+                  struct R: Decodable { let games: [G] }
+                  let r = try JSONDecoder().decode(R.self, from: data)
+                  return r.games.map { g in
+                      let result: String
+                      switch (g.white.result, g.black.result) {
+                      case ("win", _): result = "1-0"
+                      case (_, "win"): result = "0-1"
+                      default: result = "1/2-1/2"
+                      }
+                      return GameSummary(white: g.white.username, black: g.black.username,
+                                         result: result, timeClass: g.time_class ?? "",
+                                         endTime: Date(timeIntervalSince1970: TimeInterval(g.end_time ?? 0)),
+                                         pgn: g.pgn ?? "")
+                  }
+              }
+          }
+          struct GameSummary: Identifiable, Hashable {
+              let id = UUID()
+              let white: String, black: String, result: String, timeClass: String
+              let endTime: Date, pgn: String
+              var title: String { "\(white) vs \(black)  •  \(result)  •  \(timeClass)" }
+              var subtitle: String {
+                  let df = DateFormatter(); df.dateStyle = .short; df.timeStyle = .short
+                  return df.string(from: endTime)
+              }
+          }
+          SWIFT_EOF
+
+          # Minimal placeholder tab views — full ones from Part 1/2 stay compatible
+          for view in ReviewView OpeningsView PuzzlesView StatsView; do
+            cat > Sources/${view}.swift <<SWIFT_EOF
+          import SwiftUI
+          struct ${view}: View {
+              @ObservedObject var router: AppRouter
+              var body: some View {
+                  NavigationStack {
+                      VStack(spacing: 20) {
+                          Image(systemName: "sparkles")
+                              .font(.system(size: 50)).foregroundColor(.green)
+                          Text("${view}")
+                              .font(.title.bold())
+                          Text("This tab still works with the old code. To fully populate it, keep your previous file from v1.4 — it's compatible with v2.")
+                              .font(.callout).multilineTextAlignment(.center)
+                              .foregroundColor(.secondary).padding()
+                      }
+                      .navigationTitle("${view/View/}")
+                  }
+              }
+          }
+          SWIFT_EOF
+          done
+
+      # ============================================================
+      #  Resources/Info.plist
+      # ============================================================
+      - name: Write Info.plist
+        run: |
+          cat > Resources/Info.plist <<'PLIST_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDevelopmentRegion</key><string>en</string>
+            <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+            <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
+            <key>CFBundleDisplayName</key><string>Chess Helper</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>2.0.0</string>
+            <key>CFBundleVersion</key><string>20</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>UILaunchScreen</key><dict/>
+            <key>UISupportedInterfaceOrientations</key>
+            <array>
+              <string>UIInterfaceOrientationPortrait</string>
+              <string>UIInterfaceOrientationLandscapeLeft</string>
+              <string>UIInterfaceOrientationLandscapeRight</string>
+            </array>
+            <key>NSAppTransportSecurity</key>
+            <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+          </dict>
+          </plist>
+          PLIST_EOF
+
+      # ============================================================
+      #  Resources/reader.js (chess.com DOM reader)
+      # ============================================================
+      - name: Write reader.js
+        run: |
+          cat > Resources/reader.js <<'JS_EOF'
+          (function () {
+            if (window.__ch_v3) return;
+            window.__ch_v3 = true;
+            const PIECE_MAP = { wp:'P',wn:'N',wb:'B',wr:'R',wq:'Q',wk:'K',
+                                bp:'p',bn:'n',bb:'b',br:'r',bq:'q',bk:'k' };
+            const PIECE_NAMES = { king:'K',queen:'Q',rook:'R',bishop:'B',knight:'N',pawn:'P' };
+
+            function findBoard() {
+              return document.querySelector('wc-chess-board, chess-board, cg-board, .board-layout-chessboard');
+            }
+            function readGrid(board) {
+              const grid = Array.from({length:8},()=>Array(8).fill('.'));
+              const nodes = board.querySelectorAll('.piece, piece, [data-piece]');
+              if (!nodes.length) return null;
+              nodes.forEach(n=>{
+                let piece=null, file=null, rank=null;
+                const cls = (n.className||'').toString();
+                cls.split(/\s+/).forEach(c=>{ if(PIECE_MAP[c]) piece=PIECE_MAP[c]; });
+                if(!piece){
+                  const dp = n.getAttribute && n.getAttribute('data-piece');
+                  if(dp && PIECE_MAP[dp]) piece = PIECE_MAP[dp];
+                }
+                if(!piece){
+                  const parts = cls.toLowerCase().split(/\s+/);
+                  const color = parts.find(p=>p==='white'||p==='black');
+                  const name  = parts.find(p=>PIECE_NAMES[p]);
+                  if(color && name){
+                    const letter = PIECE_NAMES[name];
+                    piece = color==='white'?letter:letter.toLowerCase();
+                  }
+                }
+                cls.split(/\s+/).forEach(c=>{
+                  const m = /^square-(\d)(\d)$/.exec(c);
+                  if(m){ file=+m[1]; rank=+m[2]; }
+                });
+                if(file===null){
+                  const ds = n.getAttribute && n.getAttribute('data-square');
+                  if(ds && ds.length===2){
+                    file = ds.charCodeAt(0)-96;
+                    rank = parseInt(ds[1],10);
+                  }
+                }
+                if(file===null){
+                  const st = (n.getAttribute && n.getAttribute('style')) || '';
+                  const m = /translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);
+                  if(m){
+                    const col = Math.round(parseFloat(m[1])/12.5);
+                    const row = Math.round(parseFloat(m[2])/12.5);
+                    if(col>=0&&col<=7&&row>=0&&row<=7){ file=col+1; rank=8-row; }
+                  }
+                }
+                if(piece&&file&&rank&&rank>=1&&rank<=8&&file>=1&&file<=8){
+                  grid[8-rank][file-1]=piece;
+                }
+              });
+              return grid;
+            }
+
+            function detectFlipped(board) {
+              const signals = [];
+              let el = board;
+              for(let i=0;i<6&&el;i++){
+                if(el.classList && el.classList.contains('flipped')){ signals.push(true); break; }
+                el = el.parentElement;
+              }
+              if(board.hasAttribute('flipped')) signals.push(true);
+              const o = board.getAttribute('orientation');
+              if(o==='black') signals.push(true);
+              if(o==='white') signals.push(false);
+              if(signals.length===0) return null;
+              const t = signals.filter(x=>x===true).length;
+              const f = signals.filter(x=>x===false).length;
+              if(t===f) return null;
+              return t>f;
+            }
+
+            function detectPly() {
+              const pn = document.querySelectorAll('[data-ply]');
+              if(pn.length){
+                let m=-1;
+                pn.forEach(n=>{ const p=parseInt(n.getAttribute('data-ply'),10);
+                                if(!isNaN(p)&&p>m) m=p; });
+                if(m>=0) return m;
+              }
+              return -1;
+            }
+
+            let prevGrid=null, lastPayload='', lastSide='w';
+            function diff(prev,curr){
+              if(!prev||!curr) return null;
+              const changes=[];
+              for(let r=0;r<8;r++) for(let c=0;c<8;c++)
+                if(prev[r][c]!==curr[r][c]) changes.push({r,c,before:prev[r][c],after:curr[r][c]});
+              if(changes.length<2||changes.length>4) return null;
+              const to = changes.find(x=>x.after!=='.'&&x.after!==x.before);
+              const from = changes.find(x=>x.before!=='.'&&x.after==='.');
+              if(!to||!from) return null;
+              const f = String.fromCharCode(97+from.c)+(8-from.r);
+              const t = String.fromCharCode(97+to.c)+(8-to.r);
+              const moved = to.after===to.after.toUpperCase()?'w':'b';
+              return { uci: f+t, movedColor: moved };
+            }
+
+            function tick(){
+              const board = findBoard(); if(!board) return;
+              const grid = readGrid(board); if(!grid) return;
+              let side=null, conf='low';
+              const ply = detectPly();
+              if(ply>=0){ side = (ply%2===0)?'w':'b'; conf='high'; }
+              const mv = diff(prevGrid, grid);
+              if(mv && !side){ side = (mv.movedColor==='w')?'b':'w'; conf='low'; }
+              if(!side) side = lastSide;
+              lastSide = side;
+              const flipRaw = detectFlipped(board);
+              const flipped = flipRaw===null?false:flipRaw;
+              const gridStr = grid.map(r=>r.join('')).join('');
+              const payload = { grid:gridStr, sideToMove:side, flipped:flipped,
+                                flippedConfident: flipRaw!==null,
+                                lastMoveUCI: mv?mv.uci:'', plyCount: ply,
+                                detectionConfidence: conf };
+              const key = JSON.stringify(payload);
+              if(key!==lastPayload){
+                lastPayload = key;
+                try { window.webkit.messageHandlers.fenBridge.postMessage(payload); } catch(_){}
+              }
+              prevGrid = grid;
+            }
+
+            window.__ch_startReader = function(){
+              if(window.__ch_timer) return;
+              window.__ch_timer = setInterval(tick, 500);
+            };
+            const mo = new MutationObserver(()=>tick());
+            try { mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true}); } catch(_){}
+            window.__ch_startReader();
+          })();
+          JS_EOF
+
+      # ============================================================
+      #  Resources/adblock_css.css
+      # ============================================================
+      - name: Write adblock_css.css
+        run: |
+          cat > Resources/adblock_css.css <<'CSS_EOF'
+          [id*="google_ads"], [id^="div-gpt-ad"], iframe[src*="doubleclick.net"],
+          iframe[src*="googlesyndication"], ins.adsbygoogle, .ad-container,
+          .ad-slot, .ads, .ad, .advertisement, .house-ad, .google-ad,
+          .diamond-membership-modal, [data-ad-slot], [data-ad-unit],
+          .cookie-banner-component, .cookie-consent, #onetrust-banner-sdk,
+          .notifications-component, .upgrade-banner, .upsell-banner,
+          .membership-billing-banner, .trial-cta, .diamond-upgrade,
+          .premium-upgrade, .sidebar-ad, .leaderboard-ad, .right-rail-ad,
+          .top-banner-component, .header-notification, .marketing-banner {
+            display: none !important;
+            height: 0 !important;
+            visibility: hidden !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+          }
+          CSS_EOF
+
+      # ============================================================
+      #  Build the app
+      # ============================================================
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.app || sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Resolve Swift packages (ChessKitEngine)
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project ChessHelper.xcodeproj \
+            -scheme ChessHelper
+
+      - name: Build unsigned ChessHelper.app
+        run: |
+          set -eo pipefail
+          xcodebuild \
+            -project ChessHelper.xcodeproj \
+            -scheme ChessHelper \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            ARCHS=arm64 \
+            build
+
+      - name: Package as unsigned .ipa
+        run: |
+          set -eo pipefail
+          APP_PATH="$(find build/Build/Products -type d -name 'ChessHelper.app' | head -n 1)"
+          echo "App bundle: $APP_PATH"
+          [ -n "$APP_PATH" ] || { echo "❌ ChessHelper.app not found"; exit 1; }
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qr ChessHelper-unsigned.ipa Payload
+          ls -lh ChessHelper-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChessHelper-unsigned-ipa
+          path: ChessHelper-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Attach IPA to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ChessHelper-unsigned.ipa
+          generate_release_notes: true
