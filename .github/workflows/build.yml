@@ -477,8 +477,7 @@ jobs:
               with open(path, "w") as f: f.write(content)
               print(f"  ✅ {path}")
           print(f"\nWrote {len(files)} core files (part 1)")
-          PYEOF
-                - name: Generate remaining source files
+          PYEOF      - name: Generate remaining source files
         shell: bash
         run: |
           python3 <<'PYEOF'
