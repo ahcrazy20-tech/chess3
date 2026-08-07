@@ -1,4 +1,4 @@
-name: Build ChessHelper v3.0 Stealth
+name: Build ChessHelper v3.1 Stealth
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "3.0.0"
-              CURRENT_PROJECT_VERSION: "30"
+              MARKETING_VERSION: "3.1.0"
+              CURRENT_PROJECT_VERSION: "31"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -149,14 +149,7 @@ jobs:
                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
               ]
               static func randomUserAgent() -> String { userAgents.randomElement()! }
-              static func humanThinkDelay(complexity: Double = 0.5) -> UInt64 {
-                  let baseMs = 800.0
-                  let extraMs = Double.random(in: 500...4200) * (0.4 + complexity)
-                  return UInt64((baseMs + extraMs) * 1_000_000)
-              }
-              static func trafficJitter() -> UInt64 {
-                  UInt64.random(in: 200_000_000...800_000_000)
-              }
+              static func trafficJitter() -> UInt64 { UInt64.random(in: 200_000_000...800_000_000) }
               static func readerInterval() -> Int { Int.random(in: 400...900) }
               private static func randomName(prefix: String, length: Int) -> String {
                   let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -194,23 +187,33 @@ jobs:
               let depth: Int
           }
 
+          /// Uses stockfish.online — chess.com cannot see this traffic.
+          /// For top-N, we call the API multiple times, each time excluding
+          /// previously-found best moves (iterative exclusion / poor man's MultiPV).
           enum EngineService {
-              static func analyze(fen: String, depth: Int = 13, variants: Int = 3) async throws -> EngineAnalysis {
+
+              /// Single call to stockfish.online
+              private static func callOnce(fen: String, depth: Int,
+                                           excludeMoves: [String] = []) async throws -> (uci: String, cp: Int?, mate: Int?, depth: Int)? {
                   try? await Task.sleep(nanoseconds: StealthConfig.trafficJitter())
-                  guard let url = URL(string: "https://chess-api.com/v1") else {
+                  var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
+                  var items = [
+                      URLQueryItem(name: "fen", value: fen),
+                      URLQueryItem(name: "depth", value: "\(min(max(depth, 8), 15))")
+                  ]
+                  // Some endpoints support 'exclude' — we send it as a courtesy
+                  if !excludeMoves.isEmpty {
+                      items.append(URLQueryItem(name: "exclude", value: excludeMoves.joined(separator: ",")))
+                  }
+                  comps.queryItems = items
+                  guard let url = comps.url else {
                       throw NSError(domain: "EngineService", code: -1, userInfo: [NSLocalizedDescriptionKey: "Bad URL"])
                   }
                   var req = URLRequest(url: url)
-                  req.httpMethod = "POST"
-                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  req.setValue("https://www.google.com/", forHTTPHeaderField: "Referer")
                   req.timeoutInterval = 12
-                  let body: [String: Any] = [
-                      "fen": fen, "depth": min(depth, 18),
-                      "variants": max(1, min(variants, 5)), "maxThinkingTime": 50
-                  ]
-                  req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                  req.setValue("https://lichess.org/", forHTTPHeaderField: "Referer")
+
                   let (data, resp) = try await URLSession.shared.data(for: req)
                   guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                       throw NSError(domain: "EngineService", code: -2, userInfo: [NSLocalizedDescriptionKey: "HTTP error"])
@@ -218,36 +221,62 @@ jobs:
                   guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                       throw NSError(domain: "EngineService", code: -3, userInfo: [NSLocalizedDescriptionKey: "Bad JSON"])
                   }
+
+                  // stockfish.online returns "bestmove b b7b5 ponder ..." format
+                  let bestMoveField = (json["bestmove"] as? String) ?? ""
+                  let parts = bestMoveField.split(separator: " ").map(String.init)
+                  var uci = ""
+                  for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count {
+                      uci = parts[i+1]; break
+                  }
+                  if uci.isEmpty { uci = parts.first ?? "" }
+                  guard !uci.isEmpty else { return nil }
+                  // Skip if this move was in excludeMoves (some servers ignore the param)
+                  if excludeMoves.contains(uci) { return nil }
+
+                  let evalDouble = json["evaluation"] as? Double
+                  let mate = json["mate"] as? Int
+                  let cp: Int? = evalDouble.map { Int(($0 * 100).rounded()) }
                   let d = (json["depth"] as? Int) ?? depth
-                  var moves: [TopMove] = []
-                  let primaryUci = (json["move"] as? String) ?? ""
-                  let primarySan = (json["san"] as? String) ?? primaryUci
-                  let primaryEval = json["eval"] as? Double
-                  let primaryMate = json["mate"] as? Int
-                  if !primaryUci.isEmpty {
-                      let cp = primaryEval.map { Int(($0 * 100).rounded()) }
-                      moves.append(TopMove(rank: 1, uci: primaryUci, san: primarySan,
-                                           evaluationCp: cp,
-                                           mateIn: (primaryMate == 0 ? nil : primaryMate),
-                                           depth: d))
-                  }
-                  if let vars = json["variants"] as? [[String: Any]] {
-                      for v in vars {
-                          let uci = (v["move"] as? String) ?? ""
-                          let san = (v["san"] as? String) ?? uci
-                          if uci.isEmpty || uci == primaryUci { continue }
-                          let e = v["eval"] as? Double
-                          let m = v["mate"] as? Int
-                          let cp = e.map { Int(($0 * 100).rounded()) }
-                          moves.append(TopMove(rank: moves.count + 1, uci: uci, san: san,
-                                               evaluationCp: cp,
-                                               mateIn: (m == 0 ? nil : m), depth: d))
-                          if moves.count >= variants { break }
-                      }
-                  }
-                  return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: d)
+                  return (uci: uci, cp: cp, mate: (mate == 0 ? nil : mate), depth: d)
               }
 
+              /// Iterative exclusion: call API up to `variants` times, each time
+              /// excluding previously-found best moves. This gives real top-N.
+              static func analyze(fen: String, depth: Int = 13, variants: Int = 3) async throws -> EngineAnalysis {
+                  var moves: [TopMove] = []
+                  var excluded: [String] = []
+                  var lastDepth = depth
+                  let target = max(1, min(variants, 5))
+
+                  for rank in 1...target {
+                      do {
+                          if let result = try await callOnce(fen: fen, depth: depth, excludeMoves: excluded) {
+                              // Guard against duplicates
+                              if excluded.contains(result.uci) { break }
+                              moves.append(TopMove(
+                                  rank: rank,
+                                  uci: result.uci,
+                                  san: result.uci,
+                                  evaluationCp: result.cp,
+                                  mateIn: result.mate,
+                                  depth: result.depth
+                              ))
+                              excluded.append(result.uci)
+                              lastDepth = result.depth
+                          } else {
+                              break
+                          }
+                      } catch {
+                          // If first call fails, throw. If later calls fail, just return what we have.
+                          if rank == 1 { throw error } else { break }
+                      }
+                  }
+
+                  return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: lastDepth)
+              }
+
+              /// Decoy request to obfuscate traffic patterns
               static func fireDecoyRequest() async {
                   let decoyFens = [
                       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -257,7 +286,7 @@ jobs:
                       "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
                   ]
                   guard let fen = decoyFens.randomElement() else { return }
-                  _ = try? await analyze(fen: fen, depth: 10, variants: 1)
+                  _ = try? await callOnce(fen: fen, depth: 10)
               }
           }
           '''
@@ -296,13 +325,14 @@ jobs:
                       .store(in: &cancellables)
                   isBeingRecorded = UIScreen.main.isCaptured
                   if isBeingRecorded { hide(reason: "screen recording") }
-                  idleTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+                  idleTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
                       Task { @MainActor in self?.checkIdle() }
                   }
               }
               private func checkIdle() {
-                  if overlayVisible && Date().timeIntervalSince(lastActivity) > 60 {
-                      hide(reason: "idle 60s")
+                  // 5 minutes idle → hide (long enough for real thinking)
+                  if overlayVisible && Date().timeIntervalSince(lastActivity) > 300 {
+                      hide(reason: "idle 5min")
                   }
               }
               func recordActivity() { lastActivity = Date() }
@@ -362,34 +392,34 @@ jobs:
               @ObservedObject var stealth: StealthManager
               @AppStorage("engineDepth") private var engineDepth = 13
               @AppStorage("engineVariants") private var engineVariants = 3
-              @AppStorage("humanTiming") private var humanTiming = true
               @AppStorage("decoyRequests") private var decoyRequests = true
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine") {
-                              Stepper(value: $engineDepth, in: 10...18) {
+                          Section("Engine — stockfish.online") {
+                              Stepper(value: $engineDepth, in: 8...15) {
                                   LabeledContent("Depth", value: "\(engineDepth)")
                               }
                               Stepper(value: $engineVariants, in: 1...5) {
                                   LabeledContent("Top moves", value: "\(engineVariants)")
                               }
+                              Text("Top moves = separate API calls (iterative exclusion). More = slower.")
+                                  .font(.caption).foregroundColor(.secondary)
                           }
-                          Section("Stealth (v3.0)") {
-                              Toggle("Human timing delays (0.8-5s)", isOn: $humanTiming)
+                          Section("Stealth (v3.1)") {
                               Toggle("Decoy API requests", isOn: $decoyRequests)
                               Text("Session bridge: \(String(StealthConfig.bridgeName.prefix(8)))…")
                                   .font(.caption.monospaced()).foregroundColor(.secondary)
                           }
                           Section("Panic gestures (always on)") {
-                              Label("Shake to hide", systemImage: "iphone.gen3.radiowaves.left.and.right")
-                              Label("3-finger tap to hide", systemImage: "hand.tap.fill")
+                              Label("Shake to hide/show", systemImage: "iphone.gen3.radiowaves.left.and.right")
+                              Label("3-finger tap to hide/show", systemImage: "hand.tap.fill")
                           }
                           Section("Auto-hide (always on)") {
                               Label("On background", systemImage: "iphone.slash")
                               Label("On screen recording", systemImage: "record.circle")
                               Label("On screenshot", systemImage: "camera.viewfinder")
-                              Label("After 60s idle", systemImage: "clock.arrow.circlepath")
+                              Label("After 5 min idle", systemImage: "clock.arrow.circlepath")
                               Toggle("Minimal mode (tiny dot)", isOn: $stealth.minimalMode)
                           }
                           Section("Status") {
@@ -401,16 +431,9 @@ jobs:
                               Button("Show overlay") { stealth.show() }
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
-                          Section("Warning") {
-                              HStack(alignment: .top) {
-                                  Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
-                                  Text("No stealth is 100%. Chess.com detects cheating via move quality over many games. Use responsibly.")
-                                      .font(.caption).foregroundColor(.secondary)
-                              }
-                          }
                           Section("About") {
-                              LabeledContent("Version", value: "3.0.0 (30)")
-                              LabeledContent("Engine", value: "Stockfish (chess-api.com)")
+                              LabeledContent("Version", value: "3.1.0 (31)")
+                              LabeledContent("Engine", value: "Stockfish (stockfish.online)")
                           }
                       }
                       .navigationTitle("Settings")
@@ -460,7 +483,6 @@ jobs:
               @Published var lastMoveCentipawnLoss = 0
               @Published var lastMoveWasMine = false
               @Published var enabled = true
-              @Published var humanDelayRemaining: Int = 0
 
               var bestMove: TopMove? { topMoves.first }
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
@@ -491,8 +513,15 @@ jobs:
                   lastMoveUCI = p.lastMoveUCI
                   plyCount = p.plyCount
                   confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  if p.flippedConfident && manualPlayerColor == nil {
-                      detectedPlayerColor = p.flipped ? "b" : "w"
+                  // TRUST the board detection when confident.
+                  // If the auto-detected color disagrees with the manual override,
+                  // clear the manual override — the board doesn't lie.
+                  if p.flippedConfident {
+                      let detected = p.flipped ? "b" : "w"
+                      detectedPlayerColor = detected
+                      if let m = manualPlayerColor, m != detected {
+                          manualPlayerColor = nil
+                      }
                   }
                   let board = buildFENBoard(from: p.grid, flipped: p.flipped)
                   let castling = deriveCastling(from: p.grid, flipped: p.flipped)
@@ -519,26 +548,12 @@ jobs:
                   let ud = UserDefaults.standard
                   let d = ud.integer(forKey: "engineDepth") > 0 ? ud.integer(forKey: "engineDepth") : 13
                   let v = ud.integer(forKey: "engineVariants") > 0 ? ud.integer(forKey: "engineVariants") : 3
-                  let humanTiming = ud.object(forKey: "humanTiming") as? Bool ?? true
                   let decoyEnabled = ud.object(forKey: "decoyRequests") as? Bool ?? true
 
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
                           let a = try await EngineService.analyze(fen: fen, depth: d, variants: v)
-                          if Task.isCancelled { return }
-                          if humanTiming {
-                              let complexity = self.estimateComplexity(a)
-                              let delayNs = StealthConfig.humanThinkDelay(complexity: complexity)
-                              let delayS = max(1, Int(Double(delayNs) / 1_000_000_000))
-                              await MainActor.run { self.humanDelayRemaining = delayS }
-                              for _ in 0..<delayS {
-                                  try? await Task.sleep(nanoseconds: 1_000_000_000)
-                                  if Task.isCancelled { return }
-                                  await MainActor.run { self.humanDelayRemaining = max(0, self.humanDelayRemaining - 1) }
-                              }
-                              await MainActor.run { self.humanDelayRemaining = 0 }
-                          }
                           if Task.isCancelled { return }
                           await MainActor.run {
                               self.topMoves = a.topMoves
@@ -567,21 +582,9 @@ jobs:
                           await MainActor.run {
                               self.errorMessage = "\(error.localizedDescription)"
                               self.isThinking = false
-                              self.humanDelayRemaining = 0
                           }
                       }
                   }
-              }
-
-              private func estimateComplexity(_ a: EngineAnalysis) -> Double {
-                  guard let best = a.bestMove, a.topMoves.count >= 2 else { return 0.5 }
-                  let bestCp = Double(best.evaluationCp ?? 0)
-                  let secondCp = Double(a.topMoves[1].evaluationCp ?? 0)
-                  let diff = abs(bestCp - secondCp)
-                  if diff < 30 { return 1.0 }
-                  if diff < 80 { return 0.7 }
-                  if diff < 200 { return 0.4 }
-                  return 0.2
               }
 
               private func evalWhitePOV(_ m: TopMove?) -> Double {
@@ -701,8 +704,8 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v3.0").font(.title2.bold())
-                      Text("STEALTH MODE — 11 layers active\n\n• Human timing (0.8-5s delays)\n• Decoy API requests\n• Random JS bridge names\n• Self-erasing scripts\n• Panic gestures (shake / 3-finger)\n• Auto-hide on record/screenshot/idle\n\nUse responsibly — mainly friend games & bots.")
+                      Text("Chess Helper v3.1").font(.title2.bold())
+                      Text("STEALTH MODE\n\n• Top-3 moves (iterative exclusion)\n• stockfish.online engine\n• Random JS bridge names\n• Decoy API requests\n• Panic: shake or 3-finger tap\n• Auto-hide on record/screenshot/background\n• Auto-hide after 5 min idle\n\nYou play at your own pace.\nUse responsibly.")
                           .font(.footnote).foregroundColor(.white.opacity(0.85))
                           .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -727,9 +730,15 @@ jobs:
                       if stealth.overlayVisible {
                           if stealth.minimalMode { dot } else { panel }
                       } else {
+                          // Hidden state: subtle but tappable reveal dot
                           Button { stealth.show() } label: {
-                              Circle().fill(Color.white.opacity(0.05)).frame(width: 24, height: 24)
-                                  .overlay(Circle().stroke(Color.white.opacity(0.1)))
+                              Circle().fill(Color.green.opacity(0.4))
+                                  .frame(width: 30, height: 30)
+                                  .overlay(
+                                      Image(systemName: "eye.fill")
+                                          .font(.caption).foregroundColor(.white.opacity(0.9))
+                                  )
+                                  .shadow(color: .black.opacity(0.5), radius: 4)
                           }
                       }
                   }
@@ -748,7 +757,6 @@ jobs:
                       header
                       if expanded {
                           colorRow
-                          if engine.humanDelayRemaining > 0 { humanThinkBar }
                           movesSection
                           lastMoveSection
                           errorSection
@@ -767,7 +775,7 @@ jobs:
                           Text(engine.isMyTurn ? "Your turn" : "Waiting").font(.caption2.bold())
                       }
                       .foregroundColor(engine.isMyTurn ? .green : .secondary)
-                      if engine.isThinking && engine.humanDelayRemaining == 0 { ProgressView().scaleEffect(0.7) }
+                      if engine.isThinking { ProgressView().scaleEffect(0.7) }
                       Spacer()
                       Button { stealth.toggleMinimalMode() } label: {
                           Image(systemName: stealth.minimalMode ? "eye.slash.fill" : "eye.fill").font(.footnote)
@@ -781,16 +789,6 @@ jobs:
                       }
                   }
                   .padding(.horizontal, 12).padding(.vertical, 8).contentShape(Rectangle())
-              }
-              private var humanThinkBar: some View {
-                  HStack(spacing: 6) {
-                      Image(systemName: "brain.head.profile").foregroundColor(.cyan).font(.caption)
-                      Text("Thinking… \(engine.humanDelayRemaining)s")
-                          .font(.caption.bold().monospaced()).foregroundColor(.cyan)
-                      Spacer()
-                      Text("stealth timing").font(.caption2).foregroundColor(.secondary)
-                  }
-                  .padding(.horizontal, 14).padding(.bottom, 4)
               }
               private var colorRow: some View {
                   HStack(spacing: 6) {
@@ -994,7 +992,6 @@ jobs:
                   }
               }
           }
-
           extension Bundle {
               func loadResource(named name: String, ext: String) -> String? {
                   if let url = url(forResource: name, withExtension: ext),
@@ -1026,8 +1023,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>3.0.0</string>
-            <key>CFBundleVersion</key><string>30</string>
+            <key>CFBundleShortVersionString</key><string>3.1.0</string>
+            <key>CFBundleVersion</key><string>31</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -1089,9 +1086,10 @@ jobs:
               var o=b.getAttribute('orientation');
               if(o==='black'){flipped=true;confident=true;}
               if(o==='white'){flipped=false;confident=true;}
+              // STRONGEST signal: white king row position
               if(grid){
                 var wkRow=-1;
-                for(var r=0;r<8;r++) for(var c=0;c<8;c++) if(grid[r][c]==='K'){wkRow=r;break;}
+                for(var r=0;r<8;r++){ for(var c=0;c<8;c++){ if(grid[r][c]==='K'){wkRow=r;break;} } if(wkRow>=0)break; }
                 if(wkRow>=0){flipped=wkRow<4; confident=true;}
               }
               return {flipped:flipped, confident:confident};
