@@ -65,7 +65,7 @@ jobs:
                   PROVISIONING_PROFILE_SPECIFIER: ""
           EOF
 
-      - name: Generate all source files
+      - name: Generate all Swift source files
         shell: bash
         run: |
           python3 <<'PYEOF'
@@ -136,15 +136,11 @@ jobs:
 
           files["Sources/StealthConfig.swift"] = r'''
           import Foundation
-
-          /// Session-random names to prevent chess.com from fingerprinting our JS bridge.
-          /// New random names every app launch.
           enum StealthConfig {
               static let bridgeName: String = randomName(prefix: "_", length: 6)
               static let readerFlag: String = randomName(prefix: "_", length: 8)
               static let startFuncName: String = randomName(prefix: "_", length: 8)
               static let timerName: String = randomName(prefix: "_", length: 8)
-
               private static let userAgents = [
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
@@ -153,25 +149,15 @@ jobs:
                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
               ]
               static func randomUserAgent() -> String { userAgents.randomElement()! }
-
-              /// Human-like delay before showing engine result (0.8s - 5s)
               static func humanThinkDelay(complexity: Double = 0.5) -> UInt64 {
                   let baseMs = 800.0
                   let extraMs = Double.random(in: 500...4200) * (0.4 + complexity)
-                  let totalMs = baseMs + extraMs
-                  return UInt64(totalMs * 1_000_000)
+                  return UInt64((baseMs + extraMs) * 1_000_000)
               }
-
-              /// Traffic jitter (200-800ms) before API call
               static func trafficJitter() -> UInt64 {
                   UInt64.random(in: 200_000_000...800_000_000)
               }
-
-              /// Random polling interval for board reader (400-900ms)
-              static func readerInterval() -> Int {
-                  Int.random(in: 400...900)
-              }
-
+              static func readerInterval() -> Int { Int.random(in: 400...900) }
               private static func randomName(prefix: String, length: Int) -> String {
                   let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
                   return prefix + String((0..<length).map { _ in chars.randomElement()! })
@@ -209,15 +195,10 @@ jobs:
           }
 
           enum EngineService {
-
-              /// Real analysis call with anti-fingerprinting.
               static func analyze(fen: String, depth: Int = 13, variants: Int = 3) async throws -> EngineAnalysis {
-                  // Traffic jitter — makes request timing look human
                   try? await Task.sleep(nanoseconds: StealthConfig.trafficJitter())
-
                   guard let url = URL(string: "https://chess-api.com/v1") else {
-                      throw NSError(domain: "EngineService", code: -1,
-                                    userInfo: [NSLocalizedDescriptionKey: "Bad URL"])
+                      throw NSError(domain: "EngineService", code: -1, userInfo: [NSLocalizedDescriptionKey: "Bad URL"])
                   }
                   var req = URLRequest(url: url)
                   req.httpMethod = "POST"
@@ -226,23 +207,17 @@ jobs:
                   req.setValue("https://www.google.com/", forHTTPHeaderField: "Referer")
                   req.timeoutInterval = 12
                   let body: [String: Any] = [
-                      "fen": fen,
-                      "depth": min(depth, 18),
-                      "variants": max(1, min(variants, 5)),
-                      "maxThinkingTime": 50
+                      "fen": fen, "depth": min(depth, 18),
+                      "variants": max(1, min(variants, 5)), "maxThinkingTime": 50
                   ]
                   req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
                   let (data, resp) = try await URLSession.shared.data(for: req)
                   guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                      throw NSError(domain: "EngineService", code: -2,
-                                    userInfo: [NSLocalizedDescriptionKey: "HTTP error"])
+                      throw NSError(domain: "EngineService", code: -2, userInfo: [NSLocalizedDescriptionKey: "HTTP error"])
                   }
                   guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                      throw NSError(domain: "EngineService", code: -3,
-                                    userInfo: [NSLocalizedDescriptionKey: "Bad JSON"])
+                      throw NSError(domain: "EngineService", code: -3, userInfo: [NSLocalizedDescriptionKey: "Bad JSON"])
                   }
-
                   let d = (json["depth"] as? Int) ?? depth
                   var moves: [TopMove] = []
                   let primaryUci = (json["move"] as? String) ?? ""
@@ -264,19 +239,15 @@ jobs:
                           let e = v["eval"] as? Double
                           let m = v["mate"] as? Int
                           let cp = e.map { Int(($0 * 100).rounded()) }
-                          moves.append(TopMove(rank: moves.count + 1,
-                                               uci: uci, san: san,
+                          moves.append(TopMove(rank: moves.count + 1, uci: uci, san: san,
                                                evaluationCp: cp,
-                                               mateIn: (m == 0 ? nil : m),
-                                               depth: d))
+                                               mateIn: (m == 0 ? nil : m), depth: d))
                           if moves.count >= variants { break }
                       }
                   }
                   return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: d)
               }
 
-              /// Fires a fake request with a random plausible position to obfuscate
-              /// our real traffic pattern (looks like we're just analyzing puzzles).
               static func fireDecoyRequest() async {
                   let decoyFens = [
                       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -303,7 +274,6 @@ jobs:
               @Published var isBeingRecorded = false
               @Published var lastHideReason = ""
               @Published var lastActivity: Date = Date()
-
               private var cancellables = Set<AnyCancellable>()
               private var idleTimer: Timer?
 
@@ -326,22 +296,15 @@ jobs:
                       .store(in: &cancellables)
                   isBeingRecorded = UIScreen.main.isCaptured
                   if isBeingRecorded { hide(reason: "screen recording") }
-                  startIdleTimer()
-              }
-
-              private func startIdleTimer() {
                   idleTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
                       Task { @MainActor in self?.checkIdle() }
                   }
               }
-
               private func checkIdle() {
-                  let idleThreshold: TimeInterval = 60 // 60 seconds
-                  if overlayVisible && Date().timeIntervalSince(lastActivity) > idleThreshold {
+                  if overlayVisible && Date().timeIntervalSince(lastActivity) > 60 {
                       hide(reason: "idle 60s")
                   }
               }
-
               func recordActivity() { lastActivity = Date() }
               func toggleOverlay() {
                   overlayVisible.toggle()
@@ -361,7 +324,6 @@ jobs:
                   super.motionEnded(motion, with: event)
               }
           }
-
           extension Notification.Name {
               static let stealthPanic = Notification.Name("StealthPanicGesture")
           }
@@ -386,7 +348,6 @@ jobs:
                   @objc func tapped() { action() }
               }
           }
-
           extension View {
               func onThreeFingerPanic(_ action: @escaping () -> Void) -> some View {
                   overlay(ThreeFingerCatcher(action: action).allowsHitTesting(true)
@@ -403,66 +364,53 @@ jobs:
               @AppStorage("engineVariants") private var engineVariants = 3
               @AppStorage("humanTiming") private var humanTiming = true
               @AppStorage("decoyRequests") private var decoyRequests = true
-              @AppStorage("autoHideIdle") private var autoHideIdle = true
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine — chess-api.com") {
+                          Section("Engine") {
                               Stepper(value: $engineDepth, in: 10...18) {
                                   LabeledContent("Depth", value: "\(engineDepth)")
                               }
                               Stepper(value: $engineVariants, in: 1...5) {
-                                  LabeledContent("Show top", value: "\(engineVariants) moves")
+                                  LabeledContent("Top moves", value: "\(engineVariants)")
                               }
                           }
-                          Section("Stealth — Dynamic (v3.0)") {
+                          Section("Stealth (v3.0)") {
                               Toggle("Human timing delays (0.8-5s)", isOn: $humanTiming)
                               Toggle("Decoy API requests", isOn: $decoyRequests)
-                              Toggle("Auto-hide after 60s idle", isOn: $autoHideIdle)
                               Text("Session bridge: \(String(StealthConfig.bridgeName.prefix(8)))…")
                                   .font(.caption.monospaced()).foregroundColor(.secondary)
                           }
-                          Section("Stealth — Panic gestures (always on)") {
+                          Section("Panic gestures (always on)") {
                               Label("Shake to hide", systemImage: "iphone.gen3.radiowaves.left.and.right")
                               Label("3-finger tap to hide", systemImage: "hand.tap.fill")
                           }
-                          Section("Stealth — Auto-hide (always on)") {
+                          Section("Auto-hide (always on)") {
                               Label("On background", systemImage: "iphone.slash")
                               Label("On screen recording", systemImage: "record.circle")
                               Label("On screenshot", systemImage: "camera.viewfinder")
+                              Label("After 60s idle", systemImage: "clock.arrow.circlepath")
                               Toggle("Minimal mode (tiny dot)", isOn: $stealth.minimalMode)
                           }
                           Section("Status") {
-                              LabeledContent("Overlay visible", value: stealth.overlayVisible ? "Yes" : "No")
-                              LabeledContent("Screen captured", value: stealth.isBeingRecorded ? "Yes" : "No")
+                              LabeledContent("Visible", value: stealth.overlayVisible ? "Yes" : "No")
+                              LabeledContent("Recorded", value: stealth.isBeingRecorded ? "Yes" : "No")
                               if !stealth.lastHideReason.isEmpty {
                                   LabeledContent("Last hide", value: stealth.lastHideReason)
                               }
                               Button("Show overlay") { stealth.show() }
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
-                          Section("Privacy") {
-                              HStack {
-                                  Image(systemName: "lock.shield.fill").foregroundColor(.green)
-                                  VStack(alignment: .leading) {
-                                      Text("Zero disk logs").bold()
-                                      Text("Nothing saved. Session-random JS names.")
-                                          .font(.caption).foregroundColor(.secondary)
-                                  }
-                              }
-                          }
                           Section("Warning") {
                               HStack(alignment: .top) {
-                                  Image(systemName: "exclamationmark.triangle.fill")
-                                      .foregroundColor(.orange)
-                                  Text("No stealth is 100%. Chess.com detects cheating via move quality over many games. Use responsibly — mainly for friend games and bots.")
+                                  Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                                  Text("No stealth is 100%. Chess.com detects cheating via move quality over many games. Use responsibly.")
                                       .font(.caption).foregroundColor(.secondary)
                               }
                           }
                           Section("About") {
                               LabeledContent("Version", value: "3.0.0 (30)")
                               LabeledContent("Engine", value: "Stockfish (chess-api.com)")
-                              LabeledContent("Stealth", value: "Full (11 layers)")
                           }
                       }
                       .navigationTitle("Settings")
@@ -470,19 +418,6 @@ jobs:
               }
           }
           '''
-
-          for path, content in files.items():
-              content = textwrap.dedent(content).strip() + "\n"
-              os.makedirs(os.path.dirname(path), exist_ok=True)
-              with open(path, "w") as f: f.write(content)
-              print(f"  ✅ {path}")
-          print(f"\nWrote {len(files)} core files (part 1)")
-          PYEOF      - name: Generate remaining source files
-        shell: bash
-        run: |
-          python3 <<'PYEOF'
-          import os, textwrap
-          files = {}
 
           files["Sources/EngineViewModel.swift"] = r'''
           import Foundation
@@ -525,7 +460,7 @@ jobs:
               @Published var lastMoveCentipawnLoss = 0
               @Published var lastMoveWasMine = false
               @Published var enabled = true
-              @Published var humanDelayRemaining: Int = 0  // for UI countdown
+              @Published var humanDelayRemaining: Int = 0
 
               var bestMove: TopMove? { topMoves.first }
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
@@ -581,7 +516,6 @@ jobs:
                   analysisTask?.cancel()
                   isThinking = true
                   errorMessage = ""
-
                   let ud = UserDefaults.standard
                   let d = ud.integer(forKey: "engineDepth") > 0 ? ud.integer(forKey: "engineDepth") : 13
                   let v = ud.integer(forKey: "engineVariants") > 0 ? ud.integer(forKey: "engineVariants") : 3
@@ -593,14 +527,11 @@ jobs:
                       do {
                           let a = try await EngineService.analyze(fen: fen, depth: d, variants: v)
                           if Task.isCancelled { return }
-
-                          // Human-timing simulation: delay showing result 0.8-5s
                           if humanTiming {
                               let complexity = self.estimateComplexity(a)
                               let delayNs = StealthConfig.humanThinkDelay(complexity: complexity)
-                              let delayS = Int(Double(delayNs) / 1_000_000_000)
+                              let delayS = max(1, Int(Double(delayNs) / 1_000_000_000))
                               await MainActor.run { self.humanDelayRemaining = delayS }
-                              // Countdown ticker
                               for _ in 0..<delayS {
                                   try? await Task.sleep(nanoseconds: 1_000_000_000)
                                   if Task.isCancelled { return }
@@ -608,7 +539,6 @@ jobs:
                               }
                               await MainActor.run { self.humanDelayRemaining = 0 }
                           }
-
                           if Task.isCancelled { return }
                           await MainActor.run {
                               self.topMoves = a.topMoves
@@ -620,8 +550,6 @@ jobs:
                               self.computeQuality(cur: wpov)
                               self.previousEvalWhitePOV = wpov
                           }
-
-                          // Fire decoy every 5-9 real requests to obfuscate traffic
                           if decoyEnabled {
                               self.movesSinceDecoy += 1
                               let threshold = Int.random(in: 5...9)
@@ -645,18 +573,15 @@ jobs:
                   }
               }
 
-              /// Estimate position complexity 0.0-1.0 (used for human timing)
               private func estimateComplexity(_ a: EngineAnalysis) -> Double {
-                  // If top move eval is very high (winning) → simple
-                  // If top 3 are close → complex (real thinking)
                   guard let best = a.bestMove, a.topMoves.count >= 2 else { return 0.5 }
                   let bestCp = Double(best.evaluationCp ?? 0)
                   let secondCp = Double(a.topMoves[1].evaluationCp ?? 0)
                   let diff = abs(bestCp - secondCp)
-                  if diff < 30 { return 1.0 }        // very close moves = hard
+                  if diff < 30 { return 1.0 }
                   if diff < 80 { return 0.7 }
                   if diff < 200 { return 0.4 }
-                  return 0.2                          // obvious move = fast
+                  return 0.2
               }
 
               private func evalWhitePOV(_ m: TopMove?) -> Double {
@@ -996,8 +921,6 @@ jobs:
               func makeCoordinator() -> Coordinator { Coordinator(engine: engine) }
               func makeUIView(context: Context) -> WKWebView {
                   let cc = WKUserContentController()
-
-                  // Inject reader.js with session-random names substituted in
                   if let jsTemplate = Bundle.main.loadResource(named: "reader", ext: "js") {
                       let js = jsTemplate
                           .replacingOccurrences(of: "__BRIDGE_NAME__", with: StealthConfig.bridgeName)
@@ -1012,7 +935,6 @@ jobs:
                       cc.addUserScript(WKUserScript(source: injector, injectionTime: .atDocumentStart, forMainFrameOnly: false))
                   }
                   cc.add(context.coordinator, name: StealthConfig.bridgeName)
-
                   let cfg = WKWebViewConfiguration()
                   cfg.userContentController = cc
                   cfg.websiteDataStore = .default()
@@ -1087,7 +1009,7 @@ jobs:
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, "w") as f: f.write(content)
               print(f"  ✅ {path}")
-          print(f"\nWrote {len(files)} files (part 2)")
+          print(f"\nWrote {len(files)} Swift files")
           PYEOF
 
       - name: Write Info.plist
@@ -1119,19 +1041,15 @@ jobs:
           </plist>
           EOF
 
-      - name: Write reader.js v5 (stealth, self-erasing, randomized names)
+      - name: Write reader.js
         run: |
           cat > Resources/reader.js <<'EOF'
           (function(){
-            // Session-random flag prevents double-init and fingerprinting
             if (window['__READER_FLAG__']) return;
             Object.defineProperty(window, '__READER_FLAG__', { value: true, enumerable: false, writable: false, configurable: false });
-
             var PM={wp:'P',wn:'N',wb:'B',wr:'R',wq:'Q',wk:'K',bp:'p',bn:'n',bb:'b',br:'r',bq:'q',bk:'k'};
             var PN={king:'K',queen:'Q',rook:'R',bishop:'B',knight:'N',pawn:'P'};
-
             function fb(){return document.querySelector('wc-chess-board,chess-board,cg-board,.board-layout-chessboard');}
-
             function rg(b){
               var g=[[],[],[],[],[],[],[],[]];
               for(var i=0;i<8;i++) g[i]=['.','.','.','.','.','.','.','.'];
@@ -1160,7 +1078,6 @@ jobs:
               }
               return g;
             }
-
             function df(b,grid){
               var confident=false, flipped=false;
               var el=b;
@@ -1179,16 +1096,12 @@ jobs:
               }
               return {flipped:flipped, confident:confident};
             }
-
             function dp(){
               var pn=document.querySelectorAll('[data-ply]');
               if(pn.length){var m=-1; for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute('data-ply'),10); if(!isNaN(p)&&p>m)m=p;} if(m>=0)return m;}
               return -1;
             }
-
-            // Closure-scoped state (no globals for anti-detection)
             var prevGrid=null, lastPayload='', lastSide='w', tickTimer=null;
-
             function diff(p,c){
               if(!p||!c)return null;
               var changes=[];
@@ -1204,7 +1117,6 @@ jobs:
               var mc=t.after===t.after.toUpperCase()?'w':'b';
               return {uci:fr+to, movedColor:mc};
             }
-
             function tick(){
               var b=fb(); if(!b) return;
               var g=rg(b); if(!g) return;
@@ -1227,36 +1139,19 @@ jobs:
               }
               prevGrid=g;
             }
-
-            // Expose start function under session-random name only
             Object.defineProperty(window, '__START_FUNC__', {
               value: function(){
                 if(tickTimer) return;
-                // Randomized interval per tick to avoid pattern detection
                 var iv = __READER_INTERVAL__ + Math.floor(Math.random()*200);
                 tickTimer = setInterval(tick, iv);
               },
               enumerable: false, writable: false, configurable: false
             });
-
-            // MutationObserver with error swallowing
             try {
               var mo = new MutationObserver(function(){ try{ tick(); }catch(e){} });
               mo.observe(document.documentElement, {childList:true, subtree:true, attributes:true});
             } catch(e){}
-
-            // Auto-start after slight random delay
             setTimeout(function(){ try{ window['__START_FUNC__'](); }catch(e){} }, 300 + Math.floor(Math.random()*400));
-
-            // Self-erase script tag from DOM if visible (anti-forensics)
-            try {
-              var scripts = document.querySelectorAll('script');
-              for(var i=0;i<scripts.length;i++){
-                if(scripts[i].textContent && scripts[i].textContent.indexOf('__BRIDGE_NAME__') > -1){
-                  scripts[i].parentNode && scripts[i].parentNode.removeChild(scripts[i]);
-                }
-              }
-            } catch(e){}
           })();
           EOF
 
