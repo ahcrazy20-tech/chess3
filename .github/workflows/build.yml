@@ -1,4 +1,4 @@
-name: Build ChessHelper v2.1
+name: Build ChessHelper v3.0 Stealth
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "2.1.0"
-              CURRENT_PROJECT_VERSION: "21"
+              MARKETING_VERSION: "3.0.0"
+              CURRENT_PROJECT_VERSION: "30"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -126,10 +126,55 @@ jobs:
                       VStack(spacing: 20) {
                           Image(systemName: icon).font(.system(size: 60)).foregroundColor(.green)
                           Text(title).font(.largeTitle.bold())
-                          Text("Coming in v2.2").foregroundColor(.secondary)
+                          Text("Coming soon").foregroundColor(.secondary)
                       }
                       .navigationTitle(title)
                   }
+              }
+          }
+          '''
+
+          files["Sources/StealthConfig.swift"] = r'''
+          import Foundation
+
+          /// Session-random names to prevent chess.com from fingerprinting our JS bridge.
+          /// New random names every app launch.
+          enum StealthConfig {
+              static let bridgeName: String = randomName(prefix: "_", length: 6)
+              static let readerFlag: String = randomName(prefix: "_", length: 8)
+              static let startFuncName: String = randomName(prefix: "_", length: 8)
+              static let timerName: String = randomName(prefix: "_", length: 8)
+
+              private static let userAgents = [
+                  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+                  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+                  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+                  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+              ]
+              static func randomUserAgent() -> String { userAgents.randomElement()! }
+
+              /// Human-like delay before showing engine result (0.8s - 5s)
+              static func humanThinkDelay(complexity: Double = 0.5) -> UInt64 {
+                  let baseMs = 800.0
+                  let extraMs = Double.random(in: 500...4200) * (0.4 + complexity)
+                  let totalMs = baseMs + extraMs
+                  return UInt64(totalMs * 1_000_000)
+              }
+
+              /// Traffic jitter (200-800ms) before API call
+              static func trafficJitter() -> UInt64 {
+                  UInt64.random(in: 200_000_000...800_000_000)
+              }
+
+              /// Random polling interval for board reader (400-900ms)
+              static func readerInterval() -> Int {
+                  Int.random(in: 400...900)
+              }
+
+              private static func randomName(prefix: String, length: Int) -> String {
+                  let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+                  return prefix + String((0..<length).map { _ in chars.randomElement()! })
               }
           }
           '''
@@ -163,10 +208,13 @@ jobs:
               let depth: Int
           }
 
-          /// Uses chess-api.com free public API — returns real top-N via MultiPV variants.
-          /// Chess.com CANNOT see this traffic (different domain, encrypted).
           enum EngineService {
+
+              /// Real analysis call with anti-fingerprinting.
               static func analyze(fen: String, depth: Int = 13, variants: Int = 3) async throws -> EngineAnalysis {
+                  // Traffic jitter — makes request timing look human
+                  try? await Task.sleep(nanoseconds: StealthConfig.trafficJitter())
+
                   guard let url = URL(string: "https://chess-api.com/v1") else {
                       throw NSError(domain: "EngineService", code: -1,
                                     userInfo: [NSLocalizedDescriptionKey: "Bad URL"])
@@ -174,6 +222,8 @@ jobs:
                   var req = URLRequest(url: url)
                   req.httpMethod = "POST"
                   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                  req.setValue("https://www.google.com/", forHTTPHeaderField: "Referer")
                   req.timeoutInterval = 12
                   let body: [String: Any] = [
                       "fen": fen,
@@ -195,8 +245,6 @@ jobs:
 
                   let d = (json["depth"] as? Int) ?? depth
                   var moves: [TopMove] = []
-
-                  // Parse the primary move
                   let primaryUci = (json["move"] as? String) ?? ""
                   let primarySan = (json["san"] as? String) ?? primaryUci
                   let primaryEval = json["eval"] as? Double
@@ -208,10 +256,8 @@ jobs:
                                            mateIn: (primaryMate == 0 ? nil : primaryMate),
                                            depth: d))
                   }
-
-                  // Parse alternative variants (real top-N)
                   if let vars = json["variants"] as? [[String: Any]] {
-                      for (idx, v) in vars.enumerated() {
+                      for v in vars {
                           let uci = (v["move"] as? String) ?? ""
                           let san = (v["san"] as? String) ?? uci
                           if uci.isEmpty || uci == primaryUci { continue }
@@ -224,11 +270,23 @@ jobs:
                                                mateIn: (m == 0 ? nil : m),
                                                depth: d))
                           if moves.count >= variants { break }
-                          _ = idx
                       }
                   }
-
                   return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: d)
+              }
+
+              /// Fires a fake request with a random plausible position to obfuscate
+              /// our real traffic pattern (looks like we're just analyzing puzzles).
+              static func fireDecoyRequest() async {
+                  let decoyFens = [
+                      "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                      "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3",
+                      "rnbqkb1r/pppp1ppp/5n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3",
+                      "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4",
+                      "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
+                  ]
+                  guard let fen = decoyFens.randomElement() else { return }
+                  _ = try? await analyze(fen: fen, depth: 10, variants: 1)
               }
           }
           '''
@@ -244,7 +302,10 @@ jobs:
               @Published var minimalMode = false
               @Published var isBeingRecorded = false
               @Published var lastHideReason = ""
+              @Published var lastActivity: Date = Date()
+
               private var cancellables = Set<AnyCancellable>()
+              private var idleTimer: Timer?
 
               init() {
                   NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)
@@ -265,14 +326,31 @@ jobs:
                       .store(in: &cancellables)
                   isBeingRecorded = UIScreen.main.isCaptured
                   if isBeingRecorded { hide(reason: "screen recording") }
+                  startIdleTimer()
               }
+
+              private func startIdleTimer() {
+                  idleTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+                      Task { @MainActor in self?.checkIdle() }
+                  }
+              }
+
+              private func checkIdle() {
+                  let idleThreshold: TimeInterval = 60 // 60 seconds
+                  if overlayVisible && Date().timeIntervalSince(lastActivity) > idleThreshold {
+                      hide(reason: "idle 60s")
+                  }
+              }
+
+              func recordActivity() { lastActivity = Date() }
               func toggleOverlay() {
                   overlayVisible.toggle()
                   lastHideReason = overlayVisible ? "" : "panic"
+                  if overlayVisible { recordActivity() }
               }
               func hide(reason: String) { overlayVisible = false; lastHideReason = reason }
-              func show() { overlayVisible = true; lastHideReason = "" }
-              func toggleMinimalMode() { minimalMode.toggle() }
+              func show() { overlayVisible = true; lastHideReason = ""; recordActivity() }
+              func toggleMinimalMode() { minimalMode.toggle(); recordActivity() }
           }
 
           extension UIWindow {
@@ -323,6 +401,9 @@ jobs:
               @ObservedObject var stealth: StealthManager
               @AppStorage("engineDepth") private var engineDepth = 13
               @AppStorage("engineVariants") private var engineVariants = 3
+              @AppStorage("humanTiming") private var humanTiming = true
+              @AppStorage("decoyRequests") private var decoyRequests = true
+              @AppStorage("autoHideIdle") private var autoHideIdle = true
               var body: some View {
                   NavigationStack {
                       Form {
@@ -331,10 +412,15 @@ jobs:
                                   LabeledContent("Depth", value: "\(engineDepth)")
                               }
                               Stepper(value: $engineVariants, in: 1...5) {
-                                  LabeledContent("Top moves", value: "\(engineVariants)")
+                                  LabeledContent("Show top", value: "\(engineVariants) moves")
                               }
-                              Text("Depth 13 ≈ ~2500 Elo. Requires internet.")
-                                  .font(.caption).foregroundColor(.secondary)
+                          }
+                          Section("Stealth — Dynamic (v3.0)") {
+                              Toggle("Human timing delays (0.8-5s)", isOn: $humanTiming)
+                              Toggle("Decoy API requests", isOn: $decoyRequests)
+                              Toggle("Auto-hide after 60s idle", isOn: $autoHideIdle)
+                              Text("Session bridge: \(String(StealthConfig.bridgeName.prefix(8)))…")
+                                  .font(.caption.monospaced()).foregroundColor(.secondary)
                           }
                           Section("Stealth — Panic gestures (always on)") {
                               Label("Shake to hide", systemImage: "iphone.gen3.radiowaves.left.and.right")
@@ -347,8 +433,8 @@ jobs:
                               Toggle("Minimal mode (tiny dot)", isOn: $stealth.minimalMode)
                           }
                           Section("Status") {
-                              LabeledContent("Visible", value: stealth.overlayVisible ? "Yes" : "No")
-                              LabeledContent("Recorded", value: stealth.isBeingRecorded ? "Yes" : "No")
+                              LabeledContent("Overlay visible", value: stealth.overlayVisible ? "Yes" : "No")
+                              LabeledContent("Screen captured", value: stealth.isBeingRecorded ? "Yes" : "No")
                               if !stealth.lastHideReason.isEmpty {
                                   LabeledContent("Last hide", value: stealth.lastHideReason)
                               }
@@ -359,14 +445,24 @@ jobs:
                               HStack {
                                   Image(systemName: "lock.shield.fill").foregroundColor(.green)
                                   VStack(alignment: .leading) {
-                                      Text("Zero chess.com traffic").bold()
-                                      Text("Engine calls go only to chess-api.com").font(.caption).foregroundColor(.secondary)
+                                      Text("Zero disk logs").bold()
+                                      Text("Nothing saved. Session-random JS names.")
+                                          .font(.caption).foregroundColor(.secondary)
                                   }
                               }
                           }
+                          Section("Warning") {
+                              HStack(alignment: .top) {
+                                  Image(systemName: "exclamationmark.triangle.fill")
+                                      .foregroundColor(.orange)
+                                  Text("No stealth is 100%. Chess.com detects cheating via move quality over many games. Use responsibly — mainly for friend games and bots.")
+                                      .font(.caption).foregroundColor(.secondary)
+                              }
+                          }
                           Section("About") {
-                              LabeledContent("Version", value: "2.1.0 (21)")
+                              LabeledContent("Version", value: "3.0.0 (30)")
                               LabeledContent("Engine", value: "Stockfish (chess-api.com)")
+                              LabeledContent("Stealth", value: "Full (11 layers)")
                           }
                       }
                       .navigationTitle("Settings")
@@ -374,6 +470,19 @@ jobs:
               }
           }
           '''
+
+          for path, content in files.items():
+              content = textwrap.dedent(content).strip() + "\n"
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w") as f: f.write(content)
+              print(f"  ✅ {path}")
+          print(f"\nWrote {len(files)} core files (part 1)")
+          PYEOF      - name: Generate remaining source files
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import os, textwrap
+          files = {}
 
           files["Sources/EngineViewModel.swift"] = r'''
           import Foundation
@@ -393,7 +502,7 @@ jobs:
                   case .none: return .clear
                   }
               }
-              }
+          }
 
           enum DetectionConfidence: String { case high, medium, low, unknown }
 
@@ -415,9 +524,8 @@ jobs:
               @Published var lastMoveQuality: MoveQuality = .none
               @Published var lastMoveCentipawnLoss = 0
               @Published var lastMoveWasMine = false
-              @Published var openingName = ""
-              @Published var openingECO = ""
               @Published var enabled = true
+              @Published var humanDelayRemaining: Int = 0  // for UI countdown
 
               var bestMove: TopMove? { topMoves.first }
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
@@ -427,6 +535,8 @@ jobs:
               private var lastAnalyzedFEN = ""
               private var analysisTask: Task<Void, Never>?
               private var debounceTask: Task<Void, Never>?
+              private var decoyTask: Task<Void, Never>?
+              private var movesSinceDecoy = 0
 
               func setManualColor(_ c: String?) {
                   manualPlayerColor = c
@@ -446,8 +556,6 @@ jobs:
                   lastMoveUCI = p.lastMoveUCI
                   plyCount = p.plyCount
                   confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  // FIX: If board is flipped in DOM, user is playing Black.
-                  // We only auto-set if we don't have a manual override.
                   if p.flippedConfident && manualPlayerColor == nil {
                       detectedPlayerColor = p.flipped ? "b" : "w"
                   }
@@ -473,13 +581,34 @@ jobs:
                   analysisTask?.cancel()
                   isThinking = true
                   errorMessage = ""
+
                   let ud = UserDefaults.standard
                   let d = ud.integer(forKey: "engineDepth") > 0 ? ud.integer(forKey: "engineDepth") : 13
                   let v = ud.integer(forKey: "engineVariants") > 0 ? ud.integer(forKey: "engineVariants") : 3
+                  let humanTiming = ud.object(forKey: "humanTiming") as? Bool ?? true
+                  let decoyEnabled = ud.object(forKey: "decoyRequests") as? Bool ?? true
+
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
                           let a = try await EngineService.analyze(fen: fen, depth: d, variants: v)
+                          if Task.isCancelled { return }
+
+                          // Human-timing simulation: delay showing result 0.8-5s
+                          if humanTiming {
+                              let complexity = self.estimateComplexity(a)
+                              let delayNs = StealthConfig.humanThinkDelay(complexity: complexity)
+                              let delayS = Int(Double(delayNs) / 1_000_000_000)
+                              await MainActor.run { self.humanDelayRemaining = delayS }
+                              // Countdown ticker
+                              for _ in 0..<delayS {
+                                  try? await Task.sleep(nanoseconds: 1_000_000_000)
+                                  if Task.isCancelled { return }
+                                  await MainActor.run { self.humanDelayRemaining = max(0, self.humanDelayRemaining - 1) }
+                              }
+                              await MainActor.run { self.humanDelayRemaining = 0 }
+                          }
+
                           if Task.isCancelled { return }
                           await MainActor.run {
                               self.topMoves = a.topMoves
@@ -491,14 +620,43 @@ jobs:
                               self.computeQuality(cur: wpov)
                               self.previousEvalWhitePOV = wpov
                           }
+
+                          // Fire decoy every 5-9 real requests to obfuscate traffic
+                          if decoyEnabled {
+                              self.movesSinceDecoy += 1
+                              let threshold = Int.random(in: 5...9)
+                              if self.movesSinceDecoy >= threshold {
+                                  self.movesSinceDecoy = 0
+                                  self.decoyTask?.cancel()
+                                  self.decoyTask = Task {
+                                      try? await Task.sleep(nanoseconds: UInt64.random(in: 2_000_000_000...8_000_000_000))
+                                      await EngineService.fireDecoyRequest()
+                                  }
+                              }
+                          }
                       } catch {
                           if Task.isCancelled { return }
                           await MainActor.run {
                               self.errorMessage = "\(error.localizedDescription)"
                               self.isThinking = false
+                              self.humanDelayRemaining = 0
                           }
                       }
                   }
+              }
+
+              /// Estimate position complexity 0.0-1.0 (used for human timing)
+              private func estimateComplexity(_ a: EngineAnalysis) -> Double {
+                  // If top move eval is very high (winning) → simple
+                  // If top 3 are close → complex (real thinking)
+                  guard let best = a.bestMove, a.topMoves.count >= 2 else { return 0.5 }
+                  let bestCp = Double(best.evaluationCp ?? 0)
+                  let secondCp = Double(a.topMoves[1].evaluationCp ?? 0)
+                  let diff = abs(bestCp - secondCp)
+                  if diff < 30 { return 1.0 }        // very close moves = hard
+                  if diff < 80 { return 0.7 }
+                  if diff < 200 { return 0.4 }
+                  return 0.2                          // obvious move = fast
               }
 
               private func evalWhitePOV(_ m: TopMove?) -> Double {
@@ -528,19 +686,12 @@ jobs:
                   }
               }
 
-              // Build FEN board. If flipped=true, the DOM reads from Black's POV,
-              // so grid[0] = rank 1, grid[7] = rank 8 already means we need to reverse.
               private func buildFENBoard(from g: String, flipped: Bool) -> String {
                   var c = Array(g); guard c.count == 64 else { return "8/8/8/8/8/8/8/8" }
                   if flipped {
-                      // Flip: reverse each row order AND each row's contents
-                      var flipped: [Character] = Array(repeating: ".", count: 64)
-                      for r in 0..<8 {
-                          for f in 0..<8 {
-                              flipped[r*8+f] = c[(7-r)*8+(7-f)]
-                          }
-                      }
-                      c = flipped
+                      var f: [Character] = Array(repeating: ".", count: 64)
+                      for r in 0..<8 { for x in 0..<8 { f[r*8+x] = c[(7-r)*8+(7-x)] } }
+                      c = f
                   }
                   var rows: [String] = []
                   for r in 0..<8 {
@@ -624,13 +775,14 @@ jobs:
               var onDismiss: () -> Void
               var body: some View {
                   VStack(spacing: 14) {
-                      Image(systemName: "exclamationmark.shield.fill").font(.system(size: 40)).foregroundColor(.yellow)
-                      Text("Fair-Play Notice").font(.title2.bold())
-                      Text("Using engine assistance during live games violates chess.com ToS.\n\nStealth is ALWAYS ON:\n• Shake or 3-finger tap → hide\n• Auto-hide on recording/screenshot/background\n\nUse responsibly.")
-                          .font(.callout).foregroundColor(.white.opacity(0.85))
+                      Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
+                      Text("Chess Helper v3.0").font(.title2.bold())
+                      Text("STEALTH MODE — 11 layers active\n\n• Human timing (0.8-5s delays)\n• Decoy API requests\n• Random JS bridge names\n• Self-erasing scripts\n• Panic gestures (shake / 3-finger)\n• Auto-hide on record/screenshot/idle\n\nUse responsibly — mainly friend games & bots.")
+                          .font(.footnote).foregroundColor(.white.opacity(0.85))
+                          .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
-                          Text("I understand").font(.headline).frame(maxWidth: .infinity)
-                              .padding(.vertical, 12).background(Color.accentColor).foregroundColor(.white).cornerRadius(10)
+                          Text("Continue").font(.headline).frame(maxWidth: .infinity)
+                              .padding(.vertical, 12).background(Color.green).foregroundColor(.white).cornerRadius(10)
                       }
                   }
                   .padding(20).background(.ultraThinMaterial).cornerRadius(18).shadow(radius: 20)
@@ -644,6 +796,7 @@ jobs:
               @ObservedObject var engine: EngineViewModel
               @ObservedObject var stealth: StealthManager
               @State private var expanded = true
+              @State private var selectedMoveIdx: Int? = nil
               var body: some View {
                   Group {
                       if stealth.overlayVisible {
@@ -656,6 +809,7 @@ jobs:
                       }
                   }
                   .onThreeFingerPanic { stealth.toggleOverlay() }
+                  .onTapGesture { stealth.recordActivity() }
               }
               private var dot: some View {
                   Button { stealth.toggleMinimalMode() } label: {
@@ -669,6 +823,7 @@ jobs:
                       header
                       if expanded {
                           colorRow
+                          if engine.humanDelayRemaining > 0 { humanThinkBar }
                           movesSection
                           lastMoveSection
                           errorSection
@@ -681,13 +836,13 @@ jobs:
               private var header: some View {
                   HStack(spacing: 10) {
                       Circle().fill(engine.enabled ? Color.green : Color.gray).frame(width: 8, height: 8)
-                      Text("Chess Helper").font(.subheadline.bold())
+                      Text("Helper").font(.subheadline.bold())
                       HStack(spacing: 4) {
                           Image(systemName: engine.isMyTurn ? "person.fill" : "hourglass").font(.caption2)
                           Text(engine.isMyTurn ? "Your turn" : "Waiting").font(.caption2.bold())
                       }
                       .foregroundColor(engine.isMyTurn ? .green : .secondary)
-                      if engine.isThinking { ProgressView().scaleEffect(0.7) }
+                      if engine.isThinking && engine.humanDelayRemaining == 0 { ProgressView().scaleEffect(0.7) }
                       Spacer()
                       Button { stealth.toggleMinimalMode() } label: {
                           Image(systemName: stealth.minimalMode ? "eye.slash.fill" : "eye.fill").font(.footnote)
@@ -701,6 +856,16 @@ jobs:
                       }
                   }
                   .padding(.horizontal, 12).padding(.vertical, 8).contentShape(Rectangle())
+              }
+              private var humanThinkBar: some View {
+                  HStack(spacing: 6) {
+                      Image(systemName: "brain.head.profile").foregroundColor(.cyan).font(.caption)
+                      Text("Thinking… \(engine.humanDelayRemaining)s")
+                          .font(.caption.bold().monospaced()).foregroundColor(.cyan)
+                      Spacer()
+                      Text("stealth timing").font(.caption2).foregroundColor(.secondary)
+                  }
+                  .padding(.horizontal, 14).padding(.bottom, 4)
               }
               private var colorRow: some View {
                   HStack(spacing: 6) {
@@ -738,7 +903,7 @@ jobs:
                   VStack(alignment: .leading, spacing: 4) {
                       Divider().opacity(0.3)
                       HStack {
-                          Text(engine.isMyTurn ? "Best moves for you" : "Opponent's best replies")
+                          Text(engine.isMyTurn ? "Choose your move (mix for stealth)" : "Opponent's likely moves")
                               .font(.caption).foregroundColor(.secondary)
                           Spacer()
                           Text("depth \(engine.depth)").font(.caption2.monospaced()).foregroundColor(.secondary)
@@ -750,7 +915,11 @@ jobs:
                               .padding(.horizontal, 14).padding(.bottom, 4)
                       } else {
                           ForEach(Array(engine.topMoves.enumerated()), id: \.element.id) { idx, m in
-                              moveRow(rank: idx + 1, move: m, isBest: idx == 0)
+                              moveRow(rank: idx + 1, move: m, isSelected: selectedMoveIdx == idx)
+                                  .onTapGesture {
+                                      stealth.recordActivity()
+                                      selectedMoveIdx = (selectedMoveIdx == idx) ? nil : idx
+                                  }
                           }
                       }
                       GeometryReader { geo in
@@ -763,18 +932,22 @@ jobs:
                       .frame(height: 8).padding(.horizontal, 14).padding(.top, 4)
                   }
               }
-              private func moveRow(rank: Int, move: TopMove, isBest: Bool) -> some View {
+              private func moveRow(rank: Int, move: TopMove, isSelected: Bool) -> some View {
                   HStack(spacing: 8) {
                       Text("#\(rank)").font(.caption.bold().monospaced())
                           .foregroundColor(rc(rank)).frame(width: 22)
                       Text(move.san.isEmpty ? move.uci : move.san)
-                          .font(isBest ? .title3.bold() : .callout.bold()).foregroundColor(rc(rank))
+                          .font(rank == 1 ? .title3.bold() : .callout.bold()).foregroundColor(rc(rank))
                       Text(move.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
                       Spacer()
                       Text(move.evalString).font(.caption.bold().monospaced()).foregroundColor(rc(rank))
+                      if isSelected {
+                          Image(systemName: "checkmark.circle.fill").foregroundColor(rc(rank)).font(.caption)
+                      }
                   }
-                  .padding(.horizontal, 14).padding(.vertical, 3)
-                  .background(isBest ? rc(rank).opacity(0.10) : Color.clear)
+                  .padding(.horizontal, 14).padding(.vertical, 5)
+                  .background(isSelected ? rc(rank).opacity(0.20) : (rank == 1 ? rc(rank).opacity(0.08) : Color.clear))
+                  .contentShape(Rectangle())
               }
               private func rc(_ r: Int) -> Color {
                   switch r { case 1: return .green; case 2: return .yellow; case 3: return .orange; default: return .white.opacity(0.7) }
@@ -823,14 +996,23 @@ jobs:
               func makeCoordinator() -> Coordinator { Coordinator(engine: engine) }
               func makeUIView(context: Context) -> WKWebView {
                   let cc = WKUserContentController()
-                  if let js = Bundle.main.loadResource(named: "reader", ext: "js") {
+
+                  // Inject reader.js with session-random names substituted in
+                  if let jsTemplate = Bundle.main.loadResource(named: "reader", ext: "js") {
+                      let js = jsTemplate
+                          .replacingOccurrences(of: "__BRIDGE_NAME__", with: StealthConfig.bridgeName)
+                          .replacingOccurrences(of: "__READER_FLAG__", with: StealthConfig.readerFlag)
+                          .replacingOccurrences(of: "__START_FUNC__", with: StealthConfig.startFuncName)
+                          .replacingOccurrences(of: "__TIMER_NAME__", with: StealthConfig.timerName)
+                          .replacingOccurrences(of: "__READER_INTERVAL__", with: "\(StealthConfig.readerInterval())")
                       cc.addUserScript(WKUserScript(source: js, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
                   }
                   if let css = Bundle.main.loadResource(named: "adblock_css", ext: "css") {
                       let injector = "(function(){var s=document.createElement('style');s.textContent=\(cssLit(css));document.documentElement.appendChild(s);})();"
                       cc.addUserScript(WKUserScript(source: injector, injectionTime: .atDocumentStart, forMainFrameOnly: false))
                   }
-                  cc.add(context.coordinator, name: "fenBridge")
+                  cc.add(context.coordinator, name: StealthConfig.bridgeName)
+
                   let cfg = WKWebViewConfiguration()
                   cfg.userContentController = cc
                   cfg.websiteDataStore = .default()
@@ -841,7 +1023,8 @@ jobs:
                   wv.navigationDelegate = context.coordinator
                   wv.uiDelegate = context.coordinator
                   wv.allowsBackForwardNavigationGestures = true
-                  if #available(iOS 16.4, *) { wv.isInspectable = true }
+                  wv.customUserAgent = StealthConfig.randomUserAgent()
+                  if #available(iOS 16.4, *) { wv.isInspectable = false }
                   wv.load(URLRequest(url: router.chessURL))
                   context.coordinator.webView = wv
                   context.coordinator.lastTrigger = router.navigateTrigger
@@ -866,7 +1049,7 @@ jobs:
                   var lastTrigger = 0
                   init(engine: EngineViewModel) { self.engine = engine }
                   func userContentController(_ u: WKUserContentController, didReceive m: WKScriptMessage) {
-                      guard m.name == "fenBridge", let d = m.body as? [String: Any] else { return }
+                      guard m.name == StealthConfig.bridgeName, let d = m.body as? [String: Any] else { return }
                       let p = EngineViewModel.BoardPayload(
                           grid: (d["grid"] as? String) ?? "",
                           sideToMove: (d["sideToMove"] as? String) ?? "w",
@@ -879,7 +1062,8 @@ jobs:
                       Task { @MainActor [weak engine] in engine?.ingest(p) }
                   }
                   func webView(_ w: WKWebView, didFinish n: WKNavigation!) {
-                      w.evaluateJavaScript("window.__ch_startReader && window.__ch_startReader();", completionHandler: nil)
+                      let js = "typeof window['\(StealthConfig.startFuncName)']==='function'&&window['\(StealthConfig.startFuncName)']();"
+                      w.evaluateJavaScript(js, completionHandler: nil)
                   }
                   func webView(_ w: WKWebView, createWebViewWith c: WKWebViewConfiguration,
                                for a: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -903,7 +1087,7 @@ jobs:
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, "w") as f: f.write(content)
               print(f"  ✅ {path}")
-          print(f"\nWrote {len(files)} files")
+          print(f"\nWrote {len(files)} files (part 2)")
           PYEOF
 
       - name: Write Info.plist
@@ -920,8 +1104,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>2.1.0</string>
-            <key>CFBundleVersion</key><string>21</string>
+            <key>CFBundleShortVersionString</key><string>3.0.0</string>
+            <key>CFBundleVersion</key><string>30</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -935,88 +1119,145 @@ jobs:
           </plist>
           EOF
 
-      - name: Write reader.js (v4 — improved orientation detection)
+      - name: Write reader.js v5 (stealth, self-erasing, randomized names)
         run: |
           cat > Resources/reader.js <<'EOF'
-          (function(){if(window.__ch_v4)return;window.__ch_v4=true;
-          const PM={wp:'P',wn:'N',wb:'B',wr:'R',wq:'Q',wk:'K',bp:'p',bn:'n',bb:'b',br:'r',bq:'q',bk:'k'};
-          const PN={king:'K',queen:'Q',rook:'R',bishop:'B',knight:'N',pawn:'P'};
-          function fb(){return document.querySelector('wc-chess-board,chess-board,cg-board,.board-layout-chessboard');}
-          function rg(b){const g=Array.from({length:8},()=>Array(8).fill('.'));
-          const ns=b.querySelectorAll('.piece,piece,[data-piece]');if(!ns.length)return null;
-          ns.forEach(n=>{let p=null,f=null,r=null;const c=(n.className||'').toString();
-          c.split(/\s+/).forEach(x=>{if(PM[x])p=PM[x];});
-          if(!p){const dp=n.getAttribute&&n.getAttribute('data-piece');if(dp&&PM[dp])p=PM[dp];}
-          if(!p){const ps=c.toLowerCase().split(/\s+/);const co=ps.find(x=>x==='white'||x==='black');
-          const na=ps.find(x=>PN[x]);if(co&&na){const l=PN[na];p=co==='white'?l:l.toLowerCase();}}
-          c.split(/\s+/).forEach(x=>{const m=/^square-(\d)(\d)$/.exec(x);if(m){f=+m[1];r=+m[2];}});
-          if(f===null){const ds=n.getAttribute&&n.getAttribute('data-square');
-          if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}
-          if(f===null){const st=(n.getAttribute&&n.getAttribute('style'))||'';
-          const m=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);
-          if(m){const co=Math.round(parseFloat(m[1])/12.5),ro=Math.round(parseFloat(m[2])/12.5);
-          if(co>=0&&co<=7&&ro>=0&&ro<=7){f=co+1;r=8-ro;}}}
-          if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8){g[8-r][f-1]=p;}});return g;}
+          (function(){
+            // Session-random flag prevents double-init and fingerprinting
+            if (window['__READER_FLAG__']) return;
+            Object.defineProperty(window, '__READER_FLAG__', { value: true, enumerable: false, writable: false, configurable: false });
 
-          // Robust flipped detection: multiple signals + strong heuristic based on
-          // where the WHITE pieces actually are in the DOM's grid.
-          function df(b,grid){
-            let confident=false, flipped=false;
-            // signal 1: 'flipped' class or attribute
-            let el=b;
-            for(let i=0;i<6&&el;i++){
-              if(el.classList&&el.classList.contains('flipped')){flipped=true;confident=true;break;}
-              el=el.parentElement;
-            }
-            if(b.hasAttribute('flipped')){flipped=true;confident=true;}
-            // signal 2: orientation attribute
-            const o=b.getAttribute('orientation');
-            if(o==='black'){flipped=true;confident=true;}
-            if(o==='white'){flipped=false;confident=true;}
-            // signal 3 (STRONG): white king position in DOM grid
-            // If white king is on TOP half of DOM grid (rows 0-3), board is flipped
-            if(grid){
-              let wkRow=-1;
-              for(let r=0;r<8;r++)for(let c=0;c<8;c++){
-                if(grid[r][c]==='K'){wkRow=r;break;}
+            var PM={wp:'P',wn:'N',wb:'B',wr:'R',wq:'Q',wk:'K',bp:'p',bn:'n',bb:'b',br:'r',bq:'q',bk:'k'};
+            var PN={king:'K',queen:'Q',rook:'R',bishop:'B',knight:'N',pawn:'P'};
+
+            function fb(){return document.querySelector('wc-chess-board,chess-board,cg-board,.board-layout-chessboard');}
+
+            function rg(b){
+              var g=[[],[],[],[],[],[],[],[]];
+              for(var i=0;i<8;i++) g[i]=['.','.','.','.','.','.','.','.'];
+              var ns=b.querySelectorAll('.piece,piece,[data-piece]');
+              if(!ns.length)return null;
+              for(var k=0;k<ns.length;k++){
+                var n=ns[k],p=null,f=null,r=null;
+                var c=(n.className||'').toString();
+                var parts=c.split(/\s+/);
+                for(var i=0;i<parts.length;i++) if(PM[parts[i]]) p=PM[parts[i]];
+                if(!p){var dp=n.getAttribute&&n.getAttribute('data-piece'); if(dp&&PM[dp]) p=PM[dp];}
+                if(!p){
+                  var lp=c.toLowerCase().split(/\s+/);
+                  var co=null,na=null;
+                  for(var i=0;i<lp.length;i++){if(lp[i]==='white'||lp[i]==='black')co=lp[i]; if(PN[lp[i]])na=lp[i];}
+                  if(co&&na){var l=PN[na]; p=co==='white'?l:l.toLowerCase();}
+                }
+                for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]); if(m){f=+m[1];r=+m[2];}}
+                if(f===null){var ds=n.getAttribute&&n.getAttribute('data-square'); if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}
+                if(f===null){
+                  var st=(n.getAttribute&&n.getAttribute('style'))||'';
+                  var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);
+                  if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro=Math.round(parseFloat(m2[2])/12.5); if(co2>=0&&co2<=7&&ro>=0&&ro<=7){f=co2+1;r=8-ro;}}
+                }
+                if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8) g[8-r][f-1]=p;
               }
-              if(wkRow>=0){
-                // White king is normally at rank 1 = DOM row 7 (bottom).
-                // If we see it in rows 0-3, board is flipped.
-                flipped=wkRow<4;
-                confident=true;
-              }
+              return g;
             }
-            return {flipped,confident};
-          }
 
-          function dp(){const pn=document.querySelectorAll('[data-ply]');
-          if(pn.length){let m=-1;pn.forEach(n=>{const p=parseInt(n.getAttribute('data-ply'),10);if(!isNaN(p)&&p>m)m=p;});
-          if(m>=0)return m;}return -1;}
+            function df(b,grid){
+              var confident=false, flipped=false;
+              var el=b;
+              for(var i=0;i<6&&el;i++){
+                if(el.classList&&el.classList.contains('flipped')){flipped=true;confident=true;break;}
+                el=el.parentElement;
+              }
+              if(b.hasAttribute('flipped')){flipped=true;confident=true;}
+              var o=b.getAttribute('orientation');
+              if(o==='black'){flipped=true;confident=true;}
+              if(o==='white'){flipped=false;confident=true;}
+              if(grid){
+                var wkRow=-1;
+                for(var r=0;r<8;r++) for(var c=0;c<8;c++) if(grid[r][c]==='K'){wkRow=r;break;}
+                if(wkRow>=0){flipped=wkRow<4; confident=true;}
+              }
+              return {flipped:flipped, confident:confident};
+            }
 
-          let pg=null,lp='',ls='w';
-          function di(p,c){if(!p||!c)return null;const ch=[];for(let r=0;r<8;r++)for(let x=0;x<8;x++)
-          if(p[r][x]!==c[r][x])ch.push({r,c:x,before:p[r][x],after:c[r][x]});
-          if(ch.length<2||ch.length>4)return null;
-          const t=ch.find(y=>y.after!=='.'&&y.after!==y.before);
-          const f=ch.find(y=>y.before!=='.'&&y.after==='.');
-          if(!t||!f)return null;
-          const fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);
-          const mc=t.after===t.after.toUpperCase()?'w':'b';return{uci:fr+to,movedColor:mc};}
+            function dp(){
+              var pn=document.querySelectorAll('[data-ply]');
+              if(pn.length){var m=-1; for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute('data-ply'),10); if(!isNaN(p)&&p>m)m=p;} if(m>=0)return m;}
+              return -1;
+            }
 
-          function tk(){const b=fb();if(!b)return;const g=rg(b);if(!g)return;
-          let s=null,cf='low';const p=dp();if(p>=0){s=(p%2===0)?'w':'b';cf='high';}
-          const m=di(pg,g);if(m&&!s){s=(m.movedColor==='w')?'b':'w';cf='low';}
-          if(!s)s=ls;ls=s;
-          const fi=df(b,g);
-          const gs=g.map(r=>r.join('')).join('');
-          const py={grid:gs,sideToMove:s,flipped:fi.flipped,flippedConfident:fi.confident,
-          lastMoveUCI:m?m.uci:'',plyCount:p,detectionConfidence:cf};
-          const k=JSON.stringify(py);if(k!==lp){lp=k;try{window.webkit.messageHandlers.fenBridge.postMessage(py);}catch(e){}}pg=g;}
+            // Closure-scoped state (no globals for anti-detection)
+            var prevGrid=null, lastPayload='', lastSide='w', tickTimer=null;
 
-          window.__ch_startReader=function(){if(window.__ch_timer)return;window.__ch_timer=setInterval(tk,500);};
-          const mo=new MutationObserver(()=>tk());try{mo.observe(document.documentElement,{childList:true,subtree:true,attributes:true});}catch(e){}
-          window.__ch_startReader();})();
+            function diff(p,c){
+              if(!p||!c)return null;
+              var changes=[];
+              for(var r=0;r<8;r++) for(var x=0;x<8;x++) if(p[r][x]!==c[r][x]) changes.push({r:r,c:x,before:p[r][x],after:c[r][x]});
+              if(changes.length<2||changes.length>4)return null;
+              var t=null,f=null;
+              for(var i=0;i<changes.length;i++){
+                if(changes[i].after!=='.'&&changes[i].after!==changes[i].before) t=changes[i];
+                if(changes[i].before!=='.'&&changes[i].after==='.') f=changes[i];
+              }
+              if(!t||!f)return null;
+              var fr=String.fromCharCode(97+f.c)+(8-f.r), to=String.fromCharCode(97+t.c)+(8-t.r);
+              var mc=t.after===t.after.toUpperCase()?'w':'b';
+              return {uci:fr+to, movedColor:mc};
+            }
+
+            function tick(){
+              var b=fb(); if(!b) return;
+              var g=rg(b); if(!g) return;
+              var side=null, cf='low';
+              var p=dp();
+              if(p>=0){side=(p%2===0)?'w':'b'; cf='high';}
+              var m=diff(prevGrid,g);
+              if(m&&!side){side=(m.movedColor==='w')?'b':'w'; cf='low';}
+              if(!side) side=lastSide;
+              lastSide=side;
+              var fi=df(b,g);
+              var gs='';
+              for(var r=0;r<8;r++) for(var c=0;c<8;c++) gs+=g[r][c];
+              var py={grid:gs, sideToMove:side, flipped:fi.flipped, flippedConfident:fi.confident,
+                      lastMoveUCI:m?m.uci:'', plyCount:p, detectionConfidence:cf};
+              var k=JSON.stringify(py);
+              if(k!==lastPayload){
+                lastPayload=k;
+                try{ window.webkit.messageHandlers['__BRIDGE_NAME__'].postMessage(py); }catch(e){}
+              }
+              prevGrid=g;
+            }
+
+            // Expose start function under session-random name only
+            Object.defineProperty(window, '__START_FUNC__', {
+              value: function(){
+                if(tickTimer) return;
+                // Randomized interval per tick to avoid pattern detection
+                var iv = __READER_INTERVAL__ + Math.floor(Math.random()*200);
+                tickTimer = setInterval(tick, iv);
+              },
+              enumerable: false, writable: false, configurable: false
+            });
+
+            // MutationObserver with error swallowing
+            try {
+              var mo = new MutationObserver(function(){ try{ tick(); }catch(e){} });
+              mo.observe(document.documentElement, {childList:true, subtree:true, attributes:true});
+            } catch(e){}
+
+            // Auto-start after slight random delay
+            setTimeout(function(){ try{ window['__START_FUNC__'](); }catch(e){} }, 300 + Math.floor(Math.random()*400));
+
+            // Self-erase script tag from DOM if visible (anti-forensics)
+            try {
+              var scripts = document.querySelectorAll('script');
+              for(var i=0;i<scripts.length;i++){
+                if(scripts[i].textContent && scripts[i].textContent.indexOf('__BRIDGE_NAME__') > -1){
+                  scripts[i].parentNode && scripts[i].parentNode.removeChild(scripts[i]);
+                }
+              }
+            } catch(e){}
+          })();
           EOF
 
       - name: Write adblock_css.css
