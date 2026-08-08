@@ -1,4 +1,4 @@
-name: Build ChessHelper v4.0
+name: Build ChessHelper v4.1
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "4.0.0"
-              CURRENT_PROJECT_VERSION: "40"
+              MARKETING_VERSION: "4.1.0"
+              CURRENT_PROJECT_VERSION: "41"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -216,51 +216,66 @@ jobs:
               let depth: Int
           }
 
-          /// PRIMARY: Lichess Cloud Eval (native MultiPV=3, real top-3 in one call)
-          /// FALLBACK: chess-api.com (single best move if Lichess doesn't have the position)
+          enum EngineError: Error, LocalizedError {
+              case badFen(String)
+              case networkOffline
+              case allEnginesFailed
+              case cancelled
+              var errorDescription: String? {
+                  switch self {
+                  case .badFen(let msg): return "Bad FEN: \(msg)"
+                  case .networkOffline: return "No internet"
+                  case .allEnginesFailed: return "Both engines offline"
+                  case .cancelled: return "Cancelled"
+                  }
+              }
+          }
+
           enum EngineService {
 
               // MARK: - Primary: Lichess Cloud Eval with MultiPV=3
-              /// Returns REAL top-3 moves from Lichess's cloud-cached Stockfish analysis.
-              /// Only works for positions Lichess has already analyzed (very common ones).
-              /// Response format: { "pvs": [{"moves": "e2e4 ...", "cp": 34}, ...] }
-              private static func callLichessCloud(fen: String) async -> [TopMove] {
+              private static func callLichessCloud(fen: String) async -> [TopMove]? {
                   var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
                   comps.queryItems = [
                       URLQueryItem(name: "fen", value: fen),
                       URLQueryItem(name: "multiPv", value: "3")
                   ]
-                  guard let url = comps.url else { return [] }
+                  guard let url = comps.url else { return nil }
                   var req = URLRequest(url: url)
                   req.timeoutInterval = 6
+                  req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData  // never cache
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return [] }
-                  guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-                      // 404 = position not in cloud, which is normal — return empty for fallback
-                      return []
+                  do {
+                      let (data, resp) = try await URLSession.shared.data(for: req)
+                      guard let http = resp as? HTTPURLResponse else { return nil }
+                      // 404 = position not in cloud (normal, not an error, just no data)
+                      if http.statusCode == 404 { return [] }
+                      guard http.statusCode == 200 else { return nil }
+                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                      let depth = (json["depth"] as? Int) ?? 20
+                      guard let pvs = json["pvs"] as? [[String: Any]] else { return [] }
+                      var moves: [TopMove] = []
+                      for (idx, pv) in pvs.prefix(3).enumerated() {
+                          let movesStr = (pv["moves"] as? String) ?? ""
+                          let firstMove = String(movesStr.split(separator: " ").first ?? "")
+                          guard !firstMove.isEmpty else { continue }
+                          let cp = pv["cp"] as? Int
+                          let mate = pv["mate"] as? Int
+                          moves.append(TopMove(
+                              rank: idx + 1,
+                              uci: firstMove,
+                              san: firstMove,
+                              evaluationCp: cp,
+                              mateIn: (mate == 0 ? nil : mate),
+                              depth: depth,
+                              source: "lc"
+                          ))
+                      }
+                      return moves
+                  } catch {
+                      // Network error → return nil (not empty)
+                      return nil
                   }
-                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
-                  let depth = (json["depth"] as? Int) ?? 20
-                  guard let pvs = json["pvs"] as? [[String: Any]] else { return [] }
-
-                  var moves: [TopMove] = []
-                  for (idx, pv) in pvs.prefix(3).enumerated() {
-                      let movesStr = (pv["moves"] as? String) ?? ""
-                      let firstMove = String(movesStr.split(separator: " ").first ?? "")
-                      guard !firstMove.isEmpty else { continue }
-                      let cp = pv["cp"] as? Int
-                      let mate = pv["mate"] as? Int
-                      moves.append(TopMove(
-                          rank: idx + 1,
-                          uci: firstMove,
-                          san: firstMove,  // Lichess returns UCI; SAN would need conversion
-                          evaluationCp: cp,
-                          mateIn: (mate == 0 ? nil : mate),
-                          depth: depth,
-                          source: "lc"
-                      ))
-                  }
-                  return moves
               }
 
               // MARK: - Fallback: chess-api.com
@@ -271,63 +286,64 @@ jobs:
                   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
                   req.timeoutInterval = 8
+                  req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
                   let body: [String: Any] = [
-                      "fen": fen,
-                      "depth": depth,
-                      "maxThinkingTime": 200
+                      "fen": fen, "depth": depth, "maxThinkingTime": 200
                   ]
                   guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return nil }
                   req.httpBody = httpBody
-                  guard let (data, _) = try? await URLSession.shared.data(for: req) else { return nil }
-                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-                  let uci = (json["move"] as? String) ?? ""
-                  guard !uci.isEmpty else { return nil }
-                  let san = (json["san"] as? String) ?? uci
-                  let eval = json["eval"] as? Double
-                  let mate = json["mate"] as? Int
-                  let cp = eval.map { Int(($0 * 100).rounded()) }
-                  let d = (json["depth"] as? Int) ?? depth
-                  return TopMove(
-                      rank: 1,
-                      uci: uci, san: san,
-                      evaluationCp: cp,
-                      mateIn: (mate == 0 ? nil : mate),
-                      depth: d,
-                      source: "cA"
-                  )
+                  do {
+                      let (data, _) = try await URLSession.shared.data(for: req)
+                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                      let uci = (json["move"] as? String) ?? ""
+                      guard !uci.isEmpty else { return nil }
+                      let san = (json["san"] as? String) ?? uci
+                      let eval = json["eval"] as? Double
+                      let mate = json["mate"] as? Int
+                      let cp = eval.map { Int(($0 * 100).rounded()) }
+                      let d = (json["depth"] as? Int) ?? depth
+                      return TopMove(rank: 1, uci: uci, san: san,
+                                     evaluationCp: cp,
+                                     mateIn: (mate == 0 ? nil : mate),
+                                     depth: d, source: "cA")
+                  } catch {
+                      return nil
+                  }
               }
 
-              /// Main analyze function: try Lichess first (real top-3), fall back to chess-api.
-              /// Streams results as they arrive via onUpdate callback.
+              /// Analyze position. Throws specific errors so caller knows what happened.
               static func analyzeStreaming(fen: String,
                                             onUpdate: @escaping @MainActor ([TopMove]) -> Void) async throws -> EngineAnalysis {
-                  // Validate FEN first
                   if let issue = FenValidator.validate(fen) {
-                      throw NSError(domain: "EngineService", code: -50,
-                                    userInfo: [NSLocalizedDescriptionKey: "Bad FEN: \(issue)"])
+                      throw EngineError.badFen(issue)
                   }
 
-                  // Try Lichess Cloud first (real top-3, ~300ms)
-                  let lichessMoves = await callLichessCloud(fen: fen)
-                  if !lichessMoves.isEmpty {
-                      await MainActor.run { onUpdate(lichessMoves) }
-                      let bestDepth = lichessMoves.first?.depth ?? 20
-                      return EngineAnalysis(topMoves: lichessMoves,
-                                            bestMove: lichessMoves.first,
-                                            depth: bestDepth)
+                  // Try Lichess first (native top-3)
+                  let lichessResult = await callLichessCloud(fen: fen)
+                  if try Task.checkCancellation() as Void? == nil, let moves = lichessResult, !moves.isEmpty {
+                      await MainActor.run { onUpdate(moves) }
+                      let bestDepth = moves.first?.depth ?? 20
+                      return EngineAnalysis(topMoves: moves, bestMove: moves.first, depth: bestDepth)
                   }
 
-                  // Lichess didn't have this position — fall back to chess-api for best move
+                  try Task.checkCancellation()
+
+                  // Fallback to chess-api
                   if let chessApiMove = await callChessApi(fen: fen) {
+                      try Task.checkCancellation()
                       let single = [chessApiMove]
                       await MainActor.run { onUpdate(single) }
-                      return EngineAnalysis(topMoves: single,
-                                            bestMove: chessApiMove,
-                                            depth: chessApiMove.depth)
+                      return EngineAnalysis(topMoves: single, bestMove: chessApiMove, depth: chessApiMove.depth)
                   }
 
-                  throw NSError(domain: "EngineService", code: -99,
-                                userInfo: [NSLocalizedDescriptionKey: "All engines offline"])
+                  // Both failed
+                  if lichessResult == nil {
+                      // Both returned nil → network problem
+                      throw EngineError.networkOffline
+                  } else {
+                      // Lichess had no data + chess-api failed
+                      throw EngineError.allEnginesFailed
+                  }
               }
           }
           '''
@@ -390,7 +406,7 @@ jobs:
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine (v4.0)") {
+                          Section("Engine (v4.1)") {
                               HStack {
                                   Circle().fill(.blue).frame(width: 10, height: 10)
                                   VStack(alignment: .leading) {
@@ -408,9 +424,11 @@ jobs:
                                   }
                               }
                           }
-                          Section("How it works") {
-                              Text("Lichess has millions of cached positions with real Stockfish analysis. Common positions (openings, tactical patterns) return 3 real moves in ~300ms.\n\nRare/unusual positions fall back to chess-api.com's live engine for the best move.")
-                                  .font(.caption).foregroundColor(.secondary)
+                          Section("Fixes in v4.1") {
+                              Label("Stale moves cleared on error", systemImage: "checkmark.shield.fill")
+                              Label("Auto-retry every 5s if offline", systemImage: "arrow.clockwise")
+                              Label("Cache bypass (fresh eval always)", systemImage: "network")
+                              Label("Clear OFFLINE indicator", systemImage: "wifi.slash")
                           }
                           Section("Panic (shake to hide/show)") {
                               Label("Shake phone", systemImage: "iphone.gen3.radiowaves.left.and.right")
@@ -430,7 +448,7 @@ jobs:
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "4.0.0 (40)")
+                              LabeledContent("Version", value: "4.1.0 (41)")
                               LabeledContent("Engine", value: "Lichess Cloud + chess-api")
                               LabeledContent("Session bridge", value: String(StealthConfig.bridgeName.prefix(8)))
                           }
@@ -472,6 +490,7 @@ jobs:
               @Published var depth = 0
               @Published var isThinking = false
               @Published var errorMessage = ""
+              @Published var isOffline = false
               @Published var detectedPlayerColor = "w"
               @Published var manualPlayerColor: String? = nil
               @Published var sideToMove = "w"
@@ -488,15 +507,22 @@ jobs:
               var isMyTurn: Bool { effectivePlayerColor == sideToMove }
 
               private var previousEvalWhitePOV: Double? = nil
-              private var lastAnalyzedFEN = ""
+              // KEY FIX: track ATTEMPTED and SUCCEEDED separately
+              private var lastSuccessfulFEN = ""    // last FEN that returned moves
+              private var lastAttemptedFEN = ""     // most recent FEN we tried
               private var analysisTask: Task<Void, Never>?
               private var debounceTask: Task<Void, Never>?
+              private var retryTask: Task<Void, Never>?
               private var pendingFEN = ""
               private var pendingFENCount = 0
 
               func setManualColor(_ c: String?) {
                   manualPlayerColor = c
-                  if !currentFEN.isEmpty { queueAnalyze(fen: currentFEN, immediate: true) }
+                  if !currentFEN.isEmpty {
+                      // Force fresh analysis for new perspective
+                      lastSuccessfulFEN = ""
+                      queueAnalyze(fen: currentFEN, immediate: true)
+                  }
               }
               func flipColor() { setManualColor(effectivePlayerColor == "w" ? "b" : "w") }
 
@@ -522,10 +548,11 @@ jobs:
                   let fen = "\(board) \(p.sideToMove) \(castling) - 0 \(full)"
 
                   if let issue = FenValidator.validate(fen) {
-                      errorMessage = "Waiting for stable board (\(issue))"
+                      // Bad FEN — don't clear moves yet (transition state), just note it
                       return
                   }
 
+                  // Stability check: same FEN must be seen 2+ times
                   if fen == pendingFEN {
                       pendingFENCount += 1
                   } else {
@@ -534,6 +561,10 @@ jobs:
                   }
                   if pendingFENCount >= 2 && fen != currentFEN {
                       currentFEN = fen
+                      // CLEAR stale moves IMMEDIATELY when position changes
+                      topMoves = []
+                      evaluation = "—"
+                      winChance = 50
                       errorMessage = ""
                       queueAnalyze(fen: fen)
                   }
@@ -541,6 +572,7 @@ jobs:
 
               private func queueAnalyze(fen: String, immediate: Bool = false) {
                   debounceTask?.cancel()
+                  retryTask?.cancel()
                   debounceTask = Task { [weak self] in
                       if !immediate { try? await Task.sleep(nanoseconds: 250_000_000) }
                       if Task.isCancelled { return }
@@ -549,17 +581,21 @@ jobs:
               }
 
               private func run(fen: String) async {
-                  guard fen != lastAnalyzedFEN else { return }
-                  lastAnalyzedFEN = fen
+                  // Skip only if we ALREADY successfully analyzed THIS exact FEN
+                  guard fen != lastSuccessfulFEN else { return }
+                  lastAttemptedFEN = fen
+
                   analysisTask?.cancel()
                   isThinking = true
                   errorMessage = ""
-                  topMoves = []
+                  // topMoves already cleared in ingest() — don't re-clear here
 
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
                           let a = try await EngineService.analyzeStreaming(fen: fen) { partial in
+                              // Only apply if this is still the current position
+                              guard fen == self.currentFEN else { return }
                               self.topMoves = partial
                               if let best = partial.first {
                                   self.evaluation = best.evalString
@@ -568,23 +604,67 @@ jobs:
                               }
                           }
                           if Task.isCancelled { return }
+                          // Guard: position must still be current when we finish
+                          guard fen == self.currentFEN else { return }
                           await MainActor.run {
                               self.topMoves = a.topMoves
                               self.evaluation = a.bestMove?.evalString ?? "—"
                               self.winChance = a.bestMove?.winChance ?? 50
                               self.depth = a.depth
                               self.isThinking = false
+                              self.isOffline = false
+                              self.errorMessage = ""
+                              // SUCCESS: mark this FEN as done
+                              self.lastSuccessfulFEN = fen
                               let wpov = self.evalWhitePOV(a.bestMove)
                               self.computeQuality(cur: wpov)
                               self.previousEvalWhitePOV = wpov
                           }
                       } catch {
                           if Task.isCancelled { return }
+                          guard fen == self.currentFEN else { return }
                           await MainActor.run {
-                              self.errorMessage = "\(error.localizedDescription)"
                               self.isThinking = false
+                              // CRITICAL: clear stale moves so user doesn't think they apply
+                              self.topMoves = []
+                              self.evaluation = "—"
+                              // DON'T update lastSuccessfulFEN — we failed
+                              if let engineError = error as? EngineError {
+                                  switch engineError {
+                                  case .networkOffline:
+                                      self.isOffline = true
+                                      self.errorMessage = "Offline — retrying…"
+                                      self.scheduleRetry(fen: fen)
+                                  case .allEnginesFailed:
+                                      self.isOffline = true
+                                      self.errorMessage = "Both engines down — retrying…"
+                                      self.scheduleRetry(fen: fen)
+                                  case .badFen(let msg):
+                                      self.errorMessage = "Bad FEN: \(msg)"
+                                  case .cancelled:
+                                      break
+                                  }
+                              } else {
+                                  self.isOffline = true
+                                  self.errorMessage = "Error — retrying…"
+                                  self.scheduleRetry(fen: fen)
+                              }
                           }
                       }
+                  }
+              }
+
+              /// Auto-retry every 5 seconds while offline
+              private func scheduleRetry(fen: String) {
+                  retryTask?.cancel()
+                  retryTask = Task { [weak self] in
+                      try? await Task.sleep(nanoseconds: 5_000_000_000)
+                      guard let self = self, !Task.isCancelled else { return }
+                      // Only retry if position hasn't changed
+                      guard fen == self.currentFEN else { return }
+                      // Only retry if still no moves
+                      guard self.topMoves.isEmpty else { return }
+                      await self.run(fen: fen)
                   }
               }
 
@@ -705,8 +785,8 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v4.0").font(.title2.bold())
-                      Text("REAL TOP-3 (Lichess Cloud)\n\n• Native MultiPV=3\n• Depth 20+\n• Sub-second response\n• Fallback to chess-api if needed\n\nCommon positions = 3 real moves.\nRare positions = 1 best move.\n\nShake = hide/show")
+                      Text("Chess Helper v4.1").font(.title2.bold())
+                      Text("BUG FIX RELEASE\n\n• Stale moves cleared on error\n• Auto-retry every 5s if offline\n• OFFLINE indicator shown\n• Cache-bypass (always fresh)\n• Position-guard on stream updates\n\nShake = hide/show")
                           .font(.footnote).foregroundColor(.white.opacity(0.85))
                           .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -747,15 +827,21 @@ jobs:
               }
               private var dot: some View {
                   Button { stealth.toggleMinimalMode() } label: {
-                      Circle().fill(engine.isMyTurn ? Color.green : Color.gray)
+                      Circle().fill(dotColor)
                           .frame(width: 14, height: 14)
                           .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1))
                   }
+              }
+              private var dotColor: Color {
+                  if engine.isOffline { return .red }
+                  if engine.isMyTurn { return .green }
+                  return .gray
               }
               private var panel: some View {
                   VStack(spacing: 0) {
                       header
                       if expanded {
+                          if engine.isOffline { offlineBanner }
                           colorRow
                           movesSection
                           lastMoveSection
@@ -763,12 +849,27 @@ jobs:
                       }
                   }
                   .background(.ultraThinMaterial).cornerRadius(16)
-                  .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.08)))
+                  .overlay(RoundedRectangle(cornerRadius: 16).stroke(borderColor, lineWidth: 1))
                   .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
+              }
+              private var borderColor: Color {
+                  engine.isOffline ? Color.red.opacity(0.5) : Color.white.opacity(0.08)
+              }
+              private var offlineBanner: some View {
+                  HStack(spacing: 6) {
+                      Image(systemName: "wifi.slash").font(.caption).foregroundColor(.red)
+                      Text("OFFLINE — moves shown may be stale")
+                          .font(.caption2.bold()).foregroundColor(.red)
+                      Spacer()
+                      ProgressView().scaleEffect(0.6)
+                  }
+                  .padding(.horizontal, 12).padding(.vertical, 4)
+                  .background(Color.red.opacity(0.15))
               }
               private var header: some View {
                   HStack(spacing: 10) {
-                      Circle().fill(engine.enabled ? Color.green : Color.gray).frame(width: 8, height: 8)
+                      Circle().fill(engine.isOffline ? Color.red : (engine.enabled ? Color.green : Color.gray))
+                          .frame(width: 8, height: 8)
                       Text("Helper").font(.subheadline.bold())
                       HStack(spacing: 4) {
                           Image(systemName: engine.isMyTurn ? "person.fill" : "hourglass").font(.caption2)
@@ -911,7 +1012,7 @@ jobs:
                   }
               }
               @ViewBuilder private var errorSection: some View {
-                  if !engine.errorMessage.isEmpty {
+                  if !engine.errorMessage.isEmpty && !engine.isOffline {
                       HStack(spacing: 6) {
                           Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange).font(.caption2)
                           Text(engine.errorMessage).font(.caption2).foregroundColor(.orange).lineLimit(2)
@@ -1041,8 +1142,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>4.0.0</string>
-            <key>CFBundleVersion</key><string>40</string>
+            <key>CFBundleShortVersionString</key><string>4.1.0</string>
+            <key>CFBundleVersion</key><string>41</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
