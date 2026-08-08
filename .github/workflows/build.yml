@@ -1,4 +1,4 @@
-name: Build ChessHelper v3.6
+name: Build ChessHelper v3.7
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "3.6.0"
-              CURRENT_PROJECT_VERSION: "37"
+              MARKETING_VERSION: "3.7.0"
+              CURRENT_PROJECT_VERSION: "38"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -146,7 +146,6 @@ jobs:
                   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
               ]
               static func randomUserAgent() -> String { userAgents.randomElement()! }
-              static func trafficJitter() -> UInt64 { UInt64.random(in: 50_000_000...200_000_000) }
               static func readerInterval() -> Int { Int.random(in: 600...1200) }
               private static func randomName(prefix: String, length: Int) -> String {
                   let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -166,7 +165,7 @@ jobs:
               let evaluationCp: Int?
               let mateIn: Int?
               let depth: Int
-              let style: String  // "tactical", "aggressive", "solid", "master", "deep", "stockfish"
+              let source: String  // "sf" | "cA" | "d13"
               var evalString: String {
                   if let m = mateIn, m != 0 { return "M\(abs(m))" }
                   if let cp = evaluationCp { return String(format: "%+.2f", Double(cp)/100.0) }
@@ -185,9 +184,11 @@ jobs:
               let depth: Int
           }
 
-          /// Multi-depth engine.
-          /// 5 parallel calls with WIDE depth range (5, 9, 13, 17) + stockfish.online
-          /// Different depths force engine to reveal different candidate moves.
+          /// FAST 3-source engine.
+          /// Call 1: stockfish.online (depth 13)
+          /// Call 2: chess-api.com (depth 10, fast)
+          /// Call 3: chess-api.com (depth 13, medium)
+          /// All fire in parallel. Fast think times = arrive within ~1 second.
           enum EngineService {
 
               struct SingleResult {
@@ -196,18 +197,47 @@ jobs:
                   let cp: Int?
                   let mateIn: Int?
                   let depth: Int
-                  let style: String
+                  let source: String
               }
 
-              // Helper: single chess-api call with specific depth + think time
-              private static func callChessApi(fen: String, depth: Int, thinkMs: Int, style: String) async -> SingleResult? {
-                  try? await Task.sleep(nanoseconds: StealthConfig.trafficJitter())
+              // Source 1: stockfish.online
+              private static func callStockfish(fen: String) async -> SingleResult? {
+                  var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
+                  comps.queryItems = [
+                      URLQueryItem(name: "fen", value: fen),
+                      URLQueryItem(name: "depth", value: "13")
+                  ]
+                  guard let url = comps.url else { return nil }
+                  var req = URLRequest(url: url)
+                  req.timeoutInterval = 6
+                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                  guard let (data, _) = try? await URLSession.shared.data(for: req) else { return nil }
+                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                  let bestField = (json["bestmove"] as? String) ?? ""
+                  let parts = bestField.split(separator: " ").map(String.init)
+                  var uci = ""
+                  for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count {
+                      uci = parts[i+1]; break
+                  }
+                  if uci.isEmpty { uci = parts.first ?? "" }
+                  guard !uci.isEmpty else { return nil }
+                  let evalDouble = json["evaluation"] as? Double
+                  let mate = json["mate"] as? Int
+                  let cp: Int? = evalDouble.map { Int(($0 * 100).rounded()) }
+                  let d = (json["depth"] as? Int) ?? 13
+                  return SingleResult(uci: uci, san: uci, cp: cp,
+                                      mateIn: (mate == 0 ? nil : mate),
+                                      depth: d, source: "sf")
+              }
+
+              // Source 2 & 3: chess-api.com (with configurable depth/think)
+              private static func callChessApi(fen: String, depth: Int, thinkMs: Int, source: String) async -> SingleResult? {
                   guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
                   var req = URLRequest(url: url)
                   req.httpMethod = "POST"
                   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  req.timeoutInterval = 12
+                  req.timeoutInterval = 6
                   let body: [String: Any] = [
                       "fen": fen,
                       "depth": depth,
@@ -226,63 +256,31 @@ jobs:
                   let d = (json["depth"] as? Int) ?? depth
                   return SingleResult(uci: uci, san: san, cp: cp,
                                       mateIn: (mate == 0 ? nil : mate),
-                                      depth: d, style: style)
+                                      depth: d, source: source)
               }
 
-              // stockfish.online call
-              private static func callStockfishOnline(fen: String) async -> SingleResult? {
-                  var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
-                  comps.queryItems = [
-                      URLQueryItem(name: "fen", value: fen),
-                      URLQueryItem(name: "depth", value: "13")
-                  ]
-                  guard let url = comps.url else { return nil }
-                  var req = URLRequest(url: url)
-                  req.timeoutInterval = 12
-                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  guard let (data, _) = try? await URLSession.shared.data(for: req) else { return nil }
-                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-                  let bestField = (json["bestmove"] as? String) ?? ""
-                  let parts = bestField.split(separator: " ").map(String.init)
-                  var uci = ""
-                  for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count {
-                      uci = parts[i+1]; break
-                  }
-                  if uci.isEmpty { uci = parts.first ?? "" }
-                  guard !uci.isEmpty else { return nil }
-                  let evalDouble = json["evaluation"] as? Double
-                  let mate = json["mate"] as? Int
-                  let cp: Int? = evalDouble.map { Int(($0 * 100).rounded()) }
-                  let d = (json["depth"] as? Int) ?? 13
-                  return SingleResult(uci: uci, san: uci, cp: cp,
-                                      mateIn: (mate == 0 ? nil : mate),
-                                      depth: d, style: "stockfish")
-              }
-
-              /// Streaming multi-depth analysis (5 parallel calls, wide depth range)
+              /// Streaming analysis — 3 parallel fast calls, moves appear as they arrive
               static func analyzeStreaming(fen: String,
                                             onUpdate: @escaping @MainActor ([TopMove]) -> Void) async throws -> EngineAnalysis {
                   var found: [SingleResult] = []
                   var seenUcis = Set<String>()
 
                   await withTaskGroup(of: SingleResult?.self) { group in
-                      // 5 different searches — wide depth range for max variety
-                      group.addTask { await callChessApi(fen: fen, depth: 5,  thinkMs: 50,  style: "tactical") }
-                      group.addTask { await callChessApi(fen: fen, depth: 9,  thinkMs: 100, style: "aggressive") }
-                      group.addTask { await callChessApi(fen: fen, depth: 13, thinkMs: 300, style: "solid") }
-                      group.addTask { await callChessApi(fen: fen, depth: 17, thinkMs: 800, style: "master") }
-                      group.addTask { await callStockfishOnline(fen: fen) }
+                      // 3 parallel fast calls, all different sources/depths
+                      group.addTask { await callStockfish(fen: fen) }                                    // sf   · d13
+                      group.addTask { await callChessApi(fen: fen, depth: 10, thinkMs: 80,  source: "cA") } // cA   · d10 · 80ms
+                      group.addTask { await callChessApi(fen: fen, depth: 13, thinkMs: 150, source: "d13") } // d13 · d13 · 150ms
 
                       for await result in group {
                           if let r = result, !seenUcis.contains(r.uci) {
                               seenUcis.insert(r.uci)
                               found.append(r)
-                              // Sort DESC by score
+                              // Sort by evaluation DESC and rebuild TopMoves
                               found.sort { scoreOf($0) > scoreOf($1) }
                               let snapshot: [TopMove] = found.enumerated().map { (idx, res) in
                                   TopMove(rank: idx + 1, uci: res.uci, san: res.san,
                                           evaluationCp: res.cp, mateIn: res.mateIn,
-                                          depth: res.depth, style: res.style)
+                                          depth: res.depth, source: res.source)
                               }
                               await MainActor.run { onUpdate(snapshot) }
                           }
@@ -297,9 +295,9 @@ jobs:
                   let finalMoves: [TopMove] = found.enumerated().map { (idx, r) in
                       TopMove(rank: idx + 1, uci: r.uci, san: r.san,
                               evaluationCp: r.cp, mateIn: r.mateIn,
-                              depth: r.depth, style: r.style)
+                              depth: r.depth, source: r.source)
                   }
-                  let bestDepth = found.map { $0.depth }.max() ?? 0
+                  let bestDepth = found.map { $0.depth }.max() ?? 13
                   return EngineAnalysis(topMoves: finalMoves,
                                         bestMove: finalMoves.first,
                                         depth: bestDepth)
@@ -370,16 +368,14 @@ jobs:
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine — Wide-depth multi-source") {
-                              HStack { Circle().fill(.red).frame(width: 10, height: 10); Text("depth 5 · tactical") }
-                              HStack { Circle().fill(.orange).frame(width: 10, height: 10); Text("depth 9 · aggressive") }
-                              HStack { Circle().fill(.yellow).frame(width: 10, height: 10); Text("depth 13 · solid") }
-                              HStack { Circle().fill(.green).frame(width: 10, height: 10); Text("depth 17 · master") }
-                              HStack { Circle().fill(.cyan).frame(width: 10, height: 10); Text("stockfish.online") }
-                              Text("5 parallel engine searches with different depths. Wide range = wildly different moves. Streaming: moves appear as they arrive.")
+                          Section("Engine — Fast 3-source parallel") {
+                              HStack { Circle().fill(.cyan).frame(width: 10, height: 10); Text("stockfish.online · d13") }
+                              HStack { Circle().fill(.orange).frame(width: 10, height: 10); Text("chess-api.com · d10 fast") }
+                              HStack { Circle().fill(.green).frame(width: 10, height: 10); Text("chess-api.com · d13 medium") }
+                              Text("3 different engines/depths run in parallel with fast think times. All arrive within ~1 second.")
                                   .font(.caption).foregroundColor(.secondary)
                           }
-                          Section("Stealth (v3.6)") {
+                          Section("Stealth (v3.7)") {
                               Text("Session bridge: \(String(StealthConfig.bridgeName.prefix(8)))…")
                                   .font(.caption.monospaced()).foregroundColor(.secondary)
                           }
@@ -401,8 +397,8 @@ jobs:
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "3.6.0 (37)")
-                              LabeledContent("Engine", value: "5-way wide-depth parallel")
+                              LabeledContent("Version", value: "3.7.0 (38)")
+                              LabeledContent("Engine", value: "Fast 3-source")
                           }
                       }
                       .navigationTitle("Settings")
@@ -494,7 +490,7 @@ jobs:
               private func queueAnalyze(fen: String, immediate: Bool = false) {
                   debounceTask?.cancel()
                   debounceTask = Task { [weak self] in
-                      if !immediate { try? await Task.sleep(nanoseconds: 300_000_000) }
+                      if !immediate { try? await Task.sleep(nanoseconds: 200_000_000) }
                       if Task.isCancelled { return }
                       await self?.run(fen: fen)
                   }
@@ -657,8 +653,8 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v3.6").font(.title2.bold())
-                      Text("WIDE-DEPTH ENGINE\n\n• 5 parallel searches (d5-d17)\n• Different depths = different moves\n• Up to 5 candidates streaming in\n• Style badges (tactical→master)\n\nShake = hide/show. Use responsibly.")
+                      Text("Chess Helper v3.7").font(.title2.bold())
+                      Text("FAST 3-SOURCE\n\n• stockfish.online (d13)\n• chess-api.com (d10 fast)\n• chess-api.com (d13 medium)\n\nAll parallel · ~1 sec total\nShake = hide/show")
                           .font(.footnote).foregroundColor(.white.opacity(0.85))
                           .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -775,10 +771,10 @@ jobs:
                   VStack(alignment: .leading, spacing: 4) {
                       Divider().opacity(0.3)
                       HStack {
-                          Text(engine.isMyTurn ? "Move options (mix these!)" : "Opponent's likely moves")
+                          Text(engine.isMyTurn ? "Move options (mix them!)" : "Opponent's likely moves")
                               .font(.caption).foregroundColor(.secondary)
                           Spacer()
-                          Text("\(engine.topMoves.count) opts · d\(engine.depth)")
+                          Text("\(engine.topMoves.count)/3")
                               .font(.caption2.monospaced()).foregroundColor(.secondary)
                       }
                       .padding(.horizontal, 14).padding(.top, 6)
@@ -804,28 +800,16 @@ jobs:
                       .frame(height: 8).padding(.horizontal, 14).padding(.top, 4)
                   }
               }
-              private func styleColor(_ style: String) -> Color {
-                  switch style {
-                  case "tactical": return .red
-                  case "aggressive": return .orange
-                  case "solid": return .yellow
-                  case "master": return .green
-                  case "stockfish": return .cyan
+              private func sourceColor(_ source: String) -> Color {
+                  switch source {
+                  case "sf": return .cyan
+                  case "cA": return .orange
+                  case "d13": return .green
                   default: return .white.opacity(0.7)
                   }
               }
-              private func styleShort(_ style: String) -> String {
-                  switch style {
-                  case "tactical": return "tac"
-                  case "aggressive": return "agg"
-                  case "solid": return "sol"
-                  case "master": return "mst"
-                  case "stockfish": return "sf"
-                  default: return "?"
-                  }
-              }
               private func moveRow(rank: Int, move: TopMove, isSelected: Bool) -> some View {
-                  let sc = styleColor(move.style)
+                  let sc = sourceColor(move.source)
                   return HStack(spacing: 8) {
                       Text("#\(rank)").font(.caption.bold().monospaced())
                           .foregroundColor(sc).frame(width: 22)
@@ -833,7 +817,7 @@ jobs:
                           .font(rank == 1 ? .title3.bold() : .callout.bold()).foregroundColor(sc)
                       Text(move.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
                       Spacer()
-                      Text(styleShort(move.style))
+                      Text(move.source)
                           .font(.caption2.bold().monospaced())
                           .padding(.horizontal, 4).padding(.vertical, 1)
                           .background(sc.opacity(0.2))
@@ -997,8 +981,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>3.6.0</string>
-            <key>CFBundleVersion</key><string>37</string>
+            <key>CFBundleShortVersionString</key><string>3.7.0</string>
+            <key>CFBundleVersion</key><string>38</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
