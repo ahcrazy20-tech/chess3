@@ -1,4 +1,4 @@
-name: Build ChessHelper v3.8
+name: Build ChessHelper v4.0
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "3.8.0"
-              CURRENT_PROJECT_VERSION: "39"
+              MARKETING_VERSION: "4.0.0"
+              CURRENT_PROJECT_VERSION: "40"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -156,9 +156,6 @@ jobs:
 
           files["Sources/FenValidator.swift"] = r'''
           import Foundation
-
-          /// Validates a FEN and reports issues.
-          /// Returns nil if valid, or a description of the problem.
           enum FenValidator {
               static func validate(_ fen: String) -> String? {
                   let parts = fen.split(separator: " ").map(String.init)
@@ -166,7 +163,6 @@ jobs:
                   let board = parts[0]
                   let ranks = board.split(separator: "/").map(String.init)
                   guard ranks.count == 8 else { return "not 8 ranks" }
-
                   var whiteKings = 0, blackKings = 0, totalPieces = 0
                   for rank in ranks {
                       var count = 0
@@ -183,7 +179,7 @@ jobs:
                   }
                   if whiteKings != 1 { return "\(whiteKings) white kings" }
                   if blackKings != 1 { return "\(blackKings) black kings" }
-                  if totalPieces < 4 { return "only \(totalPieces) pieces (transition?)" }
+                  if totalPieces < 4 { return "only \(totalPieces) pieces" }
                   if totalPieces > 32 { return "\(totalPieces) pieces (invalid)" }
                   return nil
               }
@@ -220,98 +216,89 @@ jobs:
               let depth: Int
           }
 
+          /// PRIMARY: Lichess Cloud Eval (native MultiPV=3, real top-3 in one call)
+          /// FALLBACK: chess-api.com (single best move if Lichess doesn't have the position)
           enum EngineService {
 
-              struct SingleResult {
-                  let uci: String
-                  let san: String
-                  let cp: Int?
-                  let mateIn: Int?
-                  let depth: Int
-                  let source: String
-              }
-
-              // Check if UCI move looks valid (4-5 chars, only a-h/1-8/promotion piece)
-              private static func isValidUci(_ uci: String) -> Bool {
-                  guard uci.count == 4 || uci.count == 5 else { return false }
-                  let chars = Array(uci)
-                  let validFiles = Set<Character>(["a","b","c","d","e","f","g","h"])
-                  let validRanks = Set<Character>(["1","2","3","4","5","6","7","8"])
-                  let validPromos = Set<Character>(["q","r","b","n"])
-                  guard validFiles.contains(chars[0]) else { return false }
-                  guard validRanks.contains(chars[1]) else { return false }
-                  guard validFiles.contains(chars[2]) else { return false }
-                  guard validRanks.contains(chars[3]) else { return false }
-                  if chars.count == 5 { guard validPromos.contains(chars[4]) else { return false } }
-                  // Reject "no move" style like a1a1
-                  if chars[0] == chars[2] && chars[1] == chars[3] { return false }
-                  return true
-              }
-
-              // Source 1: stockfish.online
-              private static func callStockfish(fen: String) async -> SingleResult? {
-                  var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
+              // MARK: - Primary: Lichess Cloud Eval with MultiPV=3
+              /// Returns REAL top-3 moves from Lichess's cloud-cached Stockfish analysis.
+              /// Only works for positions Lichess has already analyzed (very common ones).
+              /// Response format: { "pvs": [{"moves": "e2e4 ...", "cp": 34}, ...] }
+              private static func callLichessCloud(fen: String) async -> [TopMove] {
+                  var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
                   comps.queryItems = [
                       URLQueryItem(name: "fen", value: fen),
-                      URLQueryItem(name: "depth", value: "13")
+                      URLQueryItem(name: "multiPv", value: "3")
                   ]
-                  guard let url = comps.url else { return nil }
+                  guard let url = comps.url else { return [] }
                   var req = URLRequest(url: url)
                   req.timeoutInterval = 6
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  guard let (data, _) = try? await URLSession.shared.data(for: req) else { return nil }
-                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-                  // Check for API error field
-                  if let success = json["success"] as? Bool, !success { return nil }
-                  let bestField = (json["bestmove"] as? String) ?? ""
-                  let parts = bestField.split(separator: " ").map(String.init)
-                  var uci = ""
-                  for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count {
-                      uci = parts[i+1]; break
+                  guard let (data, resp) = try? await URLSession.shared.data(for: req) else { return [] }
+                  guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                      // 404 = position not in cloud, which is normal — return empty for fallback
+                      return []
                   }
-                  if uci.isEmpty { uci = parts.first ?? "" }
-                  guard !uci.isEmpty, isValidUci(uci) else { return nil }
-                  let evalDouble = json["evaluation"] as? Double
-                  let mate = json["mate"] as? Int
-                  let cp: Int? = evalDouble.map { Int(($0 * 100).rounded()) }
-                  let d = (json["depth"] as? Int) ?? 13
-                  return SingleResult(uci: uci, san: uci, cp: cp,
-                                      mateIn: (mate == 0 ? nil : mate),
-                                      depth: d, source: "sf")
+                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+                  let depth = (json["depth"] as? Int) ?? 20
+                  guard let pvs = json["pvs"] as? [[String: Any]] else { return [] }
+
+                  var moves: [TopMove] = []
+                  for (idx, pv) in pvs.prefix(3).enumerated() {
+                      let movesStr = (pv["moves"] as? String) ?? ""
+                      let firstMove = String(movesStr.split(separator: " ").first ?? "")
+                      guard !firstMove.isEmpty else { continue }
+                      let cp = pv["cp"] as? Int
+                      let mate = pv["mate"] as? Int
+                      moves.append(TopMove(
+                          rank: idx + 1,
+                          uci: firstMove,
+                          san: firstMove,  // Lichess returns UCI; SAN would need conversion
+                          evaluationCp: cp,
+                          mateIn: (mate == 0 ? nil : mate),
+                          depth: depth,
+                          source: "lc"
+                      ))
+                  }
+                  return moves
               }
 
-              // chess-api.com call
-              private static func callChessApi(fen: String, depth: Int, thinkMs: Int, source: String) async -> SingleResult? {
+              // MARK: - Fallback: chess-api.com
+              private static func callChessApi(fen: String, depth: Int = 12) async -> TopMove? {
                   guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
                   var req = URLRequest(url: url)
                   req.httpMethod = "POST"
                   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  req.timeoutInterval = 6
+                  req.timeoutInterval = 8
                   let body: [String: Any] = [
                       "fen": fen,
                       "depth": depth,
-                      "maxThinkingTime": thinkMs
+                      "maxThinkingTime": 200
                   ]
                   guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return nil }
                   req.httpBody = httpBody
                   guard let (data, _) = try? await URLSession.shared.data(for: req) else { return nil }
                   guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
                   let uci = (json["move"] as? String) ?? ""
-                  guard !uci.isEmpty, isValidUci(uci) else { return nil }
+                  guard !uci.isEmpty else { return nil }
                   let san = (json["san"] as? String) ?? uci
                   let eval = json["eval"] as? Double
                   let mate = json["mate"] as? Int
                   let cp = eval.map { Int(($0 * 100).rounded()) }
                   let d = (json["depth"] as? Int) ?? depth
-                  return SingleResult(uci: uci, san: san, cp: cp,
-                                      mateIn: (mate == 0 ? nil : mate),
-                                      depth: d, source: source)
+                  return TopMove(
+                      rank: 1,
+                      uci: uci, san: san,
+                      evaluationCp: cp,
+                      mateIn: (mate == 0 ? nil : mate),
+                      depth: d,
+                      source: "cA"
+                  )
               }
 
-              /// Streaming analysis with FEN validation + retry with alternate castling.
-              /// If we get < 2 unique moves, retry once with looser castling rights ("KQkq")
-              /// or stricter ("-") to force different engine responses.
+              /// Main analyze function: try Lichess first (real top-3), fall back to chess-api.
+              /// Streams results as they arrive via onUpdate callback.
               static func analyzeStreaming(fen: String,
                                             onUpdate: @escaping @MainActor ([TopMove]) -> Void) async throws -> EngineAnalysis {
                   // Validate FEN first
@@ -320,91 +307,27 @@ jobs:
                                     userInfo: [NSLocalizedDescriptionKey: "Bad FEN: \(issue)"])
                   }
 
-                  var found: [SingleResult] = []
-                  var seenUcis = Set<String>()
-
-                  // First round: 3 parallel calls with primary FEN
-                  await withTaskGroup(of: SingleResult?.self) { group in
-                      group.addTask { await callStockfish(fen: fen) }
-                      group.addTask { await callChessApi(fen: fen, depth: 10, thinkMs: 80,  source: "cA") }
-                      group.addTask { await callChessApi(fen: fen, depth: 13, thinkMs: 150, source: "d13") }
-                      for await result in group {
-                          if let r = result, !seenUcis.contains(r.uci) {
-                              seenUcis.insert(r.uci)
-                              found.append(r)
-                              found.sort { scoreOf($0) > scoreOf($1) }
-                              let snapshot = buildTopMoves(found)
-                              await MainActor.run { onUpdate(snapshot) }
-                          }
-                      }
+                  // Try Lichess Cloud first (real top-3, ~300ms)
+                  let lichessMoves = await callLichessCloud(fen: fen)
+                  if !lichessMoves.isEmpty {
+                      await MainActor.run { onUpdate(lichessMoves) }
+                      let bestDepth = lichessMoves.first?.depth ?? 20
+                      return EngineAnalysis(topMoves: lichessMoves,
+                                            bestMove: lichessMoves.first,
+                                            depth: bestDepth)
                   }
 
-                  // If we only got 1 unique move, try alternate FENs to force variety
-                  if found.count < 2 {
-                      let altFens = alternateFens(from: fen)
-                      await withTaskGroup(of: SingleResult?.self) { group in
-                          for altFen in altFens {
-                              group.addTask { await callChessApi(fen: altFen, depth: 12, thinkMs: 100, source: "alt") }
-                          }
-                          for await result in group {
-                              if let r = result, !seenUcis.contains(r.uci), isValidUci(r.uci) {
-                                  seenUcis.insert(r.uci)
-                                  found.append(r)
-                                  found.sort { scoreOf($0) > scoreOf($1) }
-                                  let snapshot = buildTopMoves(found)
-                                  await MainActor.run { onUpdate(snapshot) }
-                              }
-                          }
-                      }
+                  // Lichess didn't have this position — fall back to chess-api for best move
+                  if let chessApiMove = await callChessApi(fen: fen) {
+                      let single = [chessApiMove]
+                      await MainActor.run { onUpdate(single) }
+                      return EngineAnalysis(topMoves: single,
+                                            bestMove: chessApiMove,
+                                            depth: chessApiMove.depth)
                   }
 
-                  guard !found.isEmpty else {
-                      throw NSError(domain: "EngineService", code: -99,
-                                    userInfo: [NSLocalizedDescriptionKey: "All engines offline"])
-                  }
-                  found.sort { scoreOf($0) > scoreOf($1) }
-                  let finalMoves = buildTopMoves(found)
-                  let bestDepth = found.map { $0.depth }.max() ?? 13
-                  return EngineAnalysis(topMoves: finalMoves,
-                                        bestMove: finalMoves.first,
-                                        depth: bestDepth)
-              }
-
-              private static func buildTopMoves(_ found: [SingleResult]) -> [TopMove] {
-                  return found.enumerated().map { (idx, r) in
-                      TopMove(rank: idx + 1, uci: r.uci, san: r.san,
-                              evaluationCp: r.cp, mateIn: r.mateIn,
-                              depth: r.depth, source: r.source)
-                  }
-              }
-
-              /// Generate alternate FEN variations to force different engine answers.
-              /// Try different castling rights combinations.
-              private static func alternateFens(from fen: String) -> [String] {
-                  let parts = fen.split(separator: " ").map(String.init)
-                  guard parts.count >= 4 else { return [] }
-                  let board = parts[0]
-                  let side = parts[1]
-                  let originalCastling = parts[2]
-                  let ep = parts[3]
-                  let rest = parts.dropFirst(4).joined(separator: " ")
-
-                  var variations: [String] = []
-                  // Variant 1: no castling rights (forces engine to consider non-castling moves)
-                  if originalCastling != "-" {
-                      variations.append("\(board) \(side) - \(ep) \(rest)")
-                  }
-                  // Variant 2: only kingside castling
-                  let ksCastling = side == "w" ? "K" : "k"
-                  if originalCastling != ksCastling {
-                      variations.append("\(board) \(side) \(ksCastling) \(ep) \(rest)")
-                  }
-                  return variations
-              }
-
-              private static func scoreOf(_ r: SingleResult) -> Double {
-                  if let m = r.mateIn { return m > 0 ? 100000 - Double(m) : -100000 - Double(m) }
-                  return Double(r.cp ?? 0)
+                  throw NSError(domain: "EngineService", code: -99,
+                                userInfo: [NSLocalizedDescriptionKey: "All engines offline"])
               }
           }
           '''
@@ -467,19 +390,27 @@ jobs:
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine — 3-source + retry") {
-                              HStack { Circle().fill(.cyan).frame(width: 10, height: 10); Text("stockfish.online · d13") }
-                              HStack { Circle().fill(.orange).frame(width: 10, height: 10); Text("chess-api.com · d10 fast") }
-                              HStack { Circle().fill(.green).frame(width: 10, height: 10); Text("chess-api.com · d13 medium") }
-                              HStack { Circle().fill(.purple).frame(width: 10, height: 10); Text("alt-FEN retry (if <2 moves)") }
-                              Text("If only 1 move found, retries with alternate castling rights to force variety.")
-                                  .font(.caption).foregroundColor(.secondary)
+                          Section("Engine (v4.0)") {
+                              HStack {
+                                  Circle().fill(.blue).frame(width: 10, height: 10)
+                                  VStack(alignment: .leading) {
+                                      Text("Lichess Cloud (primary)").font(.subheadline)
+                                      Text("Real top-3 via MultiPV. Depth 20+.")
+                                          .font(.caption).foregroundColor(.secondary)
+                                  }
+                              }
+                              HStack {
+                                  Circle().fill(.orange).frame(width: 10, height: 10)
+                                  VStack(alignment: .leading) {
+                                      Text("chess-api.com (fallback)").font(.subheadline)
+                                      Text("Best move when Lichess has no data.")
+                                          .font(.caption).foregroundColor(.secondary)
+                                  }
+                              }
                           }
-                          Section("FEN validation (v3.8)") {
-                              Label("2 kings required", systemImage: "checkmark.shield")
-                              Label("4-32 pieces required", systemImage: "checkmark.shield")
-                              Label("Move must look legal (a1h8)", systemImage: "checkmark.shield")
-                              Label("Skip bad FENs (transitions)", systemImage: "checkmark.shield")
+                          Section("How it works") {
+                              Text("Lichess has millions of cached positions with real Stockfish analysis. Common positions (openings, tactical patterns) return 3 real moves in ~300ms.\n\nRare/unusual positions fall back to chess-api.com's live engine for the best move.")
+                                  .font(.caption).foregroundColor(.secondary)
                           }
                           Section("Panic (shake to hide/show)") {
                               Label("Shake phone", systemImage: "iphone.gen3.radiowaves.left.and.right")
@@ -499,8 +430,9 @@ jobs:
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "3.8.0 (39)")
-                              LabeledContent("Engine", value: "3-source + FEN validator")
+                              LabeledContent("Version", value: "4.0.0 (40)")
+                              LabeledContent("Engine", value: "Lichess Cloud + chess-api")
+                              LabeledContent("Session bridge", value: String(StealthConfig.bridgeName.prefix(8)))
                           }
                       }
                       .navigationTitle("Settings")
@@ -559,7 +491,6 @@ jobs:
               private var lastAnalyzedFEN = ""
               private var analysisTask: Task<Void, Never>?
               private var debounceTask: Task<Void, Never>?
-              // Stability tracking: only send FEN if it's been the same for 2 reads
               private var pendingFEN = ""
               private var pendingFENCount = 0
 
@@ -590,14 +521,11 @@ jobs:
                   let full = max(1, (p.plyCount / 2) + 1)
                   let fen = "\(board) \(p.sideToMove) \(castling) - 0 \(full)"
 
-                  // Validate FEN before doing anything
                   if let issue = FenValidator.validate(fen) {
-                      // Bad FEN — probably transition state. Skip.
                       errorMessage = "Waiting for stable board (\(issue))"
                       return
                   }
 
-                  // Stability check: only trigger if same FEN seen twice in a row
                   if fen == pendingFEN {
                       pendingFENCount += 1
                   } else {
@@ -777,8 +705,8 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v3.8").font(.title2.bold())
-                      Text("BULLETPROOF FEN + RETRY\n\n• 3-source parallel engine\n• FEN validation (2 kings, piece count)\n• Board stability check (2 reads)\n• Auto-retry with alt castling if <2 moves\n• Reject illegal engine responses\n\nShake = hide/show")
+                      Text("Chess Helper v4.0").font(.title2.bold())
+                      Text("REAL TOP-3 (Lichess Cloud)\n\n• Native MultiPV=3\n• Depth 20+\n• Sub-second response\n• Fallback to chess-api if needed\n\nCommon positions = 3 real moves.\nRare positions = 1 best move.\n\nShake = hide/show")
                           .font(.footnote).foregroundColor(.white.opacity(0.85))
                           .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -898,7 +826,7 @@ jobs:
                           Text(engine.isMyTurn ? "Move options (mix them!)" : "Opponent's likely moves")
                               .font(.caption).foregroundColor(.secondary)
                           Spacer()
-                          Text("\(engine.topMoves.count) opts")
+                          Text("\(engine.topMoves.count) opts · d\(engine.depth)")
                               .font(.caption2.monospaced()).foregroundColor(.secondary)
                       }
                       .padding(.horizontal, 14).padding(.top, 6)
@@ -926,20 +854,27 @@ jobs:
               }
               private func sourceColor(_ source: String) -> Color {
                   switch source {
-                  case "sf": return .cyan
+                  case "lc": return .blue
                   case "cA": return .orange
-                  case "d13": return .green
-                  case "alt": return .purple
+                  default: return .white.opacity(0.7)
+                  }
+              }
+              private func rankColor(_ rank: Int) -> Color {
+                  switch rank {
+                  case 1: return .green
+                  case 2: return .yellow
+                  case 3: return .orange
                   default: return .white.opacity(0.7)
                   }
               }
               private func moveRow(rank: Int, move: TopMove, isSelected: Bool) -> some View {
+                  let rc = rankColor(rank)
                   let sc = sourceColor(move.source)
                   return HStack(spacing: 8) {
                       Text("#\(rank)").font(.caption.bold().monospaced())
-                          .foregroundColor(sc).frame(width: 22)
+                          .foregroundColor(rc).frame(width: 22)
                       Text(move.san.isEmpty ? move.uci : move.san)
-                          .font(rank == 1 ? .title3.bold() : .callout.bold()).foregroundColor(sc)
+                          .font(rank == 1 ? .title3.bold() : .callout.bold()).foregroundColor(rc)
                       Text(move.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
                       Spacer()
                       Text(move.source)
@@ -949,13 +884,13 @@ jobs:
                           .foregroundColor(sc)
                           .cornerRadius(3)
                       Text("d\(move.depth)").font(.caption2.monospaced()).foregroundColor(.secondary)
-                      Text(move.evalString).font(.caption.bold().monospaced()).foregroundColor(sc)
+                      Text(move.evalString).font(.caption.bold().monospaced()).foregroundColor(rc)
                       if isSelected {
-                          Image(systemName: "checkmark.circle.fill").foregroundColor(sc).font(.caption)
+                          Image(systemName: "checkmark.circle.fill").foregroundColor(rc).font(.caption)
                       }
                   }
                   .padding(.horizontal, 14).padding(.vertical, 5)
-                  .background(isSelected ? sc.opacity(0.20) : (rank == 1 ? sc.opacity(0.08) : Color.clear))
+                  .background(isSelected ? rc.opacity(0.20) : (rank == 1 ? rc.opacity(0.08) : Color.clear))
                   .contentShape(Rectangle())
               }
               @ViewBuilder private var lastMoveSection: some View {
@@ -1106,8 +1041,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>3.8.0</string>
-            <key>CFBundleVersion</key><string>39</string>
+            <key>CFBundleShortVersionString</key><string>4.0.0</string>
+            <key>CFBundleVersion</key><string>40</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -1187,7 +1122,6 @@ jobs:
               if (bkRow >= 0) return { flipped: bkRow >= 4, confident: true };
               return { flipped: false, confident: false };
             }
-            // Validate grid: must have exactly 2 kings and 4-32 total pieces
             function isGridValid(grid) {
               if (!grid) return false;
               var wk = 0, bk = 0, total = 0;
@@ -1224,7 +1158,6 @@ jobs:
             function tick(){
               var b=fb(); if(!b) return;
               var g=rg(b); if(!g) return;
-              // Skip if grid is in transient/invalid state (piece being dragged)
               if (!isGridValid(g)) return;
               var side=null, cf='low';
               var p=dp();
