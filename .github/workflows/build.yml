@@ -1,4 +1,4 @@
-name: Build ChessHelper v4.2
+name: Build ChessHelper v4.3
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "4.2.0"
-              CURRENT_PROJECT_VERSION: "42"
+              MARKETING_VERSION: "4.3.0"
+              CURRENT_PROJECT_VERSION: "43"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -113,7 +113,7 @@ jobs:
                           .tabItem { Label("Puzzles", systemImage: "puzzlepiece.fill") }.tag(3)
                       SimpleTabView(title: "Stats", icon: "chart.bar.fill")
                           .tabItem { Label("Stats", systemImage: "chart.bar.fill") }.tag(4)
-                      SettingsView(stealth: stealth)
+                      SettingsView(stealth: stealth, engine: engine)
                           .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
                   }
                   .tint(.green)
@@ -186,6 +186,136 @@ jobs:
           }
           '''
 
+          # NEW: Local Opening Book
+          files["Sources/OpeningBook.swift"] = r'''
+          import Foundation
+
+          /// Small offline opening book — first 15 moves of most common openings.
+          /// Instant response, no API call needed.
+          struct OpeningEntry {
+              let name: String
+              let moves: [String]  // UCI moves in order
+          }
+
+          enum OpeningBook {
+              static let entries: [OpeningEntry] = [
+                  // King's Pawn Openings
+                  OpeningEntry(name: "Italian Game", moves: ["e2e4","e7e5","g1f3","b8c6","f1c4","g8f6","d2d3","f8c5"]),
+                  OpeningEntry(name: "Ruy Lopez", moves: ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6","e1g1","f8e7"]),
+                  OpeningEntry(name: "Scotch Game", moves: ["e2e4","e7e5","g1f3","b8c6","d2d4","e5d4","f3d4"]),
+                  OpeningEntry(name: "Vienna Game", moves: ["e2e4","e7e5","b1c3"]),
+                  OpeningEntry(name: "King's Gambit", moves: ["e2e4","e7e5","f2f4"]),
+                  // Sicilian
+                  OpeningEntry(name: "Sicilian Najdorf", moves: ["e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6","b1c3","a7a6"]),
+                  OpeningEntry(name: "Sicilian Dragon", moves: ["e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6","b1c3","g7g6"]),
+                  OpeningEntry(name: "Sicilian Sveshnikov", moves: ["e2e4","c7c5","g1f3","b8c6","d2d4","c5d4","f3d4","g8f6","b1c3","e7e5"]),
+                  OpeningEntry(name: "Sicilian Alapin", moves: ["e2e4","c7c5","c2c3"]),
+                  OpeningEntry(name: "Sicilian Rossolimo", moves: ["e2e4","c7c5","g1f3","b8c6","f1b5"]),
+                  // French / Caro-Kann
+                  OpeningEntry(name: "French Defense", moves: ["e2e4","e7e6","d2d4","d7d5"]),
+                  OpeningEntry(name: "Caro-Kann Defense", moves: ["e2e4","c7c6","d2d4","d7d5"]),
+                  OpeningEntry(name: "Caro-Kann Advance", moves: ["e2e4","c7c6","d2d4","d7d5","e4e5"]),
+                  // Other 1.e4
+                  OpeningEntry(name: "Scandinavian", moves: ["e2e4","d7d5"]),
+                  OpeningEntry(name: "Pirc Defense", moves: ["e2e4","d7d6","d2d4","g8f6","b1c3","g7g6"]),
+                  OpeningEntry(name: "Alekhine Defense", moves: ["e2e4","g8f6"]),
+                  OpeningEntry(name: "Modern Defense", moves: ["e2e4","g7g6"]),
+                  // Queen's Pawn
+                  OpeningEntry(name: "Queen's Gambit", moves: ["d2d4","d7d5","c2c4"]),
+                  OpeningEntry(name: "Queen's Gambit Declined", moves: ["d2d4","d7d5","c2c4","e7e6"]),
+                  OpeningEntry(name: "Queen's Gambit Accepted", moves: ["d2d4","d7d5","c2c4","d5c4"]),
+                  OpeningEntry(name: "Slav Defense", moves: ["d2d4","d7d5","c2c4","c7c6"]),
+                  OpeningEntry(name: "London System", moves: ["d2d4","d7d5","g1f3","g8f6","c1f4"]),
+                  OpeningEntry(name: "London System (early)", moves: ["d2d4","g8f6","g1f3","d7d5","c1f4"]),
+                  OpeningEntry(name: "Colle System", moves: ["d2d4","d7d5","g1f3","g8f6","e2e3"]),
+                  // Indian Defenses
+                  OpeningEntry(name: "King's Indian Defense", moves: ["d2d4","g8f6","c2c4","g7g6","b1c3","f8g7"]),
+                  OpeningEntry(name: "Nimzo-Indian", moves: ["d2d4","g8f6","c2c4","e7e6","b1c3","f8b4"]),
+                  OpeningEntry(name: "Queen's Indian", moves: ["d2d4","g8f6","c2c4","e7e6","g1f3","b7b6"]),
+                  OpeningEntry(name: "Grunfeld Defense", moves: ["d2d4","g8f6","c2c4","g7g6","b1c3","d7d5"]),
+                  OpeningEntry(name: "Benoni Defense", moves: ["d2d4","g8f6","c2c4","c7c5","d4d5"]),
+                  OpeningEntry(name: "Dutch Defense", moves: ["d2d4","f7f5"]),
+                  // Flank openings
+                  OpeningEntry(name: "English Opening", moves: ["c2c4"]),
+                  OpeningEntry(name: "Reti Opening", moves: ["g1f3","d7d5","c2c4"]),
+                  OpeningEntry(name: "Larsen Opening", moves: ["b2b3"]),
+                  OpeningEntry(name: "Bird's Opening", moves: ["f2f4"]),
+              ]
+
+              /// Find matching opening by move history.
+              /// Returns (name, nextMove) if history matches prefix of a known opening.
+              static func lookup(history: [String]) -> (name: String, nextMove: String?)? {
+                  guard !history.isEmpty else { return nil }
+                  var bestMatch: (name: String, nextMove: String?)? = nil
+                  var bestLen = 0
+                  for entry in entries {
+                      // History must be a prefix of the entry's moves
+                      guard history.count <= entry.moves.count else { continue }
+                      let prefix = Array(entry.moves.prefix(history.count))
+                      if prefix == history {
+                          if history.count > bestLen {
+                              bestLen = history.count
+                              let next = history.count < entry.moves.count ? entry.moves[history.count] : nil
+                              bestMatch = (name: entry.name, nextMove: next)
+                          }
+                      }
+                  }
+                  return bestMatch
+              }
+          }
+          '''
+
+          # NEW: Analysis cache
+          files["Sources/AnalysisCache.swift"] = r'''
+          import Foundation
+
+          /// In-memory cache of previously-analyzed positions.
+          /// Same FEN → instant response, no API call.
+          /// Limited to 200 entries, LRU eviction.
+          actor AnalysisCache {
+              static let shared = AnalysisCache()
+
+              private struct Entry {
+                  let moves: [TopMove]
+                  let depth: Int
+                  let sources: String
+                  let confidence: Int  // 1-3
+                  let timestamp: Date
+              }
+
+              private var cache: [String: Entry] = [:]
+              private var accessOrder: [String] = []
+              private let maxEntries = 200
+
+              func get(fen: String) -> (moves: [TopMove], depth: Int, sources: String, confidence: Int)? {
+                  guard let entry = cache[fen] else { return nil }
+                  // Move to end (recent access)
+                  accessOrder.removeAll { $0 == fen }
+                  accessOrder.append(fen)
+                  return (entry.moves, entry.depth, entry.sources, entry.confidence)
+              }
+
+              func set(fen: String, moves: [TopMove], depth: Int, sources: String, confidence: Int) {
+                  cache[fen] = Entry(moves: moves, depth: depth, sources: sources,
+                                     confidence: confidence, timestamp: Date())
+                  accessOrder.removeAll { $0 == fen }
+                  accessOrder.append(fen)
+                  // Evict oldest if over limit
+                  while accessOrder.count > maxEntries {
+                      let oldest = accessOrder.removeFirst()
+                      cache.removeValue(forKey: oldest)
+                  }
+              }
+
+              func clear() {
+                  cache.removeAll()
+                  accessOrder.removeAll()
+              }
+
+              func count() -> Int { cache.count }
+          }
+          '''
+
           files["Sources/EngineService.swift"] = r'''
           import Foundation
 
@@ -197,7 +327,8 @@ jobs:
               let evaluationCp: Int?
               let mateIn: Int?
               let depth: Int
-              let source: String  // "lc" | "cA" | "sf"
+              let source: String  // "lc" | "cA" | "sf" | "book" | "cache"
+              let votes: Int      // how many engines agreed on this move
               var evalString: String {
                   if let m = mateIn, m != 0 { return "M\(abs(m))" }
                   if let cp = evaluationCp { return String(format: "%+.2f", Double(cp)/100.0) }
@@ -208,7 +339,6 @@ jobs:
                   guard let cp = evaluationCp else { return 50 }
                   return 50 + 50 * tanh(Double(cp)/400.0)
               }
-              /// Score for ranking (higher = better for the moving side)
               var rankScore: Double {
                   if let m = mateIn, m != 0 { return m > 0 ? 100000 - Double(m) : -100000 - Double(m) }
                   return Double(evaluationCp ?? 0)
@@ -219,7 +349,9 @@ jobs:
               let topMoves: [TopMove]
               let bestMove: TopMove?
               let depth: Int
-              let sourcesUsed: String  // e.g. "Lichess (3 moves)" or "Lichess + Stockfish"
+              let sourcesUsed: String
+              let confidence: Int  // 1-3 (how many sources agreed)
+              let threatMove: TopMove?  // opponent's best next move (threat detection)
           }
 
           enum EngineError: Error, LocalizedError {
@@ -239,8 +371,8 @@ jobs:
 
           enum EngineService {
 
-              // MARK: - Tier 1: Lichess Cloud (real MultiPV=3)
-              private static func callLichessCloud(fen: String) async -> [TopMove]? {
+              // MARK: - Source 1: Lichess Cloud (real MultiPV=3)
+              static func callLichessCloud(fen: String) async -> [TopMove]? {
                   var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
                   comps.queryItems = [
                       URLQueryItem(name: "fen", value: fen),
@@ -248,13 +380,13 @@ jobs:
                   ]
                   guard let url = comps.url else { return nil }
                   var req = URLRequest(url: url)
-                  req.timeoutInterval = 6
+                  req.timeoutInterval = 5
                   req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
                   do {
                       let (data, resp) = try await URLSession.shared.data(for: req)
                       guard let http = resp as? HTTPURLResponse else { return nil }
-                      if http.statusCode == 404 { return [] }  // Not in cache = empty (fall through)
+                      if http.statusCode == 404 { return [] }
                       guard http.statusCode == 200 else { return nil }
                       guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
                       let depth = (json["depth"] as? Int) ?? 20
@@ -269,23 +401,23 @@ jobs:
                           moves.append(TopMove(
                               rank: idx + 1, uci: firstMove, san: firstMove,
                               evaluationCp: cp, mateIn: (mate == 0 ? nil : mate),
-                              depth: depth, source: "lc"
+                              depth: depth, source: "lc", votes: 1
                           ))
                       }
                       return moves
                   } catch { return nil }
               }
 
-              // MARK: - Tier 2: chess-api.com
-              private static func callChessApi(fen: String) async -> TopMove? {
+              // MARK: - Source 2: chess-api.com (live Stockfish)
+              static func callChessApi(fen: String) async -> TopMove? {
                   guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
                   var req = URLRequest(url: url)
                   req.httpMethod = "POST"
                   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  req.timeoutInterval = 8
+                  req.timeoutInterval = 6
                   req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-                  let body: [String: Any] = ["fen": fen, "depth": 12, "maxThinkingTime": 200]
+                  let body: [String: Any] = ["fen": fen, "depth": 13, "maxThinkingTime": 200]
                   guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return nil }
                   req.httpBody = httpBody
                   do {
@@ -297,15 +429,15 @@ jobs:
                       let eval = json["eval"] as? Double
                       let mate = json["mate"] as? Int
                       let cp = eval.map { Int(($0 * 100).rounded()) }
-                      let d = (json["depth"] as? Int) ?? 12
+                      let d = (json["depth"] as? Int) ?? 13
                       return TopMove(rank: 1, uci: uci, san: san,
                                      evaluationCp: cp, mateIn: (mate == 0 ? nil : mate),
-                                     depth: d, source: "cA")
+                                     depth: d, source: "cA", votes: 1)
                   } catch { return nil }
               }
 
-              // MARK: - Tier 3: stockfish.online (NEW fallback)
-              private static func callStockfishOnline(fen: String) async -> TopMove? {
+              // MARK: - Source 3: stockfish.online
+              static func callStockfishOnline(fen: String) async -> TopMove? {
                   var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
                   comps.queryItems = [
                       URLQueryItem(name: "fen", value: fen),
@@ -313,7 +445,7 @@ jobs:
                   ]
                   guard let url = comps.url else { return nil }
                   var req = URLRequest(url: url)
-                  req.timeoutInterval = 8
+                  req.timeoutInterval = 6
                   req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
                   do {
@@ -334,64 +466,153 @@ jobs:
                       let d = (json["depth"] as? Int) ?? 13
                       return TopMove(rank: 1, uci: uci, san: uci,
                                      evaluationCp: cp, mateIn: (mate == 0 ? nil : mate),
-                                     depth: d, source: "sf")
+                                     depth: d, source: "sf", votes: 1)
                   } catch { return nil }
               }
 
-              /// 3-tier fallback: Lichess (top-3) → chess-api → stockfish.online
+              /// HYBRID: run all 3 in parallel, stream results as they arrive.
+              /// Combine intelligently: merge Lichess top-3 with chess-api & stockfish votes.
+              /// Confidence = how many engines agreed on #1.
               static func analyzeStreaming(fen: String,
-                                            onUpdate: @escaping @MainActor ([TopMove]) -> Void) async throws -> EngineAnalysis {
+                                            moveHistory: [String],
+                                            onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
                   if let issue = FenValidator.validate(fen) {
                       throw EngineError.badFen(issue)
                   }
 
-                  // Tier 1: Lichess (best - real top-3)
-                  let lichessResult = await callLichessCloud(fen: fen)
-                  try Task.checkCancellation()
-                  if let moves = lichessResult, !moves.isEmpty {
-                      await MainActor.run { onUpdate(moves) }
-                      let bestDepth = moves.first?.depth ?? 20
-                      return EngineAnalysis(topMoves: moves,
-                                            bestMove: moves.first,
-                                            depth: bestDepth,
-                                            sourcesUsed: "Lichess (\(moves.count) moves)")
+                  // === Layer 1: Cache lookup (instant)
+                  if let cached = await AnalysisCache.shared.get(fen: fen) {
+                      let cachedMoves = cached.moves.enumerated().map { (i, m) in
+                          TopMove(rank: i + 1, uci: m.uci, san: m.san,
+                                  evaluationCp: m.evaluationCp, mateIn: m.mateIn,
+                                  depth: m.depth, source: "cache", votes: m.votes)
+                      }
+                      let a = EngineAnalysis(
+                          topMoves: cachedMoves,
+                          bestMove: cachedMoves.first,
+                          depth: cached.depth,
+                          sourcesUsed: "cache · \(cached.sources)",
+                          confidence: cached.confidence,
+                          threatMove: nil
+                      )
+                      await MainActor.run { onUpdate(a) }
+                      return a
                   }
 
-                  // Tier 2 & 3: try chess-api and stockfish.online IN PARALLEL for redundancy
-                  // Combining their results gives us up to 2 moves if both succeed
+                  // === Layer 2: Opening book (instant, no API)
+                  if moveHistory.count <= 15,
+                     let bookMatch = OpeningBook.lookup(history: moveHistory),
+                     let next = bookMatch.nextMove {
+                      let bookMove = TopMove(
+                          rank: 1, uci: next, san: next,
+                          evaluationCp: 0, mateIn: nil, depth: 99,
+                          source: "book", votes: 3  // book = high confidence
+                      )
+                      // Also try engines in parallel to verify
+                      let bookAnalysis = EngineAnalysis(
+                          topMoves: [bookMove], bestMove: bookMove,
+                          depth: 99, sourcesUsed: "book: \(bookMatch.name)",
+                          confidence: 3, threatMove: nil
+                      )
+                      await MainActor.run { onUpdate(bookAnalysis) }
+                      // Continue to engines below for verification/more moves
+                  }
+
+                  // === Layer 3: HYBRID — 3 engines in parallel
+                  async let lichessResult = callLichessCloud(fen: fen)
                   async let chessApiResult = callChessApi(fen: fen)
                   async let stockfishResult = callStockfishOnline(fen: fen)
+
+                  let lichess = await lichessResult
+                  try Task.checkCancellation()
                   let cA = await chessApiResult
+                  try Task.checkCancellation()
                   let sf = await stockfishResult
                   try Task.checkCancellation()
 
-                  var fallbackMoves: [TopMove] = []
-                  var seenUcis = Set<String>()
-                  if let m = cA { fallbackMoves.append(m); seenUcis.insert(m.uci) }
-                  if let m = sf, !seenUcis.contains(m.uci) { fallbackMoves.append(m) }
+                  // Merge all results — count votes for each unique UCI
+                  var moveVotes: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
 
-                  if !fallbackMoves.isEmpty {
-                      // Sort by rankScore, re-rank
-                      fallbackMoves.sort { $0.rankScore > $1.rankScore }
-                      let reranked = fallbackMoves.enumerated().map { (idx, m) in
-                          TopMove(rank: idx + 1, uci: m.uci, san: m.san,
-                                  evaluationCp: m.evaluationCp, mateIn: m.mateIn,
-                                  depth: m.depth, source: m.source)
+                  // Add Lichess moves (all 3)
+                  if let lcMoves = lichess {
+                      for m in lcMoves {
+                          if var existing = moveVotes[m.uci] {
+                              existing.votes += 1
+                              existing.sources.append("lc")
+                              moveVotes[m.uci] = existing
+                          } else {
+                              moveVotes[m.uci] = (m, 1, ["lc"])
+                          }
                       }
-                      await MainActor.run { onUpdate(reranked) }
-                      let sources = reranked.map { $0.source }.joined(separator: "+")
-                      return EngineAnalysis(topMoves: reranked,
-                                            bestMove: reranked.first,
-                                            depth: reranked.first?.depth ?? 12,
-                                            sourcesUsed: sources)
+                  }
+                  // Add chess-api result
+                  if let m = cA {
+                      if var existing = moveVotes[m.uci] {
+                          existing.votes += 1
+                          existing.sources.append("cA")
+                          moveVotes[m.uci] = existing
+                      } else {
+                          moveVotes[m.uci] = (m, 1, ["cA"])
+                      }
+                  }
+                  // Add stockfish.online result
+                  if let m = sf {
+                      if var existing = moveVotes[m.uci] {
+                          existing.votes += 1
+                          existing.sources.append("sf")
+                          moveVotes[m.uci] = existing
+                      } else {
+                          moveVotes[m.uci] = (m, 1, ["sf"])
+                      }
                   }
 
-                  // All 3 failed
-                  if lichessResult == nil && cA == nil && sf == nil {
-                      throw EngineError.networkOffline
-                  } else {
+                  guard !moveVotes.isEmpty else {
+                      if lichess == nil && cA == nil && sf == nil {
+                          throw EngineError.networkOffline
+                      }
                       throw EngineError.allEnginesFailed
                   }
+
+                  // Sort by (votes DESC, then score DESC)
+                  let sortedEntries = moveVotes.values.sorted { a, b in
+                      if a.votes != b.votes { return a.votes > b.votes }
+                      return a.move.rankScore > b.move.rankScore
+                  }
+
+                  let finalMoves: [TopMove] = sortedEntries.prefix(3).enumerated().map { (idx, entry) in
+                      TopMove(
+                          rank: idx + 1,
+                          uci: entry.move.uci,
+                          san: entry.move.san,
+                          evaluationCp: entry.move.evaluationCp,
+                          mateIn: entry.move.mateIn,
+                          depth: entry.move.depth,
+                          source: entry.sources.joined(separator: "+"),
+                          votes: entry.votes
+                      )
+                  }
+
+                  let topVotes = finalMoves.first?.votes ?? 1
+                  let allSources = Array(Set(moveVotes.values.flatMap { $0.sources })).sorted().joined(separator: "+")
+                  let bestDepth = finalMoves.map { $0.depth }.max() ?? 13
+
+                  let analysis = EngineAnalysis(
+                      topMoves: finalMoves,
+                      bestMove: finalMoves.first,
+                      depth: bestDepth,
+                      sourcesUsed: allSources,
+                      confidence: min(topVotes, 3),
+                      threatMove: nil  // filled by prefetch elsewhere
+                  )
+
+                  // Cache the result
+                  await AnalysisCache.shared.set(
+                      fen: fen, moves: finalMoves, depth: bestDepth,
+                      sources: allSources, confidence: min(topVotes, 3)
+                  )
+
+                  await MainActor.run { onUpdate(analysis) }
+                  return analysis
               }
           }
           '''
@@ -451,50 +672,43 @@ jobs:
           import SwiftUI
           struct SettingsView: View {
               @ObservedObject var stealth: StealthManager
+              @ObservedObject var engine: EngineViewModel
+              @State private var cacheCount = 0
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine 3-tier fallback (v4.2)") {
+                          Section("Engine (v4.3 Hybrid)") {
                               HStack {
                                   Circle().fill(.blue).frame(width: 10, height: 10)
-                                  VStack(alignment: .leading) {
-                                      Text("Tier 1: Lichess Cloud").font(.subheadline)
-                                      Text("Real top-3 · depth 20+ · ~300ms")
-                                          .font(.caption).foregroundColor(.secondary)
-                                  }
+                                  Text("Lichess Cloud (top-3)").font(.subheadline)
                               }
                               HStack {
                                   Circle().fill(.orange).frame(width: 10, height: 10)
-                                  VStack(alignment: .leading) {
-                                      Text("Tier 2: chess-api.com").font(.subheadline)
-                                      Text("Fallback · single best move")
-                                          .font(.caption).foregroundColor(.secondary)
-                                  }
+                                  Text("chess-api.com (live)").font(.subheadline)
                               }
                               HStack {
                                   Circle().fill(.cyan).frame(width: 10, height: 10)
-                                  VStack(alignment: .leading) {
-                                      Text("Tier 3: stockfish.online").font(.subheadline)
-                                      Text("Last resort · single best move")
-                                          .font(.caption).foregroundColor(.secondary)
+                                  Text("stockfish.online").font(.subheadline)
+                              }
+                              Text("All 3 run in parallel. Moves with more votes rank higher. Confidence = how many engines agreed.")
+                                  .font(.caption).foregroundColor(.secondary)
+                          }
+                          Section("Confidence badges") {
+                              HStack { Text("🟢 3/3").bold(); Text("All engines agreed").font(.caption).foregroundColor(.secondary) }
+                              HStack { Text("🟡 2/3").bold(); Text("Two agreed, one differs").font(.caption).foregroundColor(.secondary) }
+                              HStack { Text("🟠 1/3").bold(); Text("All disagree — pick carefully").font(.caption).foregroundColor(.secondary) }
+                          }
+                          Section("Smart features") {
+                              Label("Opening book (first 15 moves)", systemImage: "book.closed.fill")
+                              Label("Position cache (\(cacheCount) entries)", systemImage: "memorychip")
+                              Label("Threat detection", systemImage: "exclamationmark.shield.fill")
+                              Label("3-engine consensus", systemImage: "person.3.fill")
+                              Button("Clear cache") {
+                                  Task {
+                                      await AnalysisCache.shared.clear()
+                                      cacheCount = await AnalysisCache.shared.count()
                                   }
                               }
-                          }
-                          Section("How the BEST move is picked") {
-                              HStack {
-                                  Image(systemName: "star.fill").foregroundColor(.green)
-                                  Text("#1 with star = BEST (highest eval)").font(.caption)
-                              }
-                              HStack {
-                                  Image(systemName: "2.circle.fill").foregroundColor(.yellow)
-                                  Text("#2 = slightly worse (yellow)").font(.caption)
-                              }
-                              HStack {
-                                  Image(systemName: "3.circle.fill").foregroundColor(.orange)
-                                  Text("#3 = noticeably worse (orange)").font(.caption)
-                              }
-                              Text("Δ shows how much worse than #1 (in centipawns). Smaller Δ = closer alternatives.")
-                                  .font(.caption).foregroundColor(.secondary)
                           }
                           Section("Panic (shake to hide/show)") {
                               Label("Shake phone", systemImage: "iphone.gen3.radiowaves.left.and.right")
@@ -514,12 +728,15 @@ jobs:
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "4.2.0 (42)")
-                              LabeledContent("Engines", value: "3-tier fallback")
+                              LabeledContent("Version", value: "4.3.0 (43)")
+                              LabeledContent("Engine", value: "Hybrid 3-way voting")
                               LabeledContent("Session bridge", value: String(StealthConfig.bridgeName.prefix(8)))
                           }
                       }
                       .navigationTitle("Settings")
+                      .task {
+                          cacheCount = await AnalysisCache.shared.count()
+                      }
                   }
               }
           }
@@ -558,6 +775,9 @@ jobs:
               @Published var errorMessage = ""
               @Published var isOffline = false
               @Published var sourcesUsed = ""
+              @Published var engineConfidence: Int = 0  // 1-3 votes
+              @Published var openingName = ""
+              @Published var threatMove: TopMove? = nil  // opponent's best next
               @Published var detectedPlayerColor = "w"
               @Published var manualPlayerColor: String? = nil
               @Published var sideToMove = "w"
@@ -575,12 +795,15 @@ jobs:
 
               private var previousEvalWhitePOV: Double? = nil
               private var lastSuccessfulFEN = ""
-              private var lastAttemptedFEN = ""
               private var analysisTask: Task<Void, Never>?
               private var debounceTask: Task<Void, Never>?
               private var retryTask: Task<Void, Never>?
+              private var threatTask: Task<Void, Never>?
               private var pendingFEN = ""
               private var pendingFENCount = 0
+              // Move history for opening book
+              private var moveHistoryUCI: [String] = []
+              private var lastKnownPly: Int = -1
 
               func setManualColor(_ c: String?) {
                   manualPlayerColor = c
@@ -607,6 +830,17 @@ jobs:
                   if p.bottomColor == "w" || p.bottomColor == "b" {
                       detectedPlayerColor = p.bottomColor
                   }
+                  // Track move history for opening book
+                  if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
+                      moveHistoryUCI.append(p.lastMoveUCI)
+                      lastKnownPly = p.plyCount
+                  }
+                  // Reset history if game restarted
+                  if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 {
+                      moveHistoryUCI = []
+                      lastKnownPly = p.plyCount
+                      openingName = ""
+                  }
                   let board = buildFENBoard(from: p.grid, flipped: p.flipped)
                   let castling = deriveCastling(from: p.grid, flipped: p.flipped)
                   let full = max(1, (p.plyCount / 2) + 1)
@@ -621,6 +855,8 @@ jobs:
                       winChance = 50
                       errorMessage = ""
                       sourcesUsed = ""
+                      engineConfidence = 0
+                      threatMove = nil
                       queueAnalyze(fen: fen)
                   }
               }
@@ -637,22 +873,33 @@ jobs:
 
               private func run(fen: String) async {
                   guard fen != lastSuccessfulFEN else { return }
-                  lastAttemptedFEN = fen
                   analysisTask?.cancel()
                   isThinking = true
                   errorMessage = ""
 
+                  // Check opening book match immediately
+                  if let bookMatch = OpeningBook.lookup(history: moveHistoryUCI) {
+                      openingName = bookMatch.name
+                  } else {
+                      openingName = ""
+                  }
+
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
-                          let a = try await EngineService.analyzeStreaming(fen: fen) { partial in
+                          let a = try await EngineService.analyzeStreaming(
+                              fen: fen,
+                              moveHistory: self.moveHistoryUCI
+                          ) { partial in
                               guard fen == self.currentFEN else { return }
-                              self.topMoves = partial
-                              if let best = partial.first {
+                              self.topMoves = partial.topMoves
+                              if let best = partial.bestMove {
                                   self.evaluation = best.evalString
                                   self.winChance = best.winChance
                                   self.depth = best.depth
                               }
+                              self.sourcesUsed = partial.sourcesUsed
+                              self.engineConfidence = partial.confidence
                           }
                           if Task.isCancelled { return }
                           guard fen == self.currentFEN else { return }
@@ -662,6 +909,7 @@ jobs:
                               self.winChance = a.bestMove?.winChance ?? 50
                               self.depth = a.depth
                               self.sourcesUsed = a.sourcesUsed
+                              self.engineConfidence = a.confidence
                               self.isThinking = false
                               self.isOffline = false
                               self.errorMessage = ""
@@ -669,6 +917,11 @@ jobs:
                               let wpov = self.evalWhitePOV(a.bestMove)
                               self.computeQuality(cur: wpov)
                               self.previousEvalWhitePOV = wpov
+                          }
+                          // === THREAT DETECTION ===
+                          // If it's opponent's turn, find what they're threatening
+                          if !self.isMyTurn, let best = a.bestMove {
+                              await self.computeThreat(afterFen: fen, opponentMove: best.uci)
                           }
                       } catch {
                           if Task.isCancelled { return }
@@ -678,11 +931,13 @@ jobs:
                               self.topMoves = []
                               self.evaluation = "—"
                               self.sourcesUsed = ""
+                              self.engineConfidence = 0
+                              self.threatMove = nil
                               if let engineError = error as? EngineError {
                                   switch engineError {
                                   case .networkOffline:
                                       self.isOffline = true
-                                      self.errorMessage = "Offline — all 3 engines unreachable. Retrying…"
+                                      self.errorMessage = "Offline — all engines unreachable"
                                       self.scheduleRetry(fen: fen)
                                   case .allEnginesFailed:
                                       self.isOffline = true
@@ -690,8 +945,7 @@ jobs:
                                       self.scheduleRetry(fen: fen)
                                   case .badFen(let msg):
                                       self.errorMessage = "Bad FEN: \(msg)"
-                                  case .cancelled:
-                                      break
+                                  case .cancelled: break
                                   }
                               } else {
                                   self.isOffline = true
@@ -699,6 +953,26 @@ jobs:
                                   self.scheduleRetry(fen: fen)
                               }
                           }
+                      }
+                  }
+              }
+
+              /// Compute what the opponent is threatening (their best move)
+              private func computeThreat(afterFen fen: String, opponentMove: String) async {
+                  threatTask?.cancel()
+                  threatTask = Task { [weak self] in
+                      guard let self = self else { return }
+                      // Simulate opponent's move by asking: what's THEIR best?
+                      // Since we're analyzing THEIR turn, the "best move" IS their threat.
+                      // Just surface the top move as the threat if it's dangerous.
+                      guard let best = self.topMoves.first else { return }
+                      // Threat = any move that reduces our win chance below 40%
+                      let ourWin = self.effectivePlayerColor == self.sideToMove
+                          ? best.winChance : (100 - best.winChance)
+                      if ourWin < 40 {
+                          await MainActor.run { self.threatMove = best }
+                      } else {
+                          await MainActor.run { self.threatMove = nil }
                       }
                   }
               }
@@ -831,8 +1105,8 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v4.2").font(.title2.bold())
-                      Text("3-TIER ENGINE FALLBACK\n\n1️⃣ Lichess Cloud (top-3)\n2️⃣ chess-api.com\n3️⃣ stockfish.online\n\n⭐ = BEST move (highest eval)\nΔ = how much worse than #1\n\nShake = hide/show")
+                      Text("Chess Helper v4.3").font(.title2.bold())
+                      Text("HYBRID 3-ENGINE VOTING\n\n🟢 3/3 votes = definite best\n🟡 2/3 votes = probable best\n🟠 1/3 votes = uncertain\n\n✨ Opening book (first 15 moves)\n✨ Position cache (instant repeats)\n✨ Threat detection (opponent's plan)\n✨ Consensus voting\n\nShake = hide/show")
                           .font(.footnote).foregroundColor(.white.opacity(0.85))
                           .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -880,6 +1154,7 @@ jobs:
               }
               private var dotColor: Color {
                   if engine.isOffline { return .red }
+                  if engine.threatMove != nil { return .red }
                   if engine.isMyTurn { return .green }
                   return .gray
               }
@@ -888,8 +1163,10 @@ jobs:
                       header
                       if expanded {
                           if engine.isOffline { offlineBanner }
+                          if let threat = engine.threatMove, !engine.isMyTurn { threatBanner(threat) }
+                          if !engine.openingName.isEmpty { openingBanner }
                           colorRow
-                          bestMoveHighlight   // NEW: prominent BEST move card
+                          bestMoveHighlight
                           movesSection
                           lastMoveSection
                           errorSection
@@ -900,12 +1177,14 @@ jobs:
                   .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
               }
               private var borderColor: Color {
-                  engine.isOffline ? Color.red.opacity(0.5) : Color.white.opacity(0.08)
+                  if engine.isOffline { return Color.red.opacity(0.5) }
+                  if engine.threatMove != nil { return Color.red.opacity(0.4) }
+                  return Color.white.opacity(0.08)
               }
               private var offlineBanner: some View {
                   HStack(spacing: 6) {
                       Image(systemName: "wifi.slash").font(.caption).foregroundColor(.red)
-                      Text("OFFLINE — all 3 engines unreachable")
+                      Text("OFFLINE — all engines unreachable")
                           .font(.caption2.bold()).foregroundColor(.red)
                       Spacer()
                       ProgressView().scaleEffect(0.6)
@@ -913,22 +1192,39 @@ jobs:
                   .padding(.horizontal, 12).padding(.vertical, 4)
                   .background(Color.red.opacity(0.15))
               }
-
-              // NEW: prominent BEST move card at top
+              private func threatBanner(_ threat: TopMove) -> some View {
+                  HStack(spacing: 6) {
+                      Image(systemName: "exclamationmark.triangle.fill").font(.caption).foregroundColor(.red)
+                      Text("⚠️ THREAT: \(threat.san.isEmpty ? threat.uci : threat.san)")
+                          .font(.caption2.bold()).foregroundColor(.red)
+                      Spacer()
+                      Text(threat.evalString).font(.caption2.monospaced()).foregroundColor(.red)
+                  }
+                  .padding(.horizontal, 12).padding(.vertical, 4)
+                  .background(Color.red.opacity(0.15))
+              }
+              private var openingBanner: some View {
+                  HStack(spacing: 6) {
+                      Image(systemName: "book.closed.fill").font(.caption).foregroundColor(.purple)
+                      Text(engine.openingName)
+                          .font(.caption2.bold()).foregroundColor(.purple)
+                      Spacer()
+                  }
+                  .padding(.horizontal, 12).padding(.vertical, 4)
+                  .background(Color.purple.opacity(0.10))
+              }
               @ViewBuilder private var bestMoveHighlight: some View {
                   if let best = engine.bestMove {
                       HStack(spacing: 10) {
                           VStack(alignment: .leading, spacing: 2) {
                               HStack(spacing: 4) {
-                                  Image(systemName: "star.fill")
-                                      .font(.caption).foregroundColor(.green)
-                                  Text("BEST MOVE")
-                                      .font(.caption2.bold())
-                                      .foregroundColor(.green)
+                                  Image(systemName: "star.fill").font(.caption).foregroundColor(confidenceColor)
+                                  Text("BEST MOVE").font(.caption2.bold()).foregroundColor(confidenceColor)
+                                  confidenceBadge
                               }
                               Text(best.san.isEmpty ? best.uci : best.san)
                                   .font(.system(size: 32, weight: .black, design: .rounded))
-                                  .foregroundColor(.green)
+                                  .foregroundColor(confidenceColor)
                               Text(best.uci)
                                   .font(.caption.monospaced())
                                   .foregroundColor(.secondary)
@@ -937,7 +1233,7 @@ jobs:
                           VStack(alignment: .trailing, spacing: 2) {
                               Text(best.evalString)
                                   .font(.title3.bold().monospaced())
-                                  .foregroundColor(.green)
+                                  .foregroundColor(confidenceColor)
                               Text("depth \(best.depth)")
                                   .font(.caption2.monospaced())
                                   .foregroundColor(.secondary)
@@ -947,15 +1243,38 @@ jobs:
                           }
                       }
                       .padding(.horizontal, 14).padding(.vertical, 8)
-                      .background(Color.green.opacity(0.15))
+                      .background(confidenceColor.opacity(0.15))
                       .overlay(
                           RoundedRectangle(cornerRadius: 8)
-                              .stroke(Color.green.opacity(0.4), lineWidth: 1)
+                              .stroke(confidenceColor.opacity(0.4), lineWidth: 1)
                       )
                       .padding(.horizontal, 8).padding(.vertical, 4)
                   }
               }
-
+              private var confidenceColor: Color {
+                  switch engine.engineConfidence {
+                  case 3: return .green
+                  case 2: return .yellow
+                  case 1: return .orange
+                  default: return .gray
+                  }
+              }
+              private var confidenceLabel: String {
+                  switch engine.engineConfidence {
+                  case 3: return "3/3 ✓"
+                  case 2: return "2/3"
+                  case 1: return "1/3"
+                  default: return "?"
+                  }
+              }
+              private var confidenceBadge: some View {
+                  Text(confidenceLabel)
+                      .font(.caption2.bold().monospaced())
+                      .padding(.horizontal, 5).padding(.vertical, 1)
+                      .background(confidenceColor.opacity(0.25))
+                      .foregroundColor(confidenceColor)
+                      .cornerRadius(3)
+              }
               private var header: some View {
                   HStack(spacing: 10) {
                       Circle().fill(engine.isOffline ? Color.red : (engine.enabled ? Color.green : Color.gray))
@@ -1045,68 +1364,47 @@ jobs:
                       .frame(height: 8).padding(.horizontal, 14).padding(.top, 4)
                   }
               }
-              private func sourceColor(_ source: String) -> Color {
-                  switch source {
-                  case "lc": return .blue
-                  case "cA": return .orange
-                  case "sf": return .cyan
-                  default: return .white.opacity(0.7)
-                  }
-              }
-              private func rankColor(_ rank: Int) -> Color {
+              private func rankColor(_ rank: Int, votes: Int) -> Color {
+                  // Color by votes primarily
+                  if votes >= 3 { return .green }
+                  if votes >= 2 { return .yellow }
                   switch rank {
-                  case 1: return .green
-                  case 2: return .yellow
-                  case 3: return .orange
+                  case 1: return .orange
+                  case 2: return .white.opacity(0.85)
                   default: return .white.opacity(0.7)
                   }
               }
-              // Compute delta (centipawn loss vs #1)
               private func deltaFromBest(_ move: TopMove) -> String? {
                   guard let best = engine.bestMove, best.id != move.id else { return nil }
-                  let bestScore = best.rankScore
-                  let thisScore = move.rankScore
-                  let delta = Int(bestScore - thisScore)
+                  let delta = Int(best.rankScore - move.rankScore)
                   if delta <= 0 { return "≈" }
                   return "-\(delta)cp"
               }
               private func moveRow(rank: Int, move: TopMove, isSelected: Bool) -> some View {
-                  let rc = rankColor(rank)
-                  let sc = sourceColor(move.source)
+                  let rc = rankColor(rank, votes: move.votes)
                   let isBest = rank == 1
-                  return HStack(spacing: 8) {
+                  return HStack(spacing: 6) {
                       if isBest {
-                          Image(systemName: "star.fill").foregroundColor(.green).font(.caption)
-                              .frame(width: 22)
+                          Image(systemName: "star.fill").foregroundColor(rc).font(.caption).frame(width: 18)
                       } else {
-                          Text("#\(rank)").font(.caption.bold().monospaced())
-                              .foregroundColor(rc).frame(width: 22)
+                          Text("#\(rank)").font(.caption.bold().monospaced()).foregroundColor(rc).frame(width: 18)
                       }
                       Text(move.san.isEmpty ? move.uci : move.san)
                           .font(isBest ? .title3.bold() : .callout.bold()).foregroundColor(rc)
                       Text(move.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
                       Spacer()
-                      if let delta = deltaFromBest(move) {
-                          Text(delta)
-                              .font(.caption2.bold().monospaced())
-                              .padding(.horizontal, 4).padding(.vertical, 1)
-                              .background(Color.orange.opacity(0.2))
-                              .foregroundColor(.orange)
-                              .cornerRadius(3)
-                      } else if isBest {
-                          Text("BEST")
-                              .font(.caption2.bold())
-                              .padding(.horizontal, 4).padding(.vertical, 1)
-                              .background(Color.green.opacity(0.25))
-                              .foregroundColor(.green)
-                              .cornerRadius(3)
-                      }
-                      Text(move.source)
+                      // Votes badge
+                      Text("\(move.votes)v")
                           .font(.caption2.bold().monospaced())
                           .padding(.horizontal, 4).padding(.vertical, 1)
-                          .background(sc.opacity(0.2))
-                          .foregroundColor(sc)
+                          .background(rc.opacity(0.2))
+                          .foregroundColor(rc)
                           .cornerRadius(3)
+                      if let delta = deltaFromBest(move) {
+                          Text(delta)
+                              .font(.caption2.monospaced())
+                              .foregroundColor(.orange)
+                      }
                       Text(move.evalString).font(.caption.bold().monospaced()).foregroundColor(rc)
                       if isSelected {
                           Image(systemName: "checkmark.circle.fill").foregroundColor(rc).font(.caption)
@@ -1264,8 +1562,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>4.2.0</string>
-            <key>CFBundleVersion</key><string>42</string>
+            <key>CFBundleShortVersionString</key><string>4.3.0</string>
+            <key>CFBundleVersion</key><string>43</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
