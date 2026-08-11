@@ -832,11 +832,11 @@ jobs:
                               Text("Drag the overlay anywhere on screen. Long-press = pick up. Tap Reset to return to bottom.")
                                   .font(.caption).foregroundColor(.secondary)
                               Toggle("Compact mode (40% smaller)", isOn: $overlayPos.isCompact)
-                                  .onChange(of: overlayPos.isCompact) { _, _ in overlayPos.save() }
+                                  .onChange(of: overlayPos.isCompact) { _ in overlayPos.save() }
                               VStack(alignment: .leading) {
                                   Text("Transparency: \(Int(overlayPos.transparency * 100))%").font(.caption)
                                   Slider(value: $overlayPos.transparency, in: 0.3...1.0)
-                                      .onChange(of: overlayPos.transparency) { _, _ in overlayPos.save() }
+                                      .onChange(of: overlayPos.transparency) { _ in overlayPos.save() }
                               }
                               Button("Reset overlay position") { overlayPos.reset() }
                           }
