@@ -1,4 +1,4 @@
-name: Build ChessHelper v4.5
+name: Build ChessHelper v5.0
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "4.5.0"
-              CURRENT_PROJECT_VERSION: "45"
+              MARKETING_VERSION: "5.0.0"
+              CURRENT_PROJECT_VERSION: "50"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -95,41 +95,353 @@ jobs:
           }
           '''
 
-          files["Sources/ContentView.swift"] = r'''
+          files["Sources/AppLanguage.swift"] = r'''
+          import Foundation
           import SwiftUI
-          struct ContentView: View {
-              @StateObject private var engine  = EngineViewModel()
-              @StateObject private var stealth = StealthManager()
-              @StateObject private var router  = AppRouter()
-              var body: some View {
-                  TabView(selection: $router.selectedTab) {
-                      PlayView(engine: engine, stealth: stealth, router: router)
-                          .tabItem { Label("Play", systemImage: "gamecontroller.fill") }.tag(0)
-                      SimpleTabView(title: "Review", icon: "magnifyingglass")
-                          .tabItem { Label("Review", systemImage: "magnifyingglass") }.tag(1)
-                      SimpleTabView(title: "Openings", icon: "book.fill")
-                          .tabItem { Label("Openings", systemImage: "book.fill") }.tag(2)
-                      SimpleTabView(title: "Puzzles", icon: "puzzlepiece.fill")
-                          .tabItem { Label("Puzzles", systemImage: "puzzlepiece.fill") }.tag(3)
-                      SimpleTabView(title: "Stats", icon: "chart.bar.fill")
-                          .tabItem { Label("Stats", systemImage: "chart.bar.fill") }.tag(4)
-                      SettingsView(stealth: stealth, engine: engine)
-                          .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
+
+          @MainActor
+          final class AppLanguage: ObservableObject {
+              enum Lang: String, CaseIterable {
+                  case arabic = "ar"
+                  case english = "en"
+                  var display: String {
+                      switch self {
+                      case .arabic: return "العربية"
+                      case .english: return "English"
+                      }
                   }
-                  .tint(.green)
+              }
+              @Published var current: Lang {
+                  didSet { UserDefaults.standard.set(current.rawValue, forKey: "app_language") }
+              }
+              init() {
+                  let saved = UserDefaults.standard.string(forKey: "app_language") ?? "en"
+                  self.current = Lang(rawValue: saved) ?? .english
+              }
+              var isArabic: Bool { current == .arabic }
+          }
+          '''
+
+          files["Sources/KeychainStore.swift"] = r'''
+          import Foundation
+          import Security
+
+          /// Secure API key storage using iOS Keychain.
+          enum KeychainStore {
+              static let groqKeyAccount = "chess_helper_groq_api_key"
+              static let service = "com.chesshelper.app"
+
+              static func save(_ value: String, account: String) -> Bool {
+                  let data = value.data(using: .utf8)!
+                  let query: [String: Any] = [
+                      kSecClass as String: kSecClassGenericPassword,
+                      kSecAttrService as String: service,
+                      kSecAttrAccount as String: account
+                  ]
+                  SecItemDelete(query as CFDictionary)
+                  var newItem = query
+                  newItem[kSecValueData as String] = data
+                  let status = SecItemAdd(newItem as CFDictionary, nil)
+                  return status == errSecSuccess
+              }
+
+              static func load(account: String) -> String? {
+                  let query: [String: Any] = [
+                      kSecClass as String: kSecClassGenericPassword,
+                      kSecAttrService as String: service,
+                      kSecAttrAccount as String: account,
+                      kSecReturnData as String: true,
+                      kSecMatchLimit as String: kSecMatchLimitOne
+                  ]
+                  var item: CFTypeRef?
+                  let status = SecItemCopyMatching(query as CFDictionary, &item)
+                  guard status == errSecSuccess, let data = item as? Data else { return nil }
+                  return String(data: data, encoding: .utf8)
+              }
+
+              static func delete(account: String) {
+                  let query: [String: Any] = [
+                      kSecClass as String: kSecClassGenericPassword,
+                      kSecAttrService as String: service,
+                      kSecAttrAccount as String: account
+                  ]
+                  SecItemDelete(query as CFDictionary)
               }
           }
-          struct SimpleTabView: View {
-              let title: String; let icon: String
-              var body: some View {
-                  NavigationStack {
-                      VStack(spacing: 20) {
-                          Image(systemName: icon).font(.system(size: 60)).foregroundColor(.green)
-                          Text(title).font(.largeTitle.bold())
-                          Text("Coming soon").foregroundColor(.secondary)
+          '''
+
+          files["Sources/GroqService.swift"] = r'''
+          import Foundation
+
+          /// Groq AI API service for chess move explanation and chat.
+          /// Uses Llama 3.3 70B - fast and smart.
+          enum GroqService {
+
+              struct ChatMessage: Codable {
+                  let role: String  // "system" | "user" | "assistant"
+                  let content: String
+              }
+
+              enum GroqError: Error, LocalizedError {
+                  case noKey
+                  case invalidKey
+                  case networkError(String)
+                  case rateLimited
+                  case parseError
+
+                  var errorDescription: String? {
+                      switch self {
+                      case .noKey: return "No Groq API key. Add it in Settings."
+                      case .invalidKey: return "Invalid API key. Check Settings."
+                      case .networkError(let m): return "Network: \(m)"
+                      case .rateLimited: return "Too many requests. Wait a moment."
+                      case .parseError: return "Bad response from AI"
                       }
-                      .navigationTitle(title)
                   }
+              }
+
+              /// Call Groq chat completion API
+              static func chat(messages: [ChatMessage], temperature: Double = 0.3) async throws -> String {
+                  guard let apiKey = KeychainStore.load(account: KeychainStore.groqKeyAccount),
+                        !apiKey.isEmpty else {
+                      throw GroqError.noKey
+                  }
+
+                  guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
+                      throw GroqError.networkError("Bad URL")
+                  }
+
+                  var req = URLRequest(url: url)
+                  req.httpMethod = "POST"
+                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                  req.timeoutInterval = 30
+
+                  let body: [String: Any] = [
+                      "model": "llama-3.3-70b-versatile",
+                      "messages": messages.map { ["role": $0.role, "content": $0.content] },
+                      "temperature": temperature,
+                      "max_tokens": 500,
+                      "top_p": 0.9
+                  ]
+
+                  req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+                  let (data, resp) = try await URLSession.shared.data(for: req)
+
+                  guard let http = resp as? HTTPURLResponse else {
+                      throw GroqError.networkError("No response")
+                  }
+
+                  if http.statusCode == 401 { throw GroqError.invalidKey }
+                  if http.statusCode == 429 { throw GroqError.rateLimited }
+                  guard (200..<300).contains(http.statusCode) else {
+                      throw GroqError.networkError("HTTP \(http.statusCode)")
+                  }
+
+                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                        let choices = json["choices"] as? [[String: Any]],
+                        let first = choices.first,
+                        let message = first["message"] as? [String: Any],
+                        let content = message["content"] as? String else {
+                      throw GroqError.parseError
+                  }
+
+                  return content.trimmingCharacters(in: .whitespacesAndNewlines)
+              }
+
+              /// Explain a specific move in the current position
+              static func explainMove(fen: String, uci: String, san: String,
+                                       eval: String, isArabic: Bool,
+                                       ranking: Int, totalMoves: Int) async throws -> String {
+                  let systemPrompt: String
+                  let userPrompt: String
+
+                  if isArabic {
+                      systemPrompt = """
+                      أنت مدرب شطرنج محترف بمستوى Grandmaster. مهمتك شرح النقلات بالعربية.
+                      كن دقيق، مختصر، ومفيد. استخدم مصطلحات شطرنج عربية بسيطة.
+                      """
+                      userPrompt = """
+                      الموقف (FEN): \(fen)
+                      النقلة #\(ranking) من أصل \(totalMoves): \(san) (\(uci))
+                      التقييم: \(eval)
+
+                      اشرحلي:
+                      1. لماذا هذه النقلة جيدة؟
+                      2. ما هي الخطة الاستراتيجية؟
+                      3. ما هي التهديدات المحتملة من الخصم؟
+                      4. أي نصائح تكتيكية؟
+
+                      اجعل الشرح واضح ومفصل في 4-6 أسطر.
+                      """
+                  } else {
+                      systemPrompt = """
+                      You are a Grandmaster-level chess coach. Explain moves clearly and professionally.
+                      Be precise, insightful, and educational.
+                      """
+                      userPrompt = """
+                      Position (FEN): \(fen)
+                      Move #\(ranking) of \(totalMoves): \(san) (\(uci))
+                      Evaluation: \(eval)
+
+                      Explain:
+                      1. Why is this move good?
+                      2. What is the strategic plan?
+                      3. What threats to watch from opponent?
+                      4. Any tactical tips?
+
+                      Provide a detailed explanation in 4-6 lines.
+                      """
+                  }
+
+                  return try await chat(messages: [
+                      ChatMessage(role: "system", content: systemPrompt),
+                      ChatMessage(role: "user", content: userPrompt)
+                  ], temperature: 0.4)
+              }
+
+              /// Free-form chat about the current position
+              static func askAboutPosition(fen: String, question: String, isArabic: Bool,
+                                            history: [ChatMessage] = []) async throws -> String {
+                  let systemPrompt: String
+                  if isArabic {
+                      systemPrompt = """
+                      أنت مدرب شطرنج محترف. تعرف الموقف الحالي (FEN): \(fen)
+                      أجب على أسئلة اللاعب بشكل مفصل ومفيد بالعربية.
+                      استخدم لغة بسيطة ومصطلحات شطرنج معروفة.
+                      """
+                  } else {
+                      systemPrompt = """
+                      You are a professional chess coach. You know the current position (FEN): \(fen)
+                      Answer the player's questions in detail and clearly.
+                      """
+                  }
+
+                  var messages: [ChatMessage] = [
+                      ChatMessage(role: "system", content: systemPrompt)
+                  ]
+                  messages.append(contentsOf: history)
+                  messages.append(ChatMessage(role: "user", content: question))
+
+                  return try await chat(messages: messages, temperature: 0.7)
+              }
+          }
+          '''
+
+          files["Sources/AIAssistantViewModel.swift"] = r'''
+          import Foundation
+          import SwiftUI
+
+          @MainActor
+          final class AIAssistantViewModel: ObservableObject {
+              @Published var currentExplanation: String = ""
+              @Published var isLoadingExplanation = false
+              @Published var explanationError: String = ""
+              @Published var currentExplainedMove: String = ""
+
+              @Published var chatMessages: [ChatEntry] = []
+              @Published var isLoadingChat = false
+              @Published var chatInput: String = ""
+
+              struct ChatEntry: Identifiable, Equatable {
+                  let id = UUID()
+                  let role: String  // "user" or "ai"
+                  let text: String
+                  let timestamp: Date = Date()
+              }
+
+              private var explanationCache: [String: String] = [:]  // key: fen+uci
+              private var explanationTask: Task<Void, Never>?
+
+              /// Explain a specific move (with caching)
+              func explainMove(fen: String, uci: String, san: String, eval: String,
+                               ranking: Int, totalMoves: Int, isArabic: Bool) {
+                  let cacheKey = "\(fen)|\(uci)|\(isArabic ? "ar" : "en")"
+
+                  // Cache hit
+                  if let cached = explanationCache[cacheKey] {
+                      currentExplanation = cached
+                      currentExplainedMove = san
+                      explanationError = ""
+                      isLoadingExplanation = false
+                      return
+                  }
+
+                  currentExplanation = ""
+                  currentExplainedMove = san
+                  explanationError = ""
+                  isLoadingExplanation = true
+
+                  explanationTask?.cancel()
+                  explanationTask = Task { [weak self] in
+                      guard let self = self else { return }
+                      do {
+                          let result = try await GroqService.explainMove(
+                              fen: fen, uci: uci, san: san, eval: eval,
+                              isArabic: isArabic, ranking: ranking, totalMoves: totalMoves
+                          )
+                          if Task.isCancelled { return }
+                          await MainActor.run {
+                              self.currentExplanation = result
+                              self.explanationCache[cacheKey] = result
+                              self.isLoadingExplanation = false
+                          }
+                      } catch {
+                          if Task.isCancelled { return }
+                          await MainActor.run {
+                              self.explanationError = error.localizedDescription
+                              self.isLoadingExplanation = false
+                          }
+                      }
+                  }
+              }
+
+              func clearExplanation() {
+                  currentExplanation = ""
+                  currentExplainedMove = ""
+                  explanationError = ""
+              }
+
+              /// Send a chat question
+              func sendChat(fen: String, isArabic: Bool) {
+                  let question = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard !question.isEmpty else { return }
+                  chatInput = ""
+                  chatMessages.append(ChatEntry(role: "user", text: question))
+                  isLoadingChat = true
+
+                  // Build history for context
+                  let historyMessages: [GroqService.ChatMessage] = chatMessages.suffix(6).map { entry in
+                      GroqService.ChatMessage(
+                          role: entry.role == "user" ? "user" : "assistant",
+                          content: entry.text
+                      )
+                  }
+                  let historyForApi = Array(historyMessages.dropLast())  // exclude the just-added one
+
+                  Task { [weak self] in
+                      guard let self = self else { return }
+                      do {
+                          let result = try await GroqService.askAboutPosition(
+                              fen: fen, question: question, isArabic: isArabic,
+                              history: historyForApi
+                          )
+                          await MainActor.run {
+                              self.chatMessages.append(ChatEntry(role: "ai", text: result))
+                              self.isLoadingChat = false
+                          }
+                      } catch {
+                          await MainActor.run {
+                              self.chatMessages.append(ChatEntry(role: "ai", text: "⚠️ \(error.localizedDescription)"))
+                              self.isLoadingChat = false
+                          }
+                      }
+                  }
+              }
+
+              func clearChat() {
+                  chatMessages.removeAll()
               }
           }
           '''
@@ -184,15 +496,11 @@ jobs:
           }
           '''
 
-          # ============ NEW: Smart FEN Builder (no history accumulation) ============
           files["Sources/FenBuilder.swift"] = r'''
           import Foundation
 
-          /// Smart FEN builder that DOES NOT accumulate errors.
-          /// Instead of tracking history, it uses direct position analysis.
           @MainActor
           final class FenBuilder {
-              // Only track things we're SURE about (king/rook that we saw move)
               private var knownWhiteKingMoved = false
               private var knownBlackKingMoved = false
               private var knownWhiteRookA1Moved = false
@@ -205,38 +513,22 @@ jobs:
               private var lastPly: Int = -1
 
               func reset() {
-                  knownWhiteKingMoved = false
-                  knownBlackKingMoved = false
-                  knownWhiteRookA1Moved = false
-                  knownWhiteRookH1Moved = false
-                  knownBlackRookA8Moved = false
-                  knownBlackRookH8Moved = false
-                  lastEP = nil
-                  halfmoveClock = 0
-                  lastGrid = nil
-                  lastPly = -1
+                  knownWhiteKingMoved = false; knownBlackKingMoved = false
+                  knownWhiteRookA1Moved = false; knownWhiteRookH1Moved = false
+                  knownBlackRookA8Moved = false; knownBlackRookH8Moved = false
+                  lastEP = nil; halfmoveClock = 0; lastGrid = nil; lastPly = -1
               }
 
-              /// Build FEN from current grid state.
-              /// grid: 8x8 chars, grid[0] = rank 8 (top), grid[7] = rank 1 (bottom)
               func build(grid: [[Character]], sideToMove: String, plyCount: Int) -> String {
-                  // If this is starting position, reset all tracking
                   if isStartingPosition(grid) {
                       reset()
-                      lastGrid = grid
-                      lastPly = plyCount
+                      lastGrid = grid; lastPly = plyCount
                   } else {
-                      // Track moves ONLY if we have valid history
                       if let old = lastGrid, plyCount >= lastPly && plyCount <= lastPly + 2 {
                           detectMoveAndUpdate(oldGrid: old, newGrid: grid)
-                      } else if lastGrid == nil {
-                          // First read wasn't starting position → probably mid-game
-                          // Trust current position for castling
                       }
-                      lastGrid = grid
-                      lastPly = plyCount
+                      lastGrid = grid; lastPly = plyCount
                   }
-
                   let boardFen = buildBoardFen(from: grid)
                   let castling = deriveCastling(from: grid)
                   let ep = lastEP ?? "-"
@@ -244,30 +536,18 @@ jobs:
                   return "\(boardFen) \(sideToMove) \(castling) \(ep) \(halfmoveClock) \(fullmove)"
               }
 
-              /// Detect what moved and update tracking
               private func detectMoveAndUpdate(oldGrid: [[Character]], newGrid: [[Character]]) {
-                  // Find all changed squares
                   var changes: [(row: Int, col: Int, before: Character, after: Character)] = []
-                  for r in 0..<8 {
-                      for c in 0..<8 {
-                          if oldGrid[r][c] != newGrid[r][c] {
-                              changes.append((r, c, oldGrid[r][c], newGrid[r][c]))
-                          }
+                  for r in 0..<8 { for c in 0..<8 {
+                      if oldGrid[r][c] != newGrid[r][c] {
+                          changes.append((r, c, oldGrid[r][c], newGrid[r][c]))
                       }
-                  }
+                  }}
                   guard !changes.isEmpty else { return }
-
-                  // Track king moves
                   for change in changes {
-                      if change.before == "K" && change.after == "." && change.row == 7 && change.col == 4 {
-                          knownWhiteKingMoved = true
-                      }
-                      if change.before == "k" && change.after == "." && change.row == 0 && change.col == 4 {
-                          knownBlackKingMoved = true
-                      }
+                      if change.before == "K" && change.after == "." && change.row == 7 && change.col == 4 { knownWhiteKingMoved = true }
+                      if change.before == "k" && change.after == "." && change.row == 0 && change.col == 4 { knownBlackKingMoved = true }
                   }
-
-                  // Track rook moves (from original squares)
                   for change in changes {
                       if change.before == "R" && change.after == "." {
                           if change.row == 7 && change.col == 0 { knownWhiteRookA1Moved = true }
@@ -277,7 +557,6 @@ jobs:
                           if change.row == 0 && change.col == 0 { knownBlackRookA8Moved = true }
                           if change.row == 0 && change.col == 7 { knownBlackRookH8Moved = true }
                       }
-                      // Track rook captures on original squares
                       if change.after != "." && change.before != change.after {
                           if change.row == 7 && change.col == 0 { knownWhiteRookA1Moved = true }
                           if change.row == 7 && change.col == 7 { knownWhiteRookH1Moved = true }
@@ -285,8 +564,6 @@ jobs:
                           if change.row == 0 && change.col == 7 { knownBlackRookH8Moved = true }
                       }
                   }
-
-                  // Detect en passant target: pawn moved 2 squares
                   lastEP = nil
                   let fromSq = changes.first { $0.before != "." && $0.after == "." }
                   let toSq = changes.first { $0.after != "." && $0.after != $0.before }
@@ -297,38 +574,26 @@ jobs:
                           let epRow = (from.row + to.row) / 2
                           lastEP = squareName(row: epRow, col: to.col)
                       }
-                      // Halfmove clock
                       let isPawnMove = piece == "P" || piece == "p"
                       let isCapture = changes.contains { $0.before != "." && $0.after != "." && $0.before != $0.after }
-                      if isPawnMove || isCapture {
-                          halfmoveClock = 0
-                      } else {
-                          halfmoveClock += 1
-                      }
+                      halfmoveClock = (isPawnMove || isCapture) ? 0 : (halfmoveClock + 1)
                   }
               }
 
               private func isStartingPosition(_ grid: [[Character]]) -> Bool {
                   guard grid.count == 8 else { return false }
-                  return String(grid[0]) == "rnbqkbnr"
-                      && String(grid[1]) == "pppppppp"
-                      && String(grid[6]) == "PPPPPPPP"
-                      && String(grid[7]) == "RNBQKBNR"
+                  return String(grid[0]) == "rnbqkbnr" && String(grid[1]) == "pppppppp"
+                      && String(grid[6]) == "PPPPPPPP" && String(grid[7]) == "RNBQKBNR"
               }
 
               private func buildBoardFen(from grid: [[Character]]) -> String {
                   var rows: [String] = []
                   for r in 0..<8 {
-                      var row = ""
-                      var empty = 0
+                      var row = ""; var empty = 0
                       for c in 0..<8 {
                           let ch = grid[r][c]
-                          if ch == "." {
-                              empty += 1
-                          } else {
-                              if empty > 0 { row += "\(empty)"; empty = 0 }
-                              row.append(ch)
-                          }
+                          if ch == "." { empty += 1 }
+                          else { if empty > 0 { row += "\(empty)"; empty = 0 }; row.append(ch) }
                       }
                       if empty > 0 { row += "\(empty)" }
                       rows.append(row)
@@ -336,21 +601,12 @@ jobs:
                   return rows.joined(separator: "/")
               }
 
-              /// Derive castling rights combining "known moved" tracking + current position check
               private func deriveCastling(from grid: [[Character]]) -> String {
                   var s = ""
-                  // White kingside
-                  if !knownWhiteKingMoved && !knownWhiteRookH1Moved
-                      && grid[7][4] == "K" && grid[7][7] == "R" { s += "K" }
-                  // White queenside
-                  if !knownWhiteKingMoved && !knownWhiteRookA1Moved
-                      && grid[7][4] == "K" && grid[7][0] == "R" { s += "Q" }
-                  // Black kingside
-                  if !knownBlackKingMoved && !knownBlackRookH8Moved
-                      && grid[0][4] == "k" && grid[0][7] == "r" { s += "k" }
-                  // Black queenside
-                  if !knownBlackKingMoved && !knownBlackRookA8Moved
-                      && grid[0][4] == "k" && grid[0][0] == "r" { s += "q" }
+                  if !knownWhiteKingMoved && !knownWhiteRookH1Moved && grid[7][4] == "K" && grid[7][7] == "R" { s += "K" }
+                  if !knownWhiteKingMoved && !knownWhiteRookA1Moved && grid[7][4] == "K" && grid[7][0] == "R" { s += "Q" }
+                  if !knownBlackKingMoved && !knownBlackRookH8Moved && grid[0][4] == "k" && grid[0][7] == "r" { s += "k" }
+                  if !knownBlackKingMoved && !knownBlackRookA8Moved && grid[0][4] == "k" && grid[0][0] == "r" { s += "q" }
                   return s.isEmpty ? "-" : s
               }
 
@@ -371,10 +627,10 @@ jobs:
               @Published var isCompact: Bool = false
               @Published var transparency: Double = 0.85
 
-              private let offsetXKey = "overlay_offset_x_v45"
-              private let offsetYKey = "overlay_offset_y_v45"
-              private let compactKey = "overlay_compact"
-              private let transparencyKey = "overlay_transparency"
+              private let offsetXKey = "overlay_offset_x_v5"
+              private let offsetYKey = "overlay_offset_y_v5"
+              private let compactKey = "overlay_compact_v5"
+              private let transparencyKey = "overlay_transparency_v5"
 
               init() {
                   let x = UserDefaults.standard.double(forKey: offsetXKey)
@@ -384,73 +640,39 @@ jobs:
                   let t = UserDefaults.standard.double(forKey: transparencyKey)
                   transparency = t > 0 ? t : 0.85
               }
-
               func save() {
                   UserDefaults.standard.set(offset.width, forKey: offsetXKey)
                   UserDefaults.standard.set(offset.height, forKey: offsetYKey)
                   UserDefaults.standard.set(isCompact, forKey: compactKey)
                   UserDefaults.standard.set(transparency, forKey: transparencyKey)
               }
-
               func reset() {
-                  offset = .zero
-                  isCompact = false
-                  transparency = 0.85
-                  save()
+                  offset = .zero; isCompact = false; transparency = 0.85; save()
               }
           }
-          '''
 
-          files["Sources/OpeningBook.swift"] = r'''
-          import Foundation
-          struct OpeningEntry {
-              let name: String
-              let moves: [String]
-          }
-          enum OpeningBook {
-              static let entries: [OpeningEntry] = [
-                  OpeningEntry(name: "Italian Game", moves: ["e2e4","e7e5","g1f3","b8c6","f1c4","g8f6","d2d3","f8c5"]),
-                  OpeningEntry(name: "Ruy Lopez", moves: ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6","e1g1","f8e7"]),
-                  OpeningEntry(name: "Scotch Game", moves: ["e2e4","e7e5","g1f3","b8c6","d2d4","e5d4","f3d4"]),
-                  OpeningEntry(name: "Vienna Game", moves: ["e2e4","e7e5","b1c3"]),
-                  OpeningEntry(name: "King's Gambit", moves: ["e2e4","e7e5","f2f4"]),
-                  OpeningEntry(name: "Sicilian Najdorf", moves: ["e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6","b1c3","a7a6"]),
-                  OpeningEntry(name: "Sicilian Dragon", moves: ["e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6","b1c3","g7g6"]),
-                  OpeningEntry(name: "Sicilian Alapin", moves: ["e2e4","c7c5","c2c3"]),
-                  OpeningEntry(name: "Sicilian Rossolimo", moves: ["e2e4","c7c5","g1f3","b8c6","f1b5"]),
-                  OpeningEntry(name: "French Defense", moves: ["e2e4","e7e6","d2d4","d7d5"]),
-                  OpeningEntry(name: "Caro-Kann Defense", moves: ["e2e4","c7c6","d2d4","d7d5"]),
-                  OpeningEntry(name: "Scandinavian", moves: ["e2e4","d7d5"]),
-                  OpeningEntry(name: "Pirc Defense", moves: ["e2e4","d7d6","d2d4","g8f6","b1c3","g7g6"]),
-                  OpeningEntry(name: "Alekhine Defense", moves: ["e2e4","g8f6"]),
-                  OpeningEntry(name: "Bird's Opening", moves: ["f2f4"]),
-                  OpeningEntry(name: "Queen's Gambit", moves: ["d2d4","d7d5","c2c4"]),
-                  OpeningEntry(name: "Queen's Gambit Declined", moves: ["d2d4","d7d5","c2c4","e7e6"]),
-                  OpeningEntry(name: "Queen's Gambit Accepted", moves: ["d2d4","d7d5","c2c4","d5c4"]),
-                  OpeningEntry(name: "Slav Defense", moves: ["d2d4","d7d5","c2c4","c7c6"]),
-                  OpeningEntry(name: "London System", moves: ["d2d4","d7d5","g1f3","g8f6","c1f4"]),
-                  OpeningEntry(name: "King's Indian Defense", moves: ["d2d4","g8f6","c2c4","g7g6","b1c3","f8g7"]),
-                  OpeningEntry(name: "Nimzo-Indian", moves: ["d2d4","g8f6","c2c4","e7e6","b1c3","f8b4"]),
-                  OpeningEntry(name: "Queen's Indian", moves: ["d2d4","g8f6","c2c4","e7e6","g1f3","b7b6"]),
-                  OpeningEntry(name: "Grunfeld Defense", moves: ["d2d4","g8f6","c2c4","g7g6","b1c3","d7d5"]),
-                  OpeningEntry(name: "Dutch Defense", moves: ["d2d4","f7f5"]),
-                  OpeningEntry(name: "English Opening", moves: ["c2c4"]),
-                  OpeningEntry(name: "Reti Opening", moves: ["g1f3","d7d5","c2c4"]),
-              ]
-              static func lookup(history: [String]) -> (name: String, nextMove: String?)? {
-                  guard !history.isEmpty else { return nil }
-                  var bestMatch: (name: String, nextMove: String?)? = nil
-                  var bestLen = 0
-                  for entry in entries {
-                      guard history.count <= entry.moves.count else { continue }
-                      let prefix = Array(entry.moves.prefix(history.count))
-                      if prefix == history && history.count > bestLen {
-                          bestLen = history.count
-                          let next = history.count < entry.moves.count ? entry.moves[history.count] : nil
-                          bestMatch = (name: entry.name, nextMove: next)
-                      }
+          @MainActor
+          final class AIOverlayPosition: ObservableObject {
+              @Published var offset: CGSize = CGSize(width: 0, height: -220)
+              @Published var isVisible: Bool = false
+              @Published var isChatMode: Bool = false
+
+              private let offsetXKey = "ai_offset_x_v5"
+              private let offsetYKey = "ai_offset_y_v5"
+
+              init() {
+                  let x = UserDefaults.standard.double(forKey: offsetXKey)
+                  let y = UserDefaults.standard.double(forKey: offsetYKey)
+                  if x != 0 || y != 0 {
+                      offset = CGSize(width: x, height: y)
                   }
-                  return bestMatch
+              }
+              func save() {
+                  UserDefaults.standard.set(offset.width, forKey: offsetXKey)
+                  UserDefaults.standard.set(offset.height, forKey: offsetYKey)
+              }
+              func reset() {
+                  offset = CGSize(width: 0, height: -220); save()
               }
           }
           '''
@@ -468,7 +690,6 @@ jobs:
               private var cache: [String: Entry] = [:]
               private var accessOrder: [String] = []
               private let maxEntries = 200
-
               func get(fen: String) -> (moves: [TopMove], depth: Int, sources: String, confidence: Int)? {
                   guard let entry = cache[fen] else { return nil }
                   accessOrder.removeAll { $0 == fen }
@@ -484,10 +705,7 @@ jobs:
                       cache.removeValue(forKey: oldest)
                   }
               }
-              func clear() {
-                  cache.removeAll()
-                  accessOrder.removeAll()
-              }
+              func clear() { cache.removeAll(); accessOrder.removeAll() }
               func count() -> Int { cache.count }
           }
           '''
@@ -546,11 +764,11 @@ jobs:
           }
 
           enum EngineService {
-              static func callLichessCloud(fen: String) async -> [TopMove]? {
+              static func callLichessCloud(fen: String, multiPv: Int = 3) async -> [TopMove]? {
                   var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
                   comps.queryItems = [
                       URLQueryItem(name: "fen", value: fen),
-                      URLQueryItem(name: "multiPv", value: "3")
+                      URLQueryItem(name: "multiPv", value: "\(multiPv)")
                   ]
                   guard let url = comps.url else { return nil }
                   var req = URLRequest(url: url)
@@ -566,7 +784,7 @@ jobs:
                       let depth = (json["depth"] as? Int) ?? 20
                       guard let pvs = json["pvs"] as? [[String: Any]] else { return [] }
                       var moves: [TopMove] = []
-                      for (idx, pv) in pvs.prefix(3).enumerated() {
+                      for (idx, pv) in pvs.prefix(multiPv).enumerated() {
                           let movesStr = (pv["moves"] as? String) ?? ""
                           let firstMove = String(movesStr.split(separator: " ").first ?? "")
                           guard !firstMove.isEmpty else { continue }
@@ -580,15 +798,19 @@ jobs:
                   } catch { return nil }
               }
 
-              static func callChessApi(fen: String) async -> TopMove? {
+              static func callChessApi(fen: String, deep: Bool = false) async -> TopMove? {
                   guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
                   var req = URLRequest(url: url)
                   req.httpMethod = "POST"
                   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  req.timeoutInterval = 6
+                  req.timeoutInterval = deep ? 15 : 6
                   req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-                  let body: [String: Any] = ["fen": fen, "depth": 13, "maxThinkingTime": 200]
+                  let body: [String: Any] = [
+                      "fen": fen,
+                      "depth": deep ? 18 : 13,
+                      "maxThinkingTime": deep ? 800 : 200
+                  ]
                   guard let httpBody = try? JSONSerialization.data(withJSONObject: body) else { return nil }
                   req.httpBody = httpBody
                   do {
@@ -600,22 +822,22 @@ jobs:
                       let eval = json["eval"] as? Double
                       let mate = json["mate"] as? Int
                       let cp = eval.map { Int(($0 * 100).rounded()) }
-                      let d = (json["depth"] as? Int) ?? 13
+                      let d = (json["depth"] as? Int) ?? (deep ? 18 : 13)
                       return TopMove(rank: 1, uci: uci, san: san,
                                      evaluationCp: cp, mateIn: (mate == 0 ? nil : mate),
                                      depth: d, source: "cA", votes: 1)
                   } catch { return nil }
               }
 
-              static func callStockfishOnline(fen: String) async -> TopMove? {
+              static func callStockfishOnline(fen: String, deep: Bool = false) async -> TopMove? {
                   var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
                   comps.queryItems = [
                       URLQueryItem(name: "fen", value: fen),
-                      URLQueryItem(name: "depth", value: "13")
+                      URLQueryItem(name: "depth", value: deep ? "15" : "13")
                   ]
                   guard let url = comps.url else { return nil }
                   var req = URLRequest(url: url)
-                  req.timeoutInterval = 6
+                  req.timeoutInterval = deep ? 15 : 6
                   req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
                   do {
@@ -634,18 +856,15 @@ jobs:
                       let mate = json["mate"] as? Int
                       let cp: Int? = evalDouble.map { Int(($0 * 100).rounded()) }
                       let d = (json["depth"] as? Int) ?? 13
-                      return TopMove(rank: 1, uci: uci, san: uci,
-                                     evaluationCp: cp, mateIn: (mate == 0 ? nil : mate),
-                                     depth: d, source: "sf", votes: 1)
+                      return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp,
+                                     mateIn: (mate == 0 ? nil : mate), depth: d, source: "sf", votes: 1)
                   } catch { return nil }
               }
 
-              static func analyzeStreaming(fen: String, moveHistory: [String],
+              static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
                                             onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
-                  if let issue = FenValidator.validate(fen) {
-                      throw EngineError.badFen(issue)
-                  }
-                  if let cached = await AnalysisCache.shared.get(fen: fen) {
+                  if let issue = FenValidator.validate(fen) { throw EngineError.badFen(issue) }
+                  if !deep, let cached = await AnalysisCache.shared.get(fen: fen) {
                       let cachedMoves = cached.moves.enumerated().map { (i, m) in
                           TopMove(rank: i + 1, uci: m.uci, san: m.san,
                                   evaluationCp: m.evaluationCp, mateIn: m.mateIn,
@@ -658,9 +877,9 @@ jobs:
                       return a
                   }
 
-                  async let lichessResult = callLichessCloud(fen: fen)
-                  async let chessApiResult = callChessApi(fen: fen)
-                  async let stockfishResult = callStockfishOnline(fen: fen)
+                  async let lichessResult = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
+                  async let chessApiResult = callChessApi(fen: fen, deep: deep)
+                  async let stockfishResult = callStockfishOnline(fen: fen, deep: deep)
                   let lichess = await lichessResult
                   try Task.checkCancellation()
                   let cA = await chessApiResult
@@ -698,43 +917,34 @@ jobs:
                           moveVotes[m.uci] = (m, 1, ["sf"])
                       }
                   }
-
                   guard !moveVotes.isEmpty else {
-                      if lichess == nil && cA == nil && sf == nil {
-                          throw EngineError.networkOffline
-                      }
+                      if lichess == nil && cA == nil && sf == nil { throw EngineError.networkOffline }
                       throw EngineError.allEnginesFailed
                   }
-
                   let sortedEntries = moveVotes.values.sorted { a, b in
                       if a.votes != b.votes { return a.votes > b.votes }
                       return a.move.rankScore > b.move.rankScore
                   }
-
-                  let finalMoves: [TopMove] = sortedEntries.prefix(3).enumerated().map { (idx, entry) in
+                  let limit = deep ? 5 : 3
+                  let finalMoves: [TopMove] = sortedEntries.prefix(limit).enumerated().map { (idx, entry) in
                       TopMove(rank: idx + 1, uci: entry.move.uci, san: entry.move.san,
                               evaluationCp: entry.move.evaluationCp, mateIn: entry.move.mateIn,
                               depth: entry.move.depth,
                               source: entry.sources.joined(separator: "+"),
                               votes: entry.votes)
                   }
-
                   let topVotes = finalMoves.first?.votes ?? 1
                   let allSources = Array(Set(moveVotes.values.flatMap { $0.sources })).sorted().joined(separator: "+")
                   let bestDepth = finalMoves.map { $0.depth }.max() ?? 13
-
-                  // Sanity check: if all moves have same eval, FEN is suspicious - don't cache
                   let evalsAreIdentical = finalMoves.count >= 2 &&
                       finalMoves.allSatisfy { $0.evaluationCp == finalMoves.first?.evaluationCp }
-                  let shouldCache = !evalsAreIdentical
-
+                  let shouldCache = !evalsAreIdentical && !deep
                   let analysis = EngineAnalysis(topMoves: finalMoves, bestMove: finalMoves.first,
                                                 depth: bestDepth, sourcesUsed: allSources,
                                                 confidence: min(topVotes, 3), debugFen: fen)
                   if shouldCache {
-                      await AnalysisCache.shared.set(fen: fen, moves: finalMoves,
-                                                     depth: bestDepth, sources: allSources,
-                                                     confidence: min(topVotes, 3))
+                      await AnalysisCache.shared.set(fen: fen, moves: finalMoves, depth: bestDepth,
+                                                     sources: allSources, confidence: min(topVotes, 3))
                   }
                   await MainActor.run { onUpdate(analysis) }
                   return analysis
@@ -754,7 +964,6 @@ jobs:
               @Published var isBeingRecorded = false
               @Published var lastHideReason = ""
               private var cancellables = Set<AnyCancellable>()
-
               init() {
                   NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)
                       .sink { [weak self] _ in
@@ -779,7 +988,6 @@ jobs:
               func show() { overlayVisible = true; lastHideReason = "" }
               func toggleMinimalMode() { minimalMode.toggle() }
           }
-
           extension UIWindow {
               open override func motionEnded(_ motion: UIEvent.EventSubtype, with event: UIEvent?) {
                   if motion == .motionShake {
@@ -793,70 +1001,42 @@ jobs:
           }
           '''
 
-          files["Sources/SettingsView.swift"] = r'''
+          files["Sources/ContentView.swift"] = r'''
           import SwiftUI
-          struct SettingsView: View {
-              @ObservedObject var stealth: StealthManager
-              @ObservedObject var engine: EngineViewModel
-              @StateObject private var overlayPos = OverlayPosition()
-              @State private var cacheCount = 0
+          struct ContentView: View {
+              @StateObject private var engine  = EngineViewModel()
+              @StateObject private var stealth = StealthManager()
+              @StateObject private var router  = AppRouter()
+              @StateObject private var aiVM    = AIAssistantViewModel()
+              @StateObject private var language = AppLanguage()
+              var body: some View {
+                  TabView(selection: $router.selectedTab) {
+                      PlayView(engine: engine, stealth: stealth, router: router, aiVM: aiVM, language: language)
+                          .tabItem { Label(language.isArabic ? "لعب" : "Play", systemImage: "gamecontroller.fill") }.tag(0)
+                      SimpleTabView(title: language.isArabic ? "مراجعة" : "Review", icon: "magnifyingglass")
+                          .tabItem { Label(language.isArabic ? "مراجعة" : "Review", systemImage: "magnifyingglass") }.tag(1)
+                      SimpleTabView(title: language.isArabic ? "افتتاحيات" : "Openings", icon: "book.fill")
+                          .tabItem { Label(language.isArabic ? "افتتاحيات" : "Openings", systemImage: "book.fill") }.tag(2)
+                      SimpleTabView(title: language.isArabic ? "ألغاز" : "Puzzles", icon: "puzzlepiece.fill")
+                          .tabItem { Label(language.isArabic ? "ألغاز" : "Puzzles", systemImage: "puzzlepiece.fill") }.tag(3)
+                      SimpleTabView(title: language.isArabic ? "إحصائيات" : "Stats", icon: "chart.bar.fill")
+                          .tabItem { Label(language.isArabic ? "إحصائيات" : "Stats", systemImage: "chart.bar.fill") }.tag(4)
+                      SettingsView(stealth: stealth, engine: engine, language: language)
+                          .tabItem { Label(language.isArabic ? "إعدادات" : "Settings", systemImage: "gearshape.fill") }.tag(5)
+                  }
+                  .tint(.green)
+                  .environment(\.layoutDirection, language.isArabic ? .rightToLeft : .leftToRight)
+              }
+          }
+          struct SimpleTabView: View {
+              let title: String; let icon: String
               var body: some View {
                   NavigationStack {
-                      Form {
-                          Section("Overlay") {
-                              Text("Drag anywhere. Reset button below returns to bottom.")
-                                  .font(.caption).foregroundColor(.secondary)
-                              Toggle("Compact mode (smaller)", isOn: $overlayPos.isCompact)
-                                  .onChange(of: overlayPos.isCompact) { _ in overlayPos.save() }
-                              VStack(alignment: .leading) {
-                                  Text("Transparency: \(Int(overlayPos.transparency * 100))%").font(.caption)
-                                  Slider(value: $overlayPos.transparency, in: 0.3...1.0)
-                                      .onChange(of: overlayPos.transparency) { _ in overlayPos.save() }
-                              }
-                              Button("Reset overlay position") { overlayPos.reset() }
-                              Toggle("Use tiny dot instead of panel", isOn: $stealth.minimalMode)
-                          }
-                          Section("Engine") {
-                              HStack { Circle().fill(.blue).frame(width: 10, height: 10); Text("Lichess Cloud").font(.subheadline) }
-                              HStack { Circle().fill(.orange).frame(width: 10, height: 10); Text("chess-api.com").font(.subheadline) }
-                              HStack { Circle().fill(.cyan).frame(width: 10, height: 10); Text("stockfish.online").font(.subheadline) }
-                          }
-                          Section("Debug") {
-                              Text("Current FEN:").font(.caption)
-                              Text(engine.currentFEN.isEmpty ? "(none)" : engine.currentFEN)
-                                  .font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(3)
-                              Text("Cache: \(cacheCount) positions").font(.caption)
-                              Button("Clear cache") {
-                                  Task {
-                                      await AnalysisCache.shared.clear()
-                                      cacheCount = await AnalysisCache.shared.count()
-                                  }
-                              }
-                              Button("Reset FEN tracker (new game)") {
-                                  engine.resetFenTracker()
-                              }
-                          }
-                          Section("Panic") {
-                              Label("Shake phone to hide/show", systemImage: "iphone.gen3.radiowaves.left.and.right")
-                          }
-                          Section("Safety") {
-                              Label("On screen recording", systemImage: "record.circle")
-                              Label("On screenshot", systemImage: "camera.viewfinder")
-                          }
-                          Section("Status") {
-                              LabeledContent("Visible", value: stealth.overlayVisible ? "Yes" : "No")
-                              LabeledContent("Recorded", value: stealth.isBeingRecorded ? "Yes" : "No")
-                              Button("Show overlay") { stealth.show() }
-                              Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
-                          }
-                          Section("About") {
-                              LabeledContent("Version", value: "4.5.0 (45)")
-                          }
-                      }
-                      .navigationTitle("Settings")
-                      .task {
-                          cacheCount = await AnalysisCache.shared.count()
-                      }
+                      VStack(spacing: 20) {
+                          Image(systemName: icon).font(.system(size: 60)).foregroundColor(.green)
+                          Text(title).font(.largeTitle.bold())
+                          Text("v5.1 Coming").foregroundColor(.secondary)
+                      }.navigationTitle(title)
                   }
               }
           }
@@ -892,11 +1072,11 @@ jobs:
               @Published var winChance: Double = 50
               @Published var depth = 0
               @Published var isThinking = false
+              @Published var isDeepAnalyzing = false
               @Published var errorMessage = ""
               @Published var isOffline = false
               @Published var sourcesUsed = ""
               @Published var engineConfidence: Int = 0
-              @Published var openingName = ""
               @Published var detectedPlayerColor = "w"
               @Published var manualPlayerColor: String? = nil
               @Published var sideToMove = "w"
@@ -932,11 +1112,16 @@ jobs:
 
               func resetFenTracker() {
                   fenBuilder.reset()
-                  moveHistoryUCI = []
-                  lastKnownPly = -1
-                  openingName = ""
+                  moveHistoryUCI = []; lastKnownPly = -1
                   lastSuccessfulFEN = ""
                   Task { await AnalysisCache.shared.clear() }
+              }
+
+              func deepAnalyze() {
+                  guard !currentFEN.isEmpty else { return }
+                  lastSuccessfulFEN = ""
+                  isDeepAnalyzing = true
+                  runDeepAnalysis(fen: currentFEN)
               }
 
               struct BoardPayload {
@@ -960,32 +1145,19 @@ jobs:
                       lastKnownPly = p.plyCount
                   }
                   if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 {
-                      resetFenTracker()
-                      lastKnownPly = p.plyCount
+                      resetFenTracker(); lastKnownPly = p.plyCount
                   }
-
                   let chars = Array(p.grid)
                   guard chars.count == 64 else { return }
                   var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
-                  for r in 0..<8 {
-                      for c in 0..<8 {
-                          grid[r][c] = chars[r * 8 + c]
-                      }
-                  }
+                  for r in 0..<8 { for c in 0..<8 { grid[r][c] = chars[r * 8 + c] } }
                   if p.flipped {
                       var flipped: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
-                      for r in 0..<8 {
-                          for c in 0..<8 {
-                              flipped[r][c] = grid[7 - r][7 - c]
-                          }
-                      }
+                      for r in 0..<8 { for c in 0..<8 { flipped[r][c] = grid[7 - r][7 - c] } }
                       grid = flipped
                   }
-
                   let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
                   if let _ = FenValidator.validate(fen) { return }
-
-                  // FIX: NO double-stability check. Analyze immediately if FEN is different.
                   if fen != currentFEN {
                       currentFEN = fen
                       topMoves = []
@@ -1002,27 +1174,27 @@ jobs:
                   debounceTask?.cancel()
                   retryTask?.cancel()
                   debounceTask = Task { [weak self] in
-                      // Short debounce (150ms) to catch board settlement without missing moves
                       if !immediate { try? await Task.sleep(nanoseconds: 150_000_000) }
                       if Task.isCancelled { return }
-                      await self?.run(fen: fen)
+                      await self?.run(fen: fen, deep: false)
                   }
               }
 
-              private func run(fen: String) async {
-                  guard fen != lastSuccessfulFEN else { return }
+              private func runDeepAnalysis(fen: String) {
+                  Task { [weak self] in
+                      await self?.run(fen: fen, deep: true)
+                  }
+              }
+
+              private func run(fen: String, deep: Bool) async {
+                  if !deep && fen == lastSuccessfulFEN { return }
                   analysisTask?.cancel()
                   isThinking = true
                   errorMessage = ""
-                  if let bookMatch = OpeningBook.lookup(history: moveHistoryUCI) {
-                      openingName = bookMatch.name
-                  } else {
-                      openingName = ""
-                  }
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
-                          let a = try await EngineService.analyzeStreaming(fen: fen, moveHistory: self.moveHistoryUCI) { partial in
+                          let a = try await EngineService.analyzeStreaming(fen: fen, moveHistory: self.moveHistoryUCI, deep: deep) { partial in
                               guard fen == self.currentFEN else { return }
                               self.topMoves = partial.topMoves
                               if let best = partial.bestMove {
@@ -1043,6 +1215,7 @@ jobs:
                               self.sourcesUsed = a.sourcesUsed
                               self.engineConfidence = a.confidence
                               self.isThinking = false
+                              self.isDeepAnalyzing = false
                               self.isOffline = false
                               self.errorMessage = ""
                               self.lastSuccessfulFEN = fen
@@ -1055,6 +1228,7 @@ jobs:
                           guard fen == self.currentFEN else { return }
                           await MainActor.run {
                               self.isThinking = false
+                              self.isDeepAnalyzing = false
                               self.topMoves = []
                               self.evaluation = "—"
                               self.sourcesUsed = ""
@@ -1062,20 +1236,16 @@ jobs:
                               if let engineError = error as? EngineError {
                                   switch engineError {
                                   case .networkOffline:
-                                      self.isOffline = true
-                                      self.errorMessage = "Offline"
+                                      self.isOffline = true; self.errorMessage = "Offline"
                                       self.scheduleRetry(fen: fen)
                                   case .allEnginesFailed:
-                                      self.isOffline = true
-                                      self.errorMessage = "Engines down"
+                                      self.isOffline = true; self.errorMessage = "Engines down"
                                       self.scheduleRetry(fen: fen)
-                                  case .badFen(let msg):
-                                      self.errorMessage = "Bad FEN: \(msg)"
+                                  case .badFen(let msg): self.errorMessage = "Bad FEN: \(msg)"
                                   case .cancelled: break
                                   }
                               } else {
-                                  self.isOffline = true
-                                  self.errorMessage = "Error"
+                                  self.isOffline = true; self.errorMessage = "Error"
                                   self.scheduleRetry(fen: fen)
                               }
                           }
@@ -1090,7 +1260,7 @@ jobs:
                       guard let self = self, !Task.isCancelled else { return }
                       guard fen == self.currentFEN else { return }
                       guard self.topMoves.isEmpty else { return }
-                      await self.run(fen: fen)
+                      await self.run(fen: fen, deep: false)
                   }
               }
 
@@ -1129,36 +1299,37 @@ jobs:
               @ObservedObject var engine: EngineViewModel
               @ObservedObject var stealth: StealthManager
               @ObservedObject var router: AppRouter
+              @ObservedObject var aiVM: AIAssistantViewModel
+              @ObservedObject var language: AppLanguage
               @StateObject private var overlayPos = OverlayPosition()
+              @StateObject private var aiPos = AIOverlayPosition()
               @State private var showDisclaimer = true
               @State private var dragOffset: CGSize = .zero
               @State private var isDragging = false
+              @State private var aiDragOffset: CGSize = .zero
+              @State private var isDraggingAI = false
 
               var body: some View {
                   VStack(spacing: 0) {
                       nav
                       ZStack {
                           ChessWebView(engine: engine, router: router)
-                          // Overlay (draggable panel) shown when visible
-                          if stealth.overlayVisible {
-                              draggableOverlay
-                          }
-                          // FIXED reveal button - always at bottom center when hidden
-                          if !stealth.overlayVisible {
-                              fixedRevealButton
-                          }
+                          if stealth.overlayVisible { draggableOverlay }
+                          if !stealth.overlayVisible { fixedRevealButton }
+                          if aiPos.isVisible { draggableAIPanel }
                       }
                   }
                   .overlay(alignment: .center) {
                       if showDisclaimer {
-                          DisclaimerCard { withAnimation { showDisclaimer = false } }.padding(24)
+                          DisclaimerCard(language: language) { withAnimation { showDisclaimer = false } }.padding(24)
                       }
                   }
               }
 
               private var draggableOverlay: some View {
                   GeometryReader { geo in
-                      HelperOverlay(engine: engine, stealth: stealth, overlayPos: overlayPos)
+                      HelperOverlay(engine: engine, stealth: stealth, overlayPos: overlayPos,
+                                    aiVM: aiVM, aiPos: aiPos, language: language)
                           .opacity(isDragging ? 1.0 : overlayPos.transparency)
                           .position(
                               x: geo.size.width / 2 + overlayPos.offset.width + dragOffset.width,
@@ -1175,24 +1346,44 @@ jobs:
                                           width: overlayPos.offset.width + value.translation.width,
                                           height: overlayPos.offset.height + value.translation.height
                                       )
-                                      dragOffset = .zero
-                                      isDragging = false
-                                      overlayPos.save()
+                                      dragOffset = .zero; isDragging = false; overlayPos.save()
                                   }
                           )
                   }
               }
 
-              // FIXED: Reveal button ALWAYS at bottom center, big and obvious
+              private var draggableAIPanel: some View {
+                  GeometryReader { geo in
+                      AIAssistantPanel(aiVM: aiVM, aiPos: aiPos, engine: engine, language: language)
+                          .opacity(isDraggingAI ? 1.0 : 0.92)
+                          .position(
+                              x: geo.size.width / 2 + aiPos.offset.width + aiDragOffset.width,
+                              y: geo.size.height / 2 + aiPos.offset.height + aiDragOffset.height
+                          )
+                          .gesture(
+                              DragGesture(minimumDistance: 5)
+                                  .onChanged { value in
+                                      isDraggingAI = true
+                                      aiDragOffset = value.translation
+                                  }
+                                  .onEnded { value in
+                                      aiPos.offset = CGSize(
+                                          width: aiPos.offset.width + value.translation.width,
+                                          height: aiPos.offset.height + value.translation.height
+                                      )
+                                      aiDragOffset = .zero; isDraggingAI = false; aiPos.save()
+                                  }
+                          )
+                  }
+              }
+
               private var fixedRevealButton: some View {
                   VStack {
                       Spacer()
-                      Button {
-                          stealth.show()
-                      } label: {
+                      Button { stealth.show() } label: {
                           HStack(spacing: 8) {
                               Image(systemName: "eye.fill").font(.title3)
-                              Text("Show Helper").font(.subheadline.bold())
+                              Text(language.isArabic ? "إظهار المساعد" : "Show Helper").font(.subheadline.bold())
                           }
                           .padding(.horizontal, 20).padding(.vertical, 12)
                           .background(Color.green)
@@ -1207,11 +1398,11 @@ jobs:
 
               private var nav: some View {
                   HStack(spacing: 8) {
-                      btn("house.fill", "Home") { router.openInPlay("https://www.chess.com/") }
-                      btn("globe", "Online") { router.openInPlay("https://www.chess.com/play/online/new") }
-                      btn("cpu", "Bots") { router.openInPlay("https://www.chess.com/play/computer/bots") }
-                      btn("puzzlepiece.fill", "Puzzles") { router.openInPlay("https://www.chess.com/puzzles") }
-                      btn("chart.line.uptrend.xyaxis", "Analysis") { router.openInPlay("https://www.chess.com/analysis") }
+                      btn("house.fill", language.isArabic ? "الرئيسية" : "Home") { router.openInPlay("https://www.chess.com/") }
+                      btn("globe", language.isArabic ? "أونلاين" : "Online") { router.openInPlay("https://www.chess.com/play/online/new") }
+                      btn("cpu", language.isArabic ? "بوت" : "Bots") { router.openInPlay("https://www.chess.com/play/computer/bots") }
+                      btn("puzzlepiece.fill", language.isArabic ? "ألغاز" : "Puzzles") { router.openInPlay("https://www.chess.com/puzzles") }
+                      btn("chart.line.uptrend.xyaxis", language.isArabic ? "تحليل" : "Analysis") { router.openInPlay("https://www.chess.com/analysis") }
                   }
                   .padding(.horizontal, 8).padding(.vertical, 6)
                   .background(Color.black.opacity(0.6))
@@ -1228,16 +1419,37 @@ jobs:
           }
 
           struct DisclaimerCard: View {
+              @ObservedObject var language: AppLanguage
               var onDismiss: () -> Void
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v4.5").font(.title2.bold())
-                      Text("MAJOR FIXES\n\n✅ Fixed reveal button (always at bottom)\n✅ Fixed FEN accumulation errors\n✅ Instant analysis (no double-check delay)\n✅ Direct move detection\n\nShake to hide/show")
-                          .font(.footnote).foregroundColor(.white.opacity(0.85))
-                          .multilineTextAlignment(.leading)
+                      Text("Chess Helper v5.0 🤖").font(.title2.bold())
+                      Text(language.isArabic ? """
+                      الإصدار الاحترافي مع AI!
+
+                      ✅ مساعد Stockfish (3 محركات)
+                      ✅ مساعد AI جديد (Groq) للشرح المفصل
+                      ✅ Deep Analysis Mode
+                      ✅ Chat مع AI عن الموقف
+                      ✅ عربي / إنجليزي
+
+                      اهتز لإخفاء / إظهار
+                      """ : """
+                      Professional Version with AI!
+
+                      ✅ Stockfish helper (3 engines)
+                      ✅ NEW AI assistant (Groq) for explanations
+                      ✅ Deep Analysis Mode
+                      ✅ Chat with AI about position
+                      ✅ Arabic / English
+
+                      Shake to hide/show
+                      """)
+                      .font(.footnote).foregroundColor(.white.opacity(0.85))
+                      .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
-                          Text("Continue").font(.headline).frame(maxWidth: .infinity)
+                          Text(language.isArabic ? "متابعة" : "Continue").font(.headline).frame(maxWidth: .infinity)
                               .padding(.vertical, 12).background(Color.green).foregroundColor(.white).cornerRadius(10)
                       }
                   }
@@ -1252,6 +1464,9 @@ jobs:
               @ObservedObject var engine: EngineViewModel
               @ObservedObject var stealth: StealthManager
               @ObservedObject var overlayPos: OverlayPosition
+              @ObservedObject var aiVM: AIAssistantViewModel
+              @ObservedObject var aiPos: AIOverlayPosition
+              @ObservedObject var language: AppLanguage
               @State private var expanded = true
 
               private var maxWidth: CGFloat { overlayPos.isCompact ? 280 : 360 }
@@ -1283,15 +1498,13 @@ jobs:
                       header
                       if expanded {
                           if engine.isOffline { offlineBanner }
-                          if !engine.openingName.isEmpty { openingBanner }
                           bestMoveHighlight
                           if !overlayPos.isCompact { movesSection }
+                          actionButtons
                           if !overlayPos.isCompact && engine.lastMoveQuality != .none {
                               lastMoveSection
                           }
-                          if !engine.errorMessage.isEmpty && !engine.isOffline {
-                              errorSection
-                          }
+                          if !engine.errorMessage.isEmpty && !engine.isOffline { errorSection }
                       }
                   }
                   .background(.ultraThinMaterial)
@@ -1312,7 +1525,7 @@ jobs:
                       Text("Helper").font(.caption.bold())
                       if engine.isThinking { ProgressView().scaleEffect(0.5) }
                       Spacer()
-                      Text(engine.isMyTurn ? "Your turn" : "Wait")
+                      Text(engine.isMyTurn ? (language.isArabic ? "دورك" : "Your turn") : (language.isArabic ? "انتظر" : "Wait"))
                           .font(.caption2.bold())
                           .foregroundColor(engine.isMyTurn ? .green : .secondary)
                       Button { stealth.hide(reason: "manual") } label: {
@@ -1329,22 +1542,12 @@ jobs:
               private var offlineBanner: some View {
                   HStack(spacing: 4) {
                       Image(systemName: "wifi.slash").font(.caption2).foregroundColor(.red)
-                      Text("OFFLINE").font(.caption2.bold()).foregroundColor(.red)
+                      Text(language.isArabic ? "غير متصل" : "OFFLINE").font(.caption2.bold()).foregroundColor(.red)
                       Spacer()
                       ProgressView().scaleEffect(0.5)
                   }
                   .padding(.horizontal, 10).padding(.vertical, 3)
                   .background(Color.red.opacity(0.15))
-              }
-
-              private var openingBanner: some View {
-                  HStack(spacing: 4) {
-                      Image(systemName: "book.closed.fill").font(.caption2).foregroundColor(.purple)
-                      Text(engine.openingName).font(.caption2.bold()).foregroundColor(.purple).lineLimit(1)
-                      Spacer()
-                  }
-                  .padding(.horizontal, 10).padding(.vertical, 3)
-                  .background(Color.purple.opacity(0.10))
               }
 
               @ViewBuilder private var bestMoveHighlight: some View {
@@ -1353,17 +1556,14 @@ jobs:
                           VStack(alignment: .leading, spacing: 1) {
                               HStack(spacing: 3) {
                                   Image(systemName: "star.fill").font(.caption2).foregroundColor(confidenceColor)
-                                  Text("BEST").font(.caption2.bold()).foregroundColor(confidenceColor)
+                                  Text(language.isArabic ? "الأفضل" : "BEST").font(.caption2.bold()).foregroundColor(confidenceColor)
                                   confidenceBadge
                               }
                               Text(best.san.isEmpty ? best.uci : best.san)
                                   .font(.system(size: overlayPos.isCompact ? 22 : 28, weight: .black, design: .rounded))
                                   .foregroundColor(confidenceColor)
-                                  .minimumScaleFactor(0.7)
-                                  .lineLimit(1)
-                              Text(best.uci)
-                                  .font(.caption2.monospaced())
-                                  .foregroundColor(.secondary)
+                                  .minimumScaleFactor(0.7).lineLimit(1)
+                              Text(best.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
                           }
                           Spacer()
                           VStack(alignment: .trailing, spacing: 1) {
@@ -1371,8 +1571,7 @@ jobs:
                                   .font(.callout.bold().monospaced())
                                   .foregroundColor(confidenceColor)
                               Text("d\(best.depth)")
-                                  .font(.caption2.monospaced())
-                                  .foregroundColor(.secondary)
+                                  .font(.caption2.monospaced()).foregroundColor(.secondary)
                               Text(engine.sourcesUsed)
                                   .font(.caption2.monospaced())
                                   .foregroundColor(.secondary).lineLimit(1)
@@ -1420,6 +1619,68 @@ jobs:
                   .padding(.horizontal, 6).padding(.vertical, 3)
               }
 
+              // NEW: Action buttons row (Ask AI + Deep Analyze)
+              private var actionButtons: some View {
+                  HStack(spacing: 6) {
+                      // Ask AI button - triggers explanation of best move
+                      Button {
+                          if let best = engine.bestMove {
+                              aiPos.isVisible = true
+                              aiPos.isChatMode = false
+                              aiVM.explainMove(
+                                  fen: engine.currentFEN,
+                                  uci: best.uci, san: best.san,
+                                  eval: best.evalString,
+                                  ranking: best.rank,
+                                  totalMoves: engine.topMoves.count,
+                                  isArabic: language.isArabic
+                              )
+                          }
+                      } label: {
+                          HStack(spacing: 4) {
+                              Image(systemName: "sparkles").font(.caption2)
+                              Text(language.isArabic ? "اسأل AI" : "Ask AI").font(.caption2.bold())
+                          }
+                          .padding(.horizontal, 8).padding(.vertical, 5)
+                          .background(Color.purple.opacity(0.3))
+                          .foregroundColor(.purple)
+                          .cornerRadius(6)
+                      }
+                      // Deep Analyze button
+                      Button { engine.deepAnalyze() } label: {
+                          HStack(spacing: 4) {
+                              if engine.isDeepAnalyzing {
+                                  ProgressView().scaleEffect(0.5)
+                              } else {
+                                  Image(systemName: "brain.head.profile").font(.caption2)
+                              }
+                              Text(language.isArabic ? "تحليل عميق" : "Deep").font(.caption2.bold())
+                          }
+                          .padding(.horizontal, 8).padding(.vertical, 5)
+                          .background(Color.cyan.opacity(0.3))
+                          .foregroundColor(.cyan)
+                          .cornerRadius(6)
+                      }
+                      .disabled(engine.isDeepAnalyzing)
+                      // Chat button
+                      Button {
+                          aiPos.isVisible = true
+                          aiPos.isChatMode = true
+                      } label: {
+                          HStack(spacing: 4) {
+                              Image(systemName: "bubble.left.and.bubble.right.fill").font(.caption2)
+                              Text(language.isArabic ? "دردشة" : "Chat").font(.caption2.bold())
+                          }
+                          .padding(.horizontal, 8).padding(.vertical, 5)
+                          .background(Color.blue.opacity(0.3))
+                          .foregroundColor(.blue)
+                          .cornerRadius(6)
+                      }
+                      Spacer()
+                  }
+                  .padding(.horizontal, 8).padding(.vertical, 4)
+              }
+
               private func rankColor(_ rank: Int, votes: Int) -> Color {
                   if votes >= 3 { return .green }
                   if votes >= 2 { return .yellow }
@@ -1449,13 +1710,28 @@ jobs:
                           Text(d).font(.caption2.monospaced()).foregroundColor(.orange)
                       }
                       Text(move.evalString).font(.caption2.bold().monospaced()).foregroundColor(rc)
+                      // Small AI button for each move
+                      Button {
+                          aiPos.isVisible = true
+                          aiPos.isChatMode = false
+                          aiVM.explainMove(
+                              fen: engine.currentFEN,
+                              uci: move.uci, san: move.san,
+                              eval: move.evalString,
+                              ranking: rank,
+                              totalMoves: engine.topMoves.count,
+                              isArabic: language.isArabic
+                          )
+                      } label: {
+                          Image(systemName: "sparkles").font(.caption2).foregroundColor(.purple)
+                      }
                   }
                   .padding(.horizontal, 6).padding(.vertical, 2)
               }
 
               @ViewBuilder private var lastMoveSection: some View {
                   HStack(spacing: 4) {
-                      Text(engine.lastMoveWasMine ? "You:" : "Opp:").font(.caption2).foregroundColor(.secondary)
+                      Text(engine.lastMoveWasMine ? (language.isArabic ? "أنت:" : "You:") : (language.isArabic ? "الخصم:" : "Opp:")).font(.caption2).foregroundColor(.secondary)
                       Text(engine.lastMoveUCI).font(.caption2.monospaced()).foregroundColor(.white.opacity(0.85))
                       Spacer()
                       Text(engine.lastMoveQuality.rawValue).font(.caption2.bold())
@@ -1472,6 +1748,331 @@ jobs:
                       Text(engine.errorMessage).font(.caption2).foregroundColor(.orange).lineLimit(2)
                   }
                   .padding(.horizontal, 10).padding(.bottom, 4)
+              }
+          }
+          '''
+
+          files["Sources/AIAssistantPanel.swift"] = r'''
+          import SwiftUI
+
+          struct AIAssistantPanel: View {
+              @ObservedObject var aiVM: AIAssistantViewModel
+              @ObservedObject var aiPos: AIOverlayPosition
+              @ObservedObject var engine: EngineViewModel
+              @ObservedObject var language: AppLanguage
+              @FocusState private var chatFocused: Bool
+
+              var body: some View {
+                  VStack(spacing: 0) {
+                      header
+                      if aiPos.isChatMode {
+                          chatContent
+                      } else {
+                          explanationContent
+                      }
+                  }
+                  .frame(maxWidth: 320)
+                  .background(.ultraThinMaterial)
+                  .cornerRadius(14)
+                  .overlay(
+                      RoundedRectangle(cornerRadius: 14)
+                          .stroke(Color.purple.opacity(0.4), lineWidth: 1.5)
+                  )
+                  .shadow(color: .purple.opacity(0.3), radius: 10, y: 4)
+              }
+
+              private var header: some View {
+                  HStack(spacing: 6) {
+                      Image(systemName: "hand.draw.fill").font(.caption2).foregroundColor(.white.opacity(0.5))
+                      Image(systemName: "sparkles").font(.caption).foregroundColor(.purple)
+                      Text("AI Assistant").font(.caption.bold()).foregroundColor(.purple)
+                      Spacer()
+                      // Mode switcher
+                      Button {
+                          withAnimation { aiPos.isChatMode.toggle() }
+                      } label: {
+                          Image(systemName: aiPos.isChatMode ? "text.bubble.fill" : "bubble.left.and.bubble.right.fill")
+                              .font(.caption)
+                              .foregroundColor(.blue)
+                      }
+                      Button { aiPos.isVisible = false } label: {
+                          Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(.red.opacity(0.7))
+                      }
+                  }
+                  .padding(.horizontal, 10).padding(.vertical, 6)
+                  .background(Color.purple.opacity(0.15))
+              }
+
+              private var explanationContent: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      if !aiVM.currentExplainedMove.isEmpty {
+                          HStack {
+                              Image(systemName: "star.fill").font(.caption).foregroundColor(.purple)
+                              Text(language.isArabic ? "شرح النقلة:" : "Explaining:").font(.caption).foregroundColor(.secondary)
+                              Text(aiVM.currentExplainedMove).font(.callout.bold()).foregroundColor(.purple)
+                          }
+                          .padding(.horizontal, 10).padding(.top, 4)
+                      }
+                      if aiVM.isLoadingExplanation {
+                          HStack {
+                              ProgressView().scaleEffect(0.7)
+                              Text(language.isArabic ? "AI يفكر..." : "AI thinking...").font(.caption).foregroundColor(.secondary)
+                          }
+                          .padding(.horizontal, 10).padding(.vertical, 10)
+                      } else if !aiVM.explanationError.isEmpty {
+                          HStack(spacing: 4) {
+                              Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange).font(.caption)
+                              Text(aiVM.explanationError).font(.caption).foregroundColor(.orange).lineLimit(3)
+                          }
+                          .padding(10)
+                      } else if !aiVM.currentExplanation.isEmpty {
+                          ScrollView {
+                              Text(aiVM.currentExplanation)
+                                  .font(.callout)
+                                  .foregroundColor(.white.opacity(0.9))
+                                  .padding(.horizontal, 10)
+                                  .padding(.bottom, 8)
+                                  .fixedSize(horizontal: false, vertical: true)
+                          }
+                          .frame(maxHeight: 240)
+                      } else {
+                          Text(language.isArabic
+                               ? "اضغط 'اسأل AI' من المساعد للحصول على شرح مفصل"
+                               : "Tap 'Ask AI' from the helper to get a detailed explanation")
+                              .font(.caption).foregroundColor(.secondary)
+                              .multilineTextAlignment(.center)
+                              .padding(20)
+                      }
+                  }
+              }
+
+              private var chatContent: some View {
+                  VStack(spacing: 0) {
+                      ScrollViewReader { proxy in
+                          ScrollView {
+                              VStack(alignment: .leading, spacing: 8) {
+                                  if aiVM.chatMessages.isEmpty {
+                                      Text(language.isArabic
+                                           ? "اسأل AI أي سؤال عن الموقف!\n\nمثال:\n• إيه أحسن استراتيجية؟\n• إيه هدف الخصم؟\n• هل نقلة X كويسة؟"
+                                           : "Ask AI anything about the position!\n\nExamples:\n• What's the best strategy?\n• What's the opponent planning?\n• Is move X good?")
+                                          .font(.caption).foregroundColor(.secondary)
+                                          .padding(12)
+                                  }
+                                  ForEach(aiVM.chatMessages) { msg in
+                                      HStack {
+                                          if msg.role == "user" { Spacer() }
+                                          Text(msg.text)
+                                              .font(.caption)
+                                              .padding(.horizontal, 10).padding(.vertical, 6)
+                                              .background(msg.role == "user" ? Color.blue.opacity(0.3) : Color.purple.opacity(0.2))
+                                              .foregroundColor(msg.role == "user" ? .white : .white.opacity(0.9))
+                                              .cornerRadius(8)
+                                              .frame(maxWidth: 240, alignment: msg.role == "user" ? .trailing : .leading)
+                                          if msg.role == "ai" { Spacer() }
+                                      }
+                                      .id(msg.id)
+                                  }
+                                  if aiVM.isLoadingChat {
+                                      HStack {
+                                          ProgressView().scaleEffect(0.6)
+                                          Text(language.isArabic ? "يكتب..." : "typing...").font(.caption2).foregroundColor(.secondary)
+                                      }
+                                      .padding(.horizontal, 10)
+                                  }
+                              }
+                              .padding(6)
+                          }
+                          .frame(maxHeight: 240)
+                          .onChange(of: aiVM.chatMessages.count) { _ in
+                              if let last = aiVM.chatMessages.last {
+                                  withAnimation {
+                                      proxy.scrollTo(last.id, anchor: .bottom)
+                                  }
+                              }
+                          }
+                      }
+                      // Chat input
+                      HStack(spacing: 6) {
+                          TextField(language.isArabic ? "اكتب سؤالك..." : "Type your question...",
+                                    text: $aiVM.chatInput)
+                              .font(.caption)
+                              .padding(.horizontal, 8).padding(.vertical, 6)
+                              .background(Color.black.opacity(0.3))
+                              .cornerRadius(8)
+                              .focused($chatFocused)
+                              .onSubmit {
+                                  aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic)
+                              }
+                          Button {
+                              aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic)
+                              chatFocused = false
+                          } label: {
+                              Image(systemName: "paperplane.fill")
+                                  .foregroundColor(.blue)
+                                  .padding(6)
+                                  .background(Color.blue.opacity(0.2))
+                                  .cornerRadius(6)
+                          }
+                          .disabled(aiVM.chatInput.trimmingCharacters(in: .whitespaces).isEmpty || aiVM.isLoadingChat)
+                          if !aiVM.chatMessages.isEmpty {
+                              Button { aiVM.clearChat() } label: {
+                                  Image(systemName: "trash").foregroundColor(.red.opacity(0.7)).font(.caption)
+                              }
+                          }
+                      }
+                      .padding(8)
+                      .background(Color.black.opacity(0.2))
+                  }
+              }
+          }
+          '''
+
+          files["Sources/SettingsView.swift"] = r'''
+          import SwiftUI
+          struct SettingsView: View {
+              @ObservedObject var stealth: StealthManager
+              @ObservedObject var engine: EngineViewModel
+              @ObservedObject var language: AppLanguage
+              @StateObject private var overlayPos = OverlayPosition()
+              @State private var cacheCount = 0
+              @State private var apiKeyInput = ""
+              @State private var apiKeySaved = false
+              @State private var showKeyInput = false
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          // Language
+                          Section(language.isArabic ? "اللغة" : "Language") {
+                              Picker(language.isArabic ? "اللغة" : "Language", selection: $language.current) {
+                                  ForEach(AppLanguage.Lang.allCases, id: \.self) { lang in
+                                      Text(lang.display).tag(lang)
+                                  }
+                              }
+                              .pickerStyle(.segmented)
+                          }
+
+                          // AI (Groq)
+                          Section(header: HStack {
+                              Image(systemName: "sparkles").foregroundColor(.purple)
+                              Text(language.isArabic ? "الذكاء الاصطناعي (Groq)" : "AI Assistant (Groq)")
+                          }) {
+                              if apiKeySaved {
+                                  HStack {
+                                      Image(systemName: "checkmark.seal.fill").foregroundColor(.green)
+                                      Text(language.isArabic ? "المفتاح مضاف ✓" : "API Key Saved ✓")
+                                      Spacer()
+                                      Button(language.isArabic ? "تعديل" : "Change") {
+                                          showKeyInput = true
+                                      }
+                                  }
+                                  Button(language.isArabic ? "حذف المفتاح" : "Remove Key", role: .destructive) {
+                                      KeychainStore.delete(account: KeychainStore.groqKeyAccount)
+                                      apiKeySaved = false
+                                      apiKeyInput = ""
+                                  }
+                              } else {
+                                  Text(language.isArabic
+                                       ? "أضف مفتاح Groq API للحصول على شرح ذكي للنقلات"
+                                       : "Add Groq API key for AI-powered move explanations")
+                                      .font(.caption).foregroundColor(.secondary)
+                                  Button {
+                                      showKeyInput = true
+                                  } label: {
+                                      Label(language.isArabic ? "إضافة مفتاح API" : "Add API Key",
+                                            systemImage: "key.fill")
+                                  }
+                                  Link(destination: URL(string: "https://console.groq.com/keys")!) {
+                                      Label(language.isArabic ? "احصل على مفتاح مجاني" : "Get free API key",
+                                            systemImage: "arrow.up.right.square")
+                                  }
+                              }
+                          }
+
+                          if showKeyInput {
+                              Section(language.isArabic ? "أدخل المفتاح" : "Enter API Key") {
+                                  SecureField("gsk_...", text: $apiKeyInput)
+                                      .font(.caption.monospaced())
+                                      .autocorrectionDisabled()
+                                      .textInputAutocapitalization(.never)
+                                  HStack {
+                                      Button(language.isArabic ? "حفظ" : "Save") {
+                                          let trimmed = apiKeyInput.trimmingCharacters(in: .whitespaces)
+                                          if !trimmed.isEmpty {
+                                              if KeychainStore.save(trimmed, account: KeychainStore.groqKeyAccount) {
+                                                  apiKeySaved = true
+                                                  showKeyInput = false
+                                                  apiKeyInput = ""
+                                              }
+                                          }
+                                      }
+                                      .buttonStyle(.borderedProminent)
+                                      Spacer()
+                                      Button(language.isArabic ? "إلغاء" : "Cancel") {
+                                          showKeyInput = false
+                                          apiKeyInput = ""
+                                      }
+                                  }
+                              }
+                          }
+
+                          Section(language.isArabic ? "المساعد" : "Overlay") {
+                              Text(language.isArabic
+                                   ? "اسحب المساعد لأي مكان. زر الإعادة يعيده للأسفل."
+                                   : "Drag anywhere. Reset button below returns to bottom.")
+                                  .font(.caption).foregroundColor(.secondary)
+                              Toggle(language.isArabic ? "وضع مضغوط" : "Compact mode", isOn: $overlayPos.isCompact)
+                                  .onChange(of: overlayPos.isCompact) { _ in overlayPos.save() }
+                              VStack(alignment: .leading) {
+                                  Text("\(language.isArabic ? "الشفافية" : "Transparency"): \(Int(overlayPos.transparency * 100))%").font(.caption)
+                                  Slider(value: $overlayPos.transparency, in: 0.3...1.0)
+                                      .onChange(of: overlayPos.transparency) { _ in overlayPos.save() }
+                              }
+                              Button(language.isArabic ? "إعادة الموضع" : "Reset overlay position") { overlayPos.reset() }
+                              Toggle(language.isArabic ? "نقطة صغيرة بدل اللوحة" : "Tiny dot instead of panel",
+                                     isOn: $stealth.minimalMode)
+                          }
+
+                          Section(language.isArabic ? "محركات الشطرنج" : "Chess Engines") {
+                              HStack { Circle().fill(.blue).frame(width: 10, height: 10); Text("Lichess Cloud").font(.subheadline) }
+                              HStack { Circle().fill(.orange).frame(width: 10, height: 10); Text("chess-api.com").font(.subheadline) }
+                              HStack { Circle().fill(.cyan).frame(width: 10, height: 10); Text("stockfish.online").font(.subheadline) }
+                          }
+
+                          Section("Debug") {
+                              Text("FEN:").font(.caption)
+                              Text(engine.currentFEN.isEmpty ? "(none)" : engine.currentFEN)
+                                  .font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(3)
+                              Text("Cache: \(cacheCount)").font(.caption)
+                              Button(language.isArabic ? "مسح الذاكرة المؤقتة" : "Clear cache") {
+                                  Task {
+                                      await AnalysisCache.shared.clear()
+                                      cacheCount = await AnalysisCache.shared.count()
+                                  }
+                              }
+                              Button(language.isArabic ? "إعادة تعيين FEN (لعبة جديدة)" : "Reset FEN tracker (new game)") {
+                                  engine.resetFenTracker()
+                              }
+                          }
+
+                          Section("Status") {
+                              LabeledContent("Visible", value: stealth.overlayVisible ? "Yes" : "No")
+                              Button(language.isArabic ? "إظهار" : "Show overlay") { stealth.show() }
+                              Button(language.isArabic ? "إخفاء" : "Hide overlay", role: .destructive) {
+                                  stealth.hide(reason: "manual")
+                              }
+                          }
+                          Section("About") {
+                              LabeledContent("Version", value: "5.0.0 (50)")
+                              LabeledContent("Phase", value: "1 of 3")
+                          }
+                      }
+                      .navigationTitle(language.isArabic ? "الإعدادات" : "Settings")
+                      .task {
+                          cacheCount = await AnalysisCache.shared.count()
+                          apiKeySaved = KeychainStore.load(account: KeychainStore.groqKeyAccount) != nil
+                      }
+                  }
               }
           }
           '''
@@ -1590,8 +2191,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>4.5.0</string>
-            <key>CFBundleVersion</key><string>45</string>
+            <key>CFBundleShortVersionString</key><string>5.0.0</string>
+            <key>CFBundleVersion</key><string>50</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -1601,6 +2202,11 @@ jobs:
               <string>UIInterfaceOrientationLandscapeRight</string>
             </array>
             <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+            <key>CFBundleLocalizations</key>
+            <array>
+              <string>en</string>
+              <string>ar</string>
+            </array>
           </dict>
           </plist>
           EOF
