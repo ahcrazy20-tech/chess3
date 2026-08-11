@@ -1,4 +1,4 @@
-name: Build ChessHelper v4.3
+name: Build ChessHelper v4.4
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "4.3.0"
-              CURRENT_PROJECT_VERSION: "43"
+              MARKETING_VERSION: "4.4.0"
+              CURRENT_PROJECT_VERSION: "44"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -143,7 +143,6 @@ jobs:
               private static let userAgents = [
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
-                  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
               ]
               static func randomUserAgent() -> String { userAgents.randomElement()! }
               static func readerInterval() -> Int { Int.random(in: 600...1200) }
@@ -160,8 +159,7 @@ jobs:
               static func validate(_ fen: String) -> String? {
                   let parts = fen.split(separator: " ").map(String.init)
                   guard parts.count >= 4 else { return "not enough FEN fields" }
-                  let board = parts[0]
-                  let ranks = board.split(separator: "/").map(String.init)
+                  let ranks = parts[0].split(separator: "/").map(String.init)
                   guard ranks.count == 8 else { return "not 8 ranks" }
                   var whiteKings = 0, blackKings = 0, totalPieces = 0
                   for rank in ranks {
@@ -175,7 +173,7 @@ jobs:
                               if ch == "k" { blackKings += 1 }
                           }
                       }
-                      if count != 8 { return "rank has \(count) squares, not 8" }
+                      if count != 8 { return "rank has \(count) squares" }
                   }
                   if whiteKings != 1 { return "\(whiteKings) white kings" }
                   if blackKings != 1 { return "\(blackKings) black kings" }
@@ -186,78 +184,279 @@ jobs:
           }
           '''
 
-          # NEW: Local Opening Book
-          files["Sources/OpeningBook.swift"] = r'''
+          # ============ FIXED FEN Builder with proper castling & EP tracking ============
+          files["Sources/FenBuilder.swift"] = r'''
           import Foundation
 
-          /// Small offline opening book — first 15 moves of most common openings.
-          /// Instant response, no API call needed.
+          /// Builds accurate FEN by tracking game state over time.
+          /// Fixes castling rights and en-passant detection which were broken before.
+          @MainActor
+          final class FenBuilder {
+              // State that persists across positions
+              private var whiteKingMoved = false
+              private var blackKingMoved = false
+              private var whiteRookA1Moved = false
+              private var whiteRookH1Moved = false
+              private var blackRookA8Moved = false
+              private var blackRookH8Moved = false
+              private var lastEPTarget: String? = nil  // "e3" if pawn just moved 2 squares
+              private var halfmoveClock: Int = 0        // for 50-move rule
+              private var lastGridState: [[Character]]? = nil
+              private var lastPly: Int = -1
+
+              /// Reset all tracking (for new game)
+              func reset() {
+                  whiteKingMoved = false
+                  blackKingMoved = false
+                  whiteRookA1Moved = false
+                  whiteRookH1Moved = false
+                  blackRookA8Moved = false
+                  blackRookH8Moved = false
+                  lastEPTarget = nil
+                  halfmoveClock = 0
+                  lastGridState = nil
+                  lastPly = -1
+              }
+
+              /// Build accurate FEN from grid + game state
+              func build(grid: [[Character]], sideToMove: String, plyCount: Int) -> String {
+                  // Detect what moved since last position
+                  updateStateFromDiff(newGrid: grid, newPly: plyCount)
+                  lastGridState = grid
+                  lastPly = plyCount
+
+                  let boardFen = buildBoardFen(from: grid)
+                  let castling = deriveCastlingRights(from: grid)
+                  let ep = lastEPTarget ?? "-"
+                  let fullmove = max(1, (plyCount / 2) + 1)
+                  return "\(boardFen) \(sideToMove) \(castling) \(ep) \(halfmoveClock) \(fullmove)"
+              }
+
+              /// Detect what changed and update state
+              private func updateStateFromDiff(newGrid: [[Character]], newPly: Int) {
+                  guard let old = lastGridState else {
+                      // First position: reset if it's the starting position
+                      if isStartingPosition(newGrid) { reset() }
+                      return
+                  }
+                  // If ply went backwards or jumped, treat as new game
+                  if newPly < lastPly || newPly > lastPly + 2 {
+                      reset()
+                      lastGridState = newGrid
+                      return
+                  }
+                  // Find changed squares
+                  var changes: [(row: Int, col: Int, before: Character, after: Character)] = []
+                  for r in 0..<8 {
+                      for c in 0..<8 {
+                          if old[r][c] != newGrid[r][c] {
+                              changes.append((r, c, old[r][c], newGrid[r][c]))
+                          }
+                      }
+                  }
+                  // No change? nothing to update
+                  guard !changes.isEmpty else { return }
+
+                  // Find "from" square (had piece, now empty) and "to" square (had different, now has piece)
+                  let fromSquare = changes.first { $0.before != "." && $0.after == "." }
+                  let toSquare = changes.first { $0.after != "." && $0.after != $0.before }
+                  guard let from = fromSquare, let to = toSquare else {
+                      // Complex change (probably castling) - handle separately
+                      handleCastlingIfNeeded(changes: changes)
+                      lastEPTarget = nil
+                      return
+                  }
+                  let movedPiece = to.after
+                  // Track king moves
+                  if movedPiece == "K" { whiteKingMoved = true }
+                  if movedPiece == "k" { blackKingMoved = true }
+                  // Track rook moves (using ORIGINAL row indices: 7=rank 1 white, 0=rank 8 black)
+                  if from.row == 7 && from.col == 0 && movedPiece == "R" { whiteRookA1Moved = true }
+                  if from.row == 7 && from.col == 7 && movedPiece == "R" { whiteRookH1Moved = true }
+                  if from.row == 0 && from.col == 0 && movedPiece == "r" { blackRookA8Moved = true }
+                  if from.row == 0 && from.col == 7 && movedPiece == "r" { blackRookH8Moved = true }
+                  // Track rook captures on original squares
+                  if to.row == 7 && to.col == 0 { whiteRookA1Moved = true }
+                  if to.row == 7 && to.col == 7 { whiteRookH1Moved = true }
+                  if to.row == 0 && to.col == 0 { blackRookA8Moved = true }
+                  if to.row == 0 && to.col == 7 { blackRookH8Moved = true }
+                  // Castling detection: king moved 2 squares
+                  handleCastlingIfNeeded(changes: changes)
+                  // En passant detection: pawn moved 2 squares
+                  lastEPTarget = nil
+                  if (movedPiece == "P" || movedPiece == "p") && abs(from.row - to.row) == 2 {
+                      let epRow = (from.row + to.row) / 2
+                      lastEPTarget = squareName(row: epRow, col: to.col)
+                  }
+                  // Halfmove clock (increment unless pawn move or capture)
+                  let isCapture = changes.count >= 2 && changes.contains { $0.before != "." && $0.after != "." }
+                  if movedPiece == "P" || movedPiece == "p" || isCapture {
+                      halfmoveClock = 0
+                  } else {
+                      halfmoveClock += 1
+                  }
+              }
+
+              private func handleCastlingIfNeeded(changes: [(row: Int, col: Int, before: Character, after: Character)]) {
+                  // Castling produces 4 changes: king from e1/e8, king to g1/c1 (or g8/c8), rook from h1/a1, rook to f1/d1
+                  guard changes.count >= 3 else { return }
+                  for change in changes {
+                      if change.before == "K" && change.after == "." && change.row == 7 && change.col == 4 {
+                          whiteKingMoved = true
+                      }
+                      if change.before == "k" && change.after == "." && change.row == 0 && change.col == 4 {
+                          blackKingMoved = true
+                      }
+                  }
+              }
+
+              private func isStartingPosition(_ grid: [[Character]]) -> Bool {
+                  // Row 0 (rank 8, black back rank)
+                  let row0 = String(grid[0])
+                  guard row0 == "rnbqkbnr" else { return false }
+                  // Row 1 (rank 7, black pawns)
+                  let row1 = String(grid[1])
+                  guard row1 == "pppppppp" else { return false }
+                  // Row 6 (rank 2, white pawns)
+                  let row6 = String(grid[6])
+                  guard row6 == "PPPPPPPP" else { return false }
+                  // Row 7 (rank 1, white back rank)
+                  let row7 = String(grid[7])
+                  guard row7 == "RNBQKBNR" else { return false }
+                  return true
+              }
+
+              private func buildBoardFen(from grid: [[Character]]) -> String {
+                  var rows: [String] = []
+                  for r in 0..<8 {
+                      var row = ""
+                      var empty = 0
+                      for c in 0..<8 {
+                          let ch = grid[r][c]
+                          if ch == "." {
+                              empty += 1
+                          } else {
+                              if empty > 0 { row += "\(empty)"; empty = 0 }
+                              row.append(ch)
+                          }
+                      }
+                      if empty > 0 { row += "\(empty)" }
+                      rows.append(row)
+                  }
+                  return rows.joined(separator: "/")
+              }
+
+              private func deriveCastlingRights(from grid: [[Character]]) -> String {
+                  var s = ""
+                  // White kingside: K not moved, H1 rook not moved, both still in place
+                  if !whiteKingMoved && !whiteRookH1Moved
+                      && grid[7][4] == "K" && grid[7][7] == "R" { s += "K" }
+                  if !whiteKingMoved && !whiteRookA1Moved
+                      && grid[7][4] == "K" && grid[7][0] == "R" { s += "Q" }
+                  if !blackKingMoved && !blackRookH8Moved
+                      && grid[0][4] == "k" && grid[0][7] == "r" { s += "k" }
+                  if !blackKingMoved && !blackRookA8Moved
+                      && grid[0][4] == "k" && grid[0][0] == "r" { s += "q" }
+                  return s.isEmpty ? "-" : s
+              }
+
+              private func squareName(row: Int, col: Int) -> String {
+                  let file = Character(UnicodeScalar(97 + col)!)
+                  let rank = 8 - row
+                  return "\(file)\(rank)"
+              }
+          }
+          '''
+
+          # ============ Overlay Position (draggable) ============
+          files["Sources/OverlayPosition.swift"] = r'''
+          import SwiftUI
+
+          /// Persists overlay position across launches
+          @MainActor
+          final class OverlayPosition: ObservableObject {
+              @Published var offset: CGSize = .zero
+              @Published var isCompact: Bool = false
+              @Published var transparency: Double = 0.85  // 0=fully transparent, 1=solid
+
+              private let offsetXKey = "overlay_offset_x"
+              private let offsetYKey = "overlay_offset_y"
+              private let compactKey = "overlay_compact"
+              private let transparencyKey = "overlay_transparency"
+
+              init() {
+                  let x = UserDefaults.standard.double(forKey: offsetXKey)
+                  let y = UserDefaults.standard.double(forKey: offsetYKey)
+                  offset = CGSize(width: x, height: y)
+                  isCompact = UserDefaults.standard.bool(forKey: compactKey)
+                  let t = UserDefaults.standard.double(forKey: transparencyKey)
+                  transparency = t > 0 ? t : 0.85
+              }
+
+              func save() {
+                  UserDefaults.standard.set(offset.width, forKey: offsetXKey)
+                  UserDefaults.standard.set(offset.height, forKey: offsetYKey)
+                  UserDefaults.standard.set(isCompact, forKey: compactKey)
+                  UserDefaults.standard.set(transparency, forKey: transparencyKey)
+              }
+
+              func reset() {
+                  offset = .zero
+                  isCompact = false
+                  transparency = 0.85
+                  save()
+              }
+          }
+          '''
+
+          files["Sources/OpeningBook.swift"] = r'''
+          import Foundation
           struct OpeningEntry {
               let name: String
-              let moves: [String]  // UCI moves in order
+              let moves: [String]
           }
-
           enum OpeningBook {
               static let entries: [OpeningEntry] = [
-                  // King's Pawn Openings
                   OpeningEntry(name: "Italian Game", moves: ["e2e4","e7e5","g1f3","b8c6","f1c4","g8f6","d2d3","f8c5"]),
                   OpeningEntry(name: "Ruy Lopez", moves: ["e2e4","e7e5","g1f3","b8c6","f1b5","a7a6","b5a4","g8f6","e1g1","f8e7"]),
                   OpeningEntry(name: "Scotch Game", moves: ["e2e4","e7e5","g1f3","b8c6","d2d4","e5d4","f3d4"]),
                   OpeningEntry(name: "Vienna Game", moves: ["e2e4","e7e5","b1c3"]),
                   OpeningEntry(name: "King's Gambit", moves: ["e2e4","e7e5","f2f4"]),
-                  // Sicilian
                   OpeningEntry(name: "Sicilian Najdorf", moves: ["e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6","b1c3","a7a6"]),
                   OpeningEntry(name: "Sicilian Dragon", moves: ["e2e4","c7c5","g1f3","d7d6","d2d4","c5d4","f3d4","g8f6","b1c3","g7g6"]),
-                  OpeningEntry(name: "Sicilian Sveshnikov", moves: ["e2e4","c7c5","g1f3","b8c6","d2d4","c5d4","f3d4","g8f6","b1c3","e7e5"]),
                   OpeningEntry(name: "Sicilian Alapin", moves: ["e2e4","c7c5","c2c3"]),
                   OpeningEntry(name: "Sicilian Rossolimo", moves: ["e2e4","c7c5","g1f3","b8c6","f1b5"]),
-                  // French / Caro-Kann
                   OpeningEntry(name: "French Defense", moves: ["e2e4","e7e6","d2d4","d7d5"]),
                   OpeningEntry(name: "Caro-Kann Defense", moves: ["e2e4","c7c6","d2d4","d7d5"]),
-                  OpeningEntry(name: "Caro-Kann Advance", moves: ["e2e4","c7c6","d2d4","d7d5","e4e5"]),
-                  // Other 1.e4
                   OpeningEntry(name: "Scandinavian", moves: ["e2e4","d7d5"]),
                   OpeningEntry(name: "Pirc Defense", moves: ["e2e4","d7d6","d2d4","g8f6","b1c3","g7g6"]),
                   OpeningEntry(name: "Alekhine Defense", moves: ["e2e4","g8f6"]),
-                  OpeningEntry(name: "Modern Defense", moves: ["e2e4","g7g6"]),
-                  // Queen's Pawn
+                  OpeningEntry(name: "Bird's Opening", moves: ["f2f4"]),
+                  OpeningEntry(name: "From's Gambit", moves: ["f2f4","e7e5"]),
                   OpeningEntry(name: "Queen's Gambit", moves: ["d2d4","d7d5","c2c4"]),
                   OpeningEntry(name: "Queen's Gambit Declined", moves: ["d2d4","d7d5","c2c4","e7e6"]),
                   OpeningEntry(name: "Queen's Gambit Accepted", moves: ["d2d4","d7d5","c2c4","d5c4"]),
                   OpeningEntry(name: "Slav Defense", moves: ["d2d4","d7d5","c2c4","c7c6"]),
                   OpeningEntry(name: "London System", moves: ["d2d4","d7d5","g1f3","g8f6","c1f4"]),
-                  OpeningEntry(name: "London System (early)", moves: ["d2d4","g8f6","g1f3","d7d5","c1f4"]),
-                  OpeningEntry(name: "Colle System", moves: ["d2d4","d7d5","g1f3","g8f6","e2e3"]),
-                  // Indian Defenses
                   OpeningEntry(name: "King's Indian Defense", moves: ["d2d4","g8f6","c2c4","g7g6","b1c3","f8g7"]),
                   OpeningEntry(name: "Nimzo-Indian", moves: ["d2d4","g8f6","c2c4","e7e6","b1c3","f8b4"]),
                   OpeningEntry(name: "Queen's Indian", moves: ["d2d4","g8f6","c2c4","e7e6","g1f3","b7b6"]),
                   OpeningEntry(name: "Grunfeld Defense", moves: ["d2d4","g8f6","c2c4","g7g6","b1c3","d7d5"]),
-                  OpeningEntry(name: "Benoni Defense", moves: ["d2d4","g8f6","c2c4","c7c5","d4d5"]),
                   OpeningEntry(name: "Dutch Defense", moves: ["d2d4","f7f5"]),
-                  // Flank openings
                   OpeningEntry(name: "English Opening", moves: ["c2c4"]),
                   OpeningEntry(name: "Reti Opening", moves: ["g1f3","d7d5","c2c4"]),
-                  OpeningEntry(name: "Larsen Opening", moves: ["b2b3"]),
-                  OpeningEntry(name: "Bird's Opening", moves: ["f2f4"]),
               ]
-
-              /// Find matching opening by move history.
-              /// Returns (name, nextMove) if history matches prefix of a known opening.
               static func lookup(history: [String]) -> (name: String, nextMove: String?)? {
                   guard !history.isEmpty else { return nil }
                   var bestMatch: (name: String, nextMove: String?)? = nil
                   var bestLen = 0
                   for entry in entries {
-                      // History must be a prefix of the entry's moves
                       guard history.count <= entry.moves.count else { continue }
                       let prefix = Array(entry.moves.prefix(history.count))
-                      if prefix == history {
-                          if history.count > bestLen {
-                              bestLen = history.count
-                              let next = history.count < entry.moves.count ? entry.moves[history.count] : nil
-                              bestMatch = (name: entry.name, nextMove: next)
-                          }
+                      if prefix == history && history.count > bestLen {
+                          bestLen = history.count
+                          let next = history.count < entry.moves.count ? entry.moves[history.count] : nil
+                          bestMatch = (name: entry.name, nextMove: next)
                       }
                   }
                   return bestMatch
@@ -265,53 +464,43 @@ jobs:
           }
           '''
 
-          # NEW: Analysis cache
           files["Sources/AnalysisCache.swift"] = r'''
           import Foundation
-
-          /// In-memory cache of previously-analyzed positions.
-          /// Same FEN → instant response, no API call.
-          /// Limited to 200 entries, LRU eviction.
           actor AnalysisCache {
               static let shared = AnalysisCache()
-
               private struct Entry {
                   let moves: [TopMove]
                   let depth: Int
                   let sources: String
-                  let confidence: Int  // 1-3
-                  let timestamp: Date
+                  let confidence: Int
               }
-
               private var cache: [String: Entry] = [:]
               private var accessOrder: [String] = []
               private let maxEntries = 200
 
               func get(fen: String) -> (moves: [TopMove], depth: Int, sources: String, confidence: Int)? {
                   guard let entry = cache[fen] else { return nil }
-                  // Move to end (recent access)
                   accessOrder.removeAll { $0 == fen }
                   accessOrder.append(fen)
                   return (entry.moves, entry.depth, entry.sources, entry.confidence)
               }
-
               func set(fen: String, moves: [TopMove], depth: Int, sources: String, confidence: Int) {
-                  cache[fen] = Entry(moves: moves, depth: depth, sources: sources,
-                                     confidence: confidence, timestamp: Date())
+                  cache[fen] = Entry(moves: moves, depth: depth, sources: sources, confidence: confidence)
                   accessOrder.removeAll { $0 == fen }
                   accessOrder.append(fen)
-                  // Evict oldest if over limit
                   while accessOrder.count > maxEntries {
                       let oldest = accessOrder.removeFirst()
                       cache.removeValue(forKey: oldest)
                   }
               }
-
+              func remove(fen: String) {
+                  cache.removeValue(forKey: fen)
+                  accessOrder.removeAll { $0 == fen }
+              }
               func clear() {
                   cache.removeAll()
                   accessOrder.removeAll()
               }
-
               func count() -> Int { cache.count }
           }
           '''
@@ -327,8 +516,8 @@ jobs:
               let evaluationCp: Int?
               let mateIn: Int?
               let depth: Int
-              let source: String  // "lc" | "cA" | "sf" | "book" | "cache"
-              let votes: Int      // how many engines agreed on this move
+              let source: String
+              let votes: Int
               var evalString: String {
                   if let m = mateIn, m != 0 { return "M\(abs(m))" }
                   if let cp = evaluationCp { return String(format: "%+.2f", Double(cp)/100.0) }
@@ -350,8 +539,8 @@ jobs:
               let bestMove: TopMove?
               let depth: Int
               let sourcesUsed: String
-              let confidence: Int  // 1-3 (how many sources agreed)
-              let threatMove: TopMove?  // opponent's best next move (threat detection)
+              let confidence: Int
+              let debugFen: String
           }
 
           enum EngineError: Error, LocalizedError {
@@ -370,8 +559,6 @@ jobs:
           }
 
           enum EngineService {
-
-              // MARK: - Source 1: Lichess Cloud (real MultiPV=3)
               static func callLichessCloud(fen: String) async -> [TopMove]? {
                   var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
                   comps.queryItems = [
@@ -398,17 +585,14 @@ jobs:
                           guard !firstMove.isEmpty else { continue }
                           let cp = pv["cp"] as? Int
                           let mate = pv["mate"] as? Int
-                          moves.append(TopMove(
-                              rank: idx + 1, uci: firstMove, san: firstMove,
-                              evaluationCp: cp, mateIn: (mate == 0 ? nil : mate),
-                              depth: depth, source: "lc", votes: 1
-                          ))
+                          moves.append(TopMove(rank: idx + 1, uci: firstMove, san: firstMove,
+                                               evaluationCp: cp, mateIn: (mate == 0 ? nil : mate),
+                                               depth: depth, source: "lc", votes: 1))
                       }
                       return moves
                   } catch { return nil }
               }
 
-              // MARK: - Source 2: chess-api.com (live Stockfish)
               static func callChessApi(fen: String) async -> TopMove? {
                   guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
                   var req = URLRequest(url: url)
@@ -436,7 +620,6 @@ jobs:
                   } catch { return nil }
               }
 
-              // MARK: - Source 3: stockfish.online
               static func callStockfishOnline(fen: String) async -> TopMove? {
                   var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
                   comps.queryItems = [
@@ -470,9 +653,6 @@ jobs:
                   } catch { return nil }
               }
 
-              /// HYBRID: run all 3 in parallel, stream results as they arrive.
-              /// Combine intelligently: merge Lichess top-3 with chess-api & stockfish votes.
-              /// Confidence = how many engines agreed on #1.
               static func analyzeStreaming(fen: String,
                                             moveHistory: [String],
                                             onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
@@ -480,7 +660,7 @@ jobs:
                       throw EngineError.badFen(issue)
                   }
 
-                  // === Layer 1: Cache lookup (instant)
+                  // Cache lookup
                   if let cached = await AnalysisCache.shared.get(fen: fen) {
                       let cachedMoves = cached.moves.enumerated().map { (i, m) in
                           TopMove(rank: i + 1, uci: m.uci, san: m.san,
@@ -488,37 +668,14 @@ jobs:
                                   depth: m.depth, source: "cache", votes: m.votes)
                       }
                       let a = EngineAnalysis(
-                          topMoves: cachedMoves,
-                          bestMove: cachedMoves.first,
-                          depth: cached.depth,
-                          sourcesUsed: "cache · \(cached.sources)",
-                          confidence: cached.confidence,
-                          threatMove: nil
-                      )
+                          topMoves: cachedMoves, bestMove: cachedMoves.first,
+                          depth: cached.depth, sourcesUsed: "cache",
+                          confidence: cached.confidence, debugFen: fen)
                       await MainActor.run { onUpdate(a) }
                       return a
                   }
 
-                  // === Layer 2: Opening book (instant, no API)
-                  if moveHistory.count <= 15,
-                     let bookMatch = OpeningBook.lookup(history: moveHistory),
-                     let next = bookMatch.nextMove {
-                      let bookMove = TopMove(
-                          rank: 1, uci: next, san: next,
-                          evaluationCp: 0, mateIn: nil, depth: 99,
-                          source: "book", votes: 3  // book = high confidence
-                      )
-                      // Also try engines in parallel to verify
-                      let bookAnalysis = EngineAnalysis(
-                          topMoves: [bookMove], bestMove: bookMove,
-                          depth: 99, sourcesUsed: "book: \(bookMatch.name)",
-                          confidence: 3, threatMove: nil
-                      )
-                      await MainActor.run { onUpdate(bookAnalysis) }
-                      // Continue to engines below for verification/more moves
-                  }
-
-                  // === Layer 3: HYBRID — 3 engines in parallel
+                  // 3 engines in parallel
                   async let lichessResult = callLichessCloud(fen: fen)
                   async let chessApiResult = callChessApi(fen: fen)
                   async let stockfishResult = callStockfishOnline(fen: fen)
@@ -530,10 +687,8 @@ jobs:
                   let sf = await stockfishResult
                   try Task.checkCancellation()
 
-                  // Merge all results — count votes for each unique UCI
+                  // Merge results by voting
                   var moveVotes: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
-
-                  // Add Lichess moves (all 3)
                   if let lcMoves = lichess {
                       for m in lcMoves {
                           if var existing = moveVotes[m.uci] {
@@ -545,7 +700,6 @@ jobs:
                           }
                       }
                   }
-                  // Add chess-api result
                   if let m = cA {
                       if var existing = moveVotes[m.uci] {
                           existing.votes += 1
@@ -555,7 +709,6 @@ jobs:
                           moveVotes[m.uci] = (m, 1, ["cA"])
                       }
                   }
-                  // Add stockfish.online result
                   if let m = sf {
                       if var existing = moveVotes[m.uci] {
                           existing.votes += 1
@@ -573,43 +726,40 @@ jobs:
                       throw EngineError.allEnginesFailed
                   }
 
-                  // Sort by (votes DESC, then score DESC)
                   let sortedEntries = moveVotes.values.sorted { a, b in
                       if a.votes != b.votes { return a.votes > b.votes }
                       return a.move.rankScore > b.move.rankScore
                   }
 
                   let finalMoves: [TopMove] = sortedEntries.prefix(3).enumerated().map { (idx, entry) in
-                      TopMove(
-                          rank: idx + 1,
-                          uci: entry.move.uci,
-                          san: entry.move.san,
-                          evaluationCp: entry.move.evaluationCp,
-                          mateIn: entry.move.mateIn,
-                          depth: entry.move.depth,
-                          source: entry.sources.joined(separator: "+"),
-                          votes: entry.votes
-                      )
+                      TopMove(rank: idx + 1, uci: entry.move.uci, san: entry.move.san,
+                              evaluationCp: entry.move.evaluationCp, mateIn: entry.move.mateIn,
+                              depth: entry.move.depth,
+                              source: entry.sources.joined(separator: "+"),
+                              votes: entry.votes)
                   }
 
                   let topVotes = finalMoves.first?.votes ?? 1
                   let allSources = Array(Set(moveVotes.values.flatMap { $0.sources })).sorted().joined(separator: "+")
                   let bestDepth = finalMoves.map { $0.depth }.max() ?? 13
 
+                  // SANITY CHECK: if all 3 moves have identical eval, FEN is likely wrong
+                  // Don't cache in this case!
+                  let evalsAreIdentical = finalMoves.count >= 2 &&
+                      finalMoves.allSatisfy { $0.evaluationCp == finalMoves.first?.evaluationCp }
+                  let shouldCache = !evalsAreIdentical
+
                   let analysis = EngineAnalysis(
-                      topMoves: finalMoves,
-                      bestMove: finalMoves.first,
-                      depth: bestDepth,
-                      sourcesUsed: allSources,
-                      confidence: min(topVotes, 3),
-                      threatMove: nil  // filled by prefetch elsewhere
+                      topMoves: finalMoves, bestMove: finalMoves.first,
+                      depth: bestDepth, sourcesUsed: allSources,
+                      confidence: min(topVotes, 3), debugFen: fen
                   )
 
-                  // Cache the result
-                  await AnalysisCache.shared.set(
-                      fen: fen, moves: finalMoves, depth: bestDepth,
-                      sources: allSources, confidence: min(topVotes, 3)
-                  )
+                  if shouldCache {
+                      await AnalysisCache.shared.set(
+                          fen: fen, moves: finalMoves, depth: bestDepth,
+                          sources: allSources, confidence: min(topVotes, 3))
+                  }
 
                   await MainActor.run { onUpdate(analysis) }
                   return analysis
@@ -673,41 +823,43 @@ jobs:
           struct SettingsView: View {
               @ObservedObject var stealth: StealthManager
               @ObservedObject var engine: EngineViewModel
+              @StateObject private var overlayPos = OverlayPosition()
               @State private var cacheCount = 0
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Engine (v4.3 Hybrid)") {
-                              HStack {
-                                  Circle().fill(.blue).frame(width: 10, height: 10)
-                                  Text("Lichess Cloud (top-3)").font(.subheadline)
+                          Section("Overlay (v4.4 draggable)") {
+                              Text("Drag the overlay anywhere on screen. Long-press = pick up. Tap Reset to return to bottom.")
+                                  .font(.caption).foregroundColor(.secondary)
+                              Toggle("Compact mode (40% smaller)", isOn: $overlayPos.isCompact)
+                                  .onChange(of: overlayPos.isCompact) { _, _ in overlayPos.save() }
+                              VStack(alignment: .leading) {
+                                  Text("Transparency: \(Int(overlayPos.transparency * 100))%").font(.caption)
+                                  Slider(value: $overlayPos.transparency, in: 0.3...1.0)
+                                      .onChange(of: overlayPos.transparency) { _, _ in overlayPos.save() }
                               }
-                              HStack {
-                                  Circle().fill(.orange).frame(width: 10, height: 10)
-                                  Text("chess-api.com (live)").font(.subheadline)
-                              }
-                              HStack {
-                                  Circle().fill(.cyan).frame(width: 10, height: 10)
-                                  Text("stockfish.online").font(.subheadline)
-                              }
-                              Text("All 3 run in parallel. Moves with more votes rank higher. Confidence = how many engines agreed.")
+                              Button("Reset overlay position") { overlayPos.reset() }
+                          }
+                          Section("Engine (Hybrid 3-way)") {
+                              HStack { Circle().fill(.blue).frame(width: 10, height: 10); Text("Lichess Cloud").font(.subheadline) }
+                              HStack { Circle().fill(.orange).frame(width: 10, height: 10); Text("chess-api.com").font(.subheadline) }
+                              HStack { Circle().fill(.cyan).frame(width: 10, height: 10); Text("stockfish.online").font(.subheadline) }
+                              Text("Fixed FEN: proper castling tracking + en-passant detection.")
                                   .font(.caption).foregroundColor(.secondary)
                           }
-                          Section("Confidence badges") {
-                              HStack { Text("🟢 3/3").bold(); Text("All engines agreed").font(.caption).foregroundColor(.secondary) }
-                              HStack { Text("🟡 2/3").bold(); Text("Two agreed, one differs").font(.caption).foregroundColor(.secondary) }
-                              HStack { Text("🟠 1/3").bold(); Text("All disagree — pick carefully").font(.caption).foregroundColor(.secondary) }
-                          }
-                          Section("Smart features") {
-                              Label("Opening book (first 15 moves)", systemImage: "book.closed.fill")
-                              Label("Position cache (\(cacheCount) entries)", systemImage: "memorychip")
-                              Label("Threat detection", systemImage: "exclamationmark.shield.fill")
-                              Label("3-engine consensus", systemImage: "person.3.fill")
+                          Section("Debug") {
+                              Text("Current FEN:").font(.caption)
+                              Text(engine.currentFEN.isEmpty ? "(none)" : engine.currentFEN)
+                                  .font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(3)
+                              Text("Cache: \(cacheCount) positions").font(.caption)
                               Button("Clear cache") {
                                   Task {
                                       await AnalysisCache.shared.clear()
                                       cacheCount = await AnalysisCache.shared.count()
                                   }
+                              }
+                              Button("Reset FEN tracker (new game)") {
+                                  engine.resetFenTracker()
                               }
                           }
                           Section("Panic (shake to hide/show)") {
@@ -721,16 +873,12 @@ jobs:
                           Section("Status") {
                               LabeledContent("Visible", value: stealth.overlayVisible ? "Yes" : "No")
                               LabeledContent("Recorded", value: stealth.isBeingRecorded ? "Yes" : "No")
-                              if !stealth.lastHideReason.isEmpty {
-                                  LabeledContent("Last hide", value: stealth.lastHideReason)
-                              }
                               Button("Show overlay") { stealth.show() }
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "4.3.0 (43)")
-                              LabeledContent("Engine", value: "Hybrid 3-way voting")
-                              LabeledContent("Session bridge", value: String(StealthConfig.bridgeName.prefix(8)))
+                              LabeledContent("Version", value: "4.4.0 (44)")
+                              LabeledContent("Engine", value: "Hybrid + fixed FEN")
                           }
                       }
                       .navigationTitle("Settings")
@@ -775,9 +923,8 @@ jobs:
               @Published var errorMessage = ""
               @Published var isOffline = false
               @Published var sourcesUsed = ""
-              @Published var engineConfidence: Int = 0  // 1-3 votes
+              @Published var engineConfidence: Int = 0
               @Published var openingName = ""
-              @Published var threatMove: TopMove? = nil  // opponent's best next
               @Published var detectedPlayerColor = "w"
               @Published var manualPlayerColor: String? = nil
               @Published var sideToMove = "w"
@@ -793,15 +940,14 @@ jobs:
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
               var isMyTurn: Bool { effectivePlayerColor == sideToMove }
 
+              private let fenBuilder = FenBuilder()
               private var previousEvalWhitePOV: Double? = nil
               private var lastSuccessfulFEN = ""
               private var analysisTask: Task<Void, Never>?
               private var debounceTask: Task<Void, Never>?
               private var retryTask: Task<Void, Never>?
-              private var threatTask: Task<Void, Never>?
               private var pendingFEN = ""
               private var pendingFENCount = 0
-              // Move history for opening book
               private var moveHistoryUCI: [String] = []
               private var lastKnownPly: Int = -1
 
@@ -813,6 +959,14 @@ jobs:
                   }
               }
               func flipColor() { setManualColor(effectivePlayerColor == "w" ? "b" : "w") }
+
+              func resetFenTracker() {
+                  fenBuilder.reset()
+                  moveHistoryUCI = []
+                  lastKnownPly = -1
+                  openingName = ""
+                  Task { await AnalysisCache.shared.clear() }
+              }
 
               struct BoardPayload {
                   let grid: String, sideToMove: String
@@ -830,21 +984,40 @@ jobs:
                   if p.bottomColor == "w" || p.bottomColor == "b" {
                       detectedPlayerColor = p.bottomColor
                   }
-                  // Track move history for opening book
+                  // Track move history
                   if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
                       moveHistoryUCI.append(p.lastMoveUCI)
                       lastKnownPly = p.plyCount
                   }
-                  // Reset history if game restarted
+                  // Reset on new game
                   if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 {
-                      moveHistoryUCI = []
+                      resetFenTracker()
                       lastKnownPly = p.plyCount
-                      openingName = ""
                   }
-                  let board = buildFENBoard(from: p.grid, flipped: p.flipped)
-                  let castling = deriveCastling(from: p.grid, flipped: p.flipped)
-                  let full = max(1, (p.plyCount / 2) + 1)
-                  let fen = "\(board) \(p.sideToMove) \(castling) - 0 \(full)"
+
+                  // Convert grid string to 2D array
+                  let chars = Array(p.grid)
+                  guard chars.count == 64 else { return }
+                  var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
+                  for r in 0..<8 {
+                      for c in 0..<8 {
+                          grid[r][c] = chars[r * 8 + c]
+                      }
+                  }
+                  // Unflip if needed
+                  if p.flipped {
+                      var flipped: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
+                      for r in 0..<8 {
+                          for c in 0..<8 {
+                              flipped[r][c] = grid[7 - r][7 - c]
+                          }
+                      }
+                      grid = flipped
+                  }
+
+                  // Build accurate FEN using the tracker
+                  let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
+
                   if let _ = FenValidator.validate(fen) { return }
                   if fen == pendingFEN { pendingFENCount += 1 }
                   else { pendingFEN = fen; pendingFENCount = 1 }
@@ -856,7 +1029,6 @@ jobs:
                       errorMessage = ""
                       sourcesUsed = ""
                       engineConfidence = 0
-                      threatMove = nil
                       queueAnalyze(fen: fen)
                   }
               }
@@ -876,20 +1048,16 @@ jobs:
                   analysisTask?.cancel()
                   isThinking = true
                   errorMessage = ""
-
-                  // Check opening book match immediately
                   if let bookMatch = OpeningBook.lookup(history: moveHistoryUCI) {
                       openingName = bookMatch.name
                   } else {
                       openingName = ""
                   }
-
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
                           let a = try await EngineService.analyzeStreaming(
-                              fen: fen,
-                              moveHistory: self.moveHistoryUCI
+                              fen: fen, moveHistory: self.moveHistoryUCI
                           ) { partial in
                               guard fen == self.currentFEN else { return }
                               self.topMoves = partial.topMoves
@@ -918,11 +1086,6 @@ jobs:
                               self.computeQuality(cur: wpov)
                               self.previousEvalWhitePOV = wpov
                           }
-                          // === THREAT DETECTION ===
-                          // If it's opponent's turn, find what they're threatening
-                          if !self.isMyTurn, let best = a.bestMove {
-                              await self.computeThreat(afterFen: fen, opponentMove: best.uci)
-                          }
                       } catch {
                           if Task.isCancelled { return }
                           guard fen == self.currentFEN else { return }
@@ -932,16 +1095,15 @@ jobs:
                               self.evaluation = "—"
                               self.sourcesUsed = ""
                               self.engineConfidence = 0
-                              self.threatMove = nil
                               if let engineError = error as? EngineError {
                                   switch engineError {
                                   case .networkOffline:
                                       self.isOffline = true
-                                      self.errorMessage = "Offline — all engines unreachable"
+                                      self.errorMessage = "Offline"
                                       self.scheduleRetry(fen: fen)
                                   case .allEnginesFailed:
                                       self.isOffline = true
-                                      self.errorMessage = "All engines down. Retrying…"
+                                      self.errorMessage = "Engines down"
                                       self.scheduleRetry(fen: fen)
                                   case .badFen(let msg):
                                       self.errorMessage = "Bad FEN: \(msg)"
@@ -949,30 +1111,10 @@ jobs:
                                   }
                               } else {
                                   self.isOffline = true
-                                  self.errorMessage = "Error — retrying…"
+                                  self.errorMessage = "Error"
                                   self.scheduleRetry(fen: fen)
                               }
                           }
-                      }
-                  }
-              }
-
-              /// Compute what the opponent is threatening (their best move)
-              private func computeThreat(afterFen fen: String, opponentMove: String) async {
-                  threatTask?.cancel()
-                  threatTask = Task { [weak self] in
-                      guard let self = self else { return }
-                      // Simulate opponent's move by asking: what's THEIR best?
-                      // Since we're analyzing THEIR turn, the "best move" IS their threat.
-                      // Just surface the top move as the threat if it's dangerous.
-                      guard let best = self.topMoves.first else { return }
-                      // Threat = any move that reduces our win chance below 40%
-                      let ourWin = self.effectivePlayerColor == self.sideToMove
-                          ? best.winChance : (100 - best.winChance)
-                      if ourWin < 40 {
-                          await MainActor.run { self.threatMove = best }
-                      } else {
-                          await MainActor.run { self.threatMove = nil }
                       }
                   }
               }
@@ -1014,45 +1156,6 @@ jobs:
                   default: lastMoveQuality = .blunder
                   }
               }
-
-              private func buildFENBoard(from g: String, flipped: Bool) -> String {
-                  var c = Array(g); guard c.count == 64 else { return "8/8/8/8/8/8/8/8" }
-                  if flipped {
-                      var f: [Character] = Array(repeating: ".", count: 64)
-                      for r in 0..<8 { for x in 0..<8 { f[r*8+x] = c[(7-r)*8+(7-x)] } }
-                      c = f
-                  }
-                  var rows: [String] = []
-                  for r in 0..<8 {
-                      var row = ""; var empty = 0
-                      for f in 0..<8 {
-                          let ch = c[r*8+f]
-                          if ch == "." { empty += 1 }
-                          else { if empty > 0 { row += "\(empty)"; empty = 0 }; row.append(ch) }
-                      }
-                      if empty > 0 { row += "\(empty)" }
-                      rows.append(row)
-                  }
-                  return rows.joined(separator: "/")
-              }
-
-              private func deriveCastling(from g: String, flipped: Bool) -> String {
-                  var c = Array(g); guard c.count == 64 else { return "-" }
-                  if flipped {
-                      var f: [Character] = Array(repeating: ".", count: 64)
-                      for r in 0..<8 { for x in 0..<8 { f[r*8+x] = c[(7-r)*8+(7-x)] } }
-                      c = f
-                  }
-                  func p(_ file: Int, _ row: Int) -> Character { c[row*8+file] }
-                  var s = ""
-                  let wk = p(4,7) == "K"
-                  if wk && p(7,7) == "R" { s += "K" }
-                  if wk && p(0,7) == "R" { s += "Q" }
-                  let bk = p(4,0) == "k"
-                  if bk && p(7,0) == "r" { s += "k" }
-                  if bk && p(0,0) == "r" { s += "q" }
-                  return s.isEmpty ? "-" : s
-              }
           }
           '''
 
@@ -1062,14 +1165,22 @@ jobs:
               @ObservedObject var engine: EngineViewModel
               @ObservedObject var stealth: StealthManager
               @ObservedObject var router: AppRouter
+              @StateObject private var overlayPos = OverlayPosition()
               @State private var showDisclaimer = true
+              @State private var dragOffset: CGSize = .zero
+              @State private var isDragging = false
+
               var body: some View {
                   VStack(spacing: 0) {
                       nav
-                      ZStack(alignment: .bottom) {
+                      ZStack {
                           ChessWebView(engine: engine, router: router)
-                          HelperOverlay(engine: engine, stealth: stealth)
-                              .padding(.horizontal, 12).padding(.bottom, 8)
+                          // Draggable overlay - positioned absolutely
+                          if stealth.overlayVisible {
+                              draggableOverlay
+                          } else {
+                              revealButton
+                          }
                       }
                   }
                   .overlay(alignment: .center) {
@@ -1078,6 +1189,55 @@ jobs:
                       }
                   }
               }
+
+              private var draggableOverlay: some View {
+                  GeometryReader { geo in
+                      HelperOverlay(engine: engine, stealth: stealth, overlayPos: overlayPos)
+                          .opacity(isDragging ? 1.0 : overlayPos.transparency)
+                          .position(
+                              x: geo.size.width / 2 + overlayPos.offset.width + dragOffset.width,
+                              y: geo.size.height - 100 + overlayPos.offset.height + dragOffset.height
+                          )
+                          .gesture(
+                              DragGesture(minimumDistance: 5)
+                                  .onChanged { value in
+                                      isDragging = true
+                                      dragOffset = value.translation
+                                  }
+                                  .onEnded { value in
+                                      overlayPos.offset = CGSize(
+                                          width: overlayPos.offset.width + value.translation.width,
+                                          height: overlayPos.offset.height + value.translation.height
+                                      )
+                                      dragOffset = .zero
+                                      isDragging = false
+                                      overlayPos.save()
+                                  }
+                          )
+                  }
+              }
+
+              private var revealButton: some View {
+                  VStack {
+                      Spacer()
+                      HStack {
+                          Spacer()
+                          Button { stealth.show() } label: {
+                              HStack(spacing: 6) {
+                                  Image(systemName: "eye.fill").font(.body)
+                                  Text("Show").font(.footnote.bold())
+                              }
+                              .padding(.horizontal, 14).padding(.vertical, 10)
+                              .background(Color.green)
+                              .foregroundColor(.white)
+                              .cornerRadius(20)
+                              .shadow(color: .black.opacity(0.5), radius: 6, y: 2)
+                          }
+                          .padding()
+                      }
+                  }
+              }
+
               private var nav: some View {
                   HStack(spacing: 8) {
                       btn("house.fill", "Home") { router.openInPlay("https://www.chess.com/") }
@@ -1105,8 +1265,8 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v4.3").font(.title2.bold())
-                      Text("HYBRID 3-ENGINE VOTING\n\n🟢 3/3 votes = definite best\n🟡 2/3 votes = probable best\n🟠 1/3 votes = uncertain\n\n✨ Opening book (first 15 moves)\n✨ Position cache (instant repeats)\n✨ Threat detection (opponent's plan)\n✨ Consensus voting\n\nShake = hide/show")
+                      Text("Chess Helper v4.4").font(.title2.bold())
+                      Text("FIXED FEN + DRAGGABLE\n\n✅ Accurate castling tracking\n✅ En-passant detection\n✅ Drag overlay anywhere\n✅ Adjustable transparency\n✅ Compact mode\n\nShake = hide/show")
                           .font(.footnote).foregroundColor(.white.opacity(0.85))
                           .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -1124,133 +1284,144 @@ jobs:
           struct HelperOverlay: View {
               @ObservedObject var engine: EngineViewModel
               @ObservedObject var stealth: StealthManager
+              @ObservedObject var overlayPos: OverlayPosition
               @State private var expanded = true
-              @State private var selectedMoveIdx: Int? = nil
+
+              private var scale: CGFloat { overlayPos.isCompact ? 0.75 : 1.0 }
+              private var maxWidth: CGFloat { overlayPos.isCompact ? 280 : 360 }
+
               var body: some View {
-                  Group {
-                      if stealth.overlayVisible {
-                          if stealth.minimalMode { dot } else { panel }
-                      } else {
-                          Button { stealth.show() } label: {
-                              HStack(spacing: 6) {
-                                  Image(systemName: "eye.fill").font(.body)
-                                  Text("Show Helper").font(.footnote.bold())
-                              }
-                              .padding(.horizontal, 14).padding(.vertical, 10)
-                              .background(Color.green)
-                              .foregroundColor(.white)
-                              .cornerRadius(20)
-                              .shadow(color: .black.opacity(0.5), radius: 6, y: 2)
-                          }
-                      }
+                  if stealth.minimalMode {
+                      dot
+                  } else {
+                      panel
+                          .frame(maxWidth: maxWidth)
                   }
               }
+
               private var dot: some View {
                   Button { stealth.toggleMinimalMode() } label: {
                       Circle().fill(dotColor)
-                          .frame(width: 14, height: 14)
-                          .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1))
+                          .frame(width: 24, height: 24)
+                          .overlay(Circle().stroke(Color.white.opacity(0.4), lineWidth: 1))
+                          .shadow(radius: 3)
                   }
               }
               private var dotColor: Color {
                   if engine.isOffline { return .red }
-                  if engine.threatMove != nil { return .red }
                   if engine.isMyTurn { return .green }
                   return .gray
               }
+
               private var panel: some View {
                   VStack(spacing: 0) {
                       header
                       if expanded {
                           if engine.isOffline { offlineBanner }
-                          if let threat = engine.threatMove, !engine.isMyTurn { threatBanner(threat) }
                           if !engine.openingName.isEmpty { openingBanner }
-                          colorRow
                           bestMoveHighlight
-                          movesSection
-                          lastMoveSection
-                          errorSection
+                          if !overlayPos.isCompact { movesSection }
+                          if !overlayPos.isCompact && engine.lastMoveQuality != .none {
+                              lastMoveSection
+                          }
+                          if !engine.errorMessage.isEmpty && !engine.isOffline {
+                              errorSection
+                          }
                       }
                   }
-                  .background(.ultraThinMaterial).cornerRadius(16)
-                  .overlay(RoundedRectangle(cornerRadius: 16).stroke(borderColor, lineWidth: 1))
-                  .shadow(color: .black.opacity(0.35), radius: 10, y: 3)
+                  .background(.ultraThinMaterial)
+                  .cornerRadius(12)
+                  .overlay(RoundedRectangle(cornerRadius: 12).stroke(borderColor, lineWidth: 1))
+                  .shadow(color: .black.opacity(0.4), radius: 8, y: 3)
               }
+
               private var borderColor: Color {
                   if engine.isOffline { return Color.red.opacity(0.5) }
-                  if engine.threatMove != nil { return Color.red.opacity(0.4) }
-                  return Color.white.opacity(0.08)
+                  return Color.white.opacity(0.15)
               }
+
+              private var header: some View {
+                  HStack(spacing: 8) {
+                      Image(systemName: "hand.draw.fill")
+                          .font(.caption2).foregroundColor(.white.opacity(0.5))
+                      Circle().fill(engine.isOffline ? Color.red : Color.green)
+                          .frame(width: 6, height: 6)
+                      Text("Helper").font(.caption.bold())
+                      if engine.isThinking { ProgressView().scaleEffect(0.5) }
+                      Spacer()
+                      Text(engine.isMyTurn ? "Your turn" : "Wait")
+                          .font(.caption2.bold())
+                          .foregroundColor(engine.isMyTurn ? .green : .secondary)
+                      Button { stealth.toggleMinimalMode() } label: {
+                          Image(systemName: "eye.slash.fill").font(.caption)
+                      }
+                      Button { withAnimation { expanded.toggle() } } label: {
+                          Image(systemName: expanded ? "chevron.down" : "chevron.up").font(.caption2)
+                      }
+                  }
+                  .padding(.horizontal, 10).padding(.vertical, 6)
+                  .contentShape(Rectangle())
+              }
+
               private var offlineBanner: some View {
-                  HStack(spacing: 6) {
-                      Image(systemName: "wifi.slash").font(.caption).foregroundColor(.red)
-                      Text("OFFLINE — all engines unreachable")
-                          .font(.caption2.bold()).foregroundColor(.red)
+                  HStack(spacing: 4) {
+                      Image(systemName: "wifi.slash").font(.caption2).foregroundColor(.red)
+                      Text("OFFLINE").font(.caption2.bold()).foregroundColor(.red)
                       Spacer()
-                      ProgressView().scaleEffect(0.6)
+                      ProgressView().scaleEffect(0.5)
                   }
-                  .padding(.horizontal, 12).padding(.vertical, 4)
+                  .padding(.horizontal, 10).padding(.vertical, 3)
                   .background(Color.red.opacity(0.15))
               }
-              private func threatBanner(_ threat: TopMove) -> some View {
-                  HStack(spacing: 6) {
-                      Image(systemName: "exclamationmark.triangle.fill").font(.caption).foregroundColor(.red)
-                      Text("⚠️ THREAT: \(threat.san.isEmpty ? threat.uci : threat.san)")
-                          .font(.caption2.bold()).foregroundColor(.red)
-                      Spacer()
-                      Text(threat.evalString).font(.caption2.monospaced()).foregroundColor(.red)
-                  }
-                  .padding(.horizontal, 12).padding(.vertical, 4)
-                  .background(Color.red.opacity(0.15))
-              }
+
               private var openingBanner: some View {
-                  HStack(spacing: 6) {
-                      Image(systemName: "book.closed.fill").font(.caption).foregroundColor(.purple)
-                      Text(engine.openingName)
-                          .font(.caption2.bold()).foregroundColor(.purple)
+                  HStack(spacing: 4) {
+                      Image(systemName: "book.closed.fill").font(.caption2).foregroundColor(.purple)
+                      Text(engine.openingName).font(.caption2.bold()).foregroundColor(.purple).lineLimit(1)
                       Spacer()
                   }
-                  .padding(.horizontal, 12).padding(.vertical, 4)
+                  .padding(.horizontal, 10).padding(.vertical, 3)
                   .background(Color.purple.opacity(0.10))
               }
+
               @ViewBuilder private var bestMoveHighlight: some View {
                   if let best = engine.bestMove {
                       HStack(spacing: 10) {
-                          VStack(alignment: .leading, spacing: 2) {
-                              HStack(spacing: 4) {
-                                  Image(systemName: "star.fill").font(.caption).foregroundColor(confidenceColor)
-                                  Text("BEST MOVE").font(.caption2.bold()).foregroundColor(confidenceColor)
+                          VStack(alignment: .leading, spacing: 1) {
+                              HStack(spacing: 3) {
+                                  Image(systemName: "star.fill").font(.caption2).foregroundColor(confidenceColor)
+                                  Text("BEST").font(.caption2.bold()).foregroundColor(confidenceColor)
                                   confidenceBadge
                               }
                               Text(best.san.isEmpty ? best.uci : best.san)
-                                  .font(.system(size: 32, weight: .black, design: .rounded))
+                                  .font(.system(size: overlayPos.isCompact ? 22 : 28, weight: .black, design: .rounded))
                                   .foregroundColor(confidenceColor)
+                                  .minimumScaleFactor(0.7)
+                                  .lineLimit(1)
                               Text(best.uci)
-                                  .font(.caption.monospaced())
+                                  .font(.caption2.monospaced())
                                   .foregroundColor(.secondary)
                           }
                           Spacer()
-                          VStack(alignment: .trailing, spacing: 2) {
+                          VStack(alignment: .trailing, spacing: 1) {
                               Text(best.evalString)
-                                  .font(.title3.bold().monospaced())
+                                  .font(.callout.bold().monospaced())
                                   .foregroundColor(confidenceColor)
-                              Text("depth \(best.depth)")
+                              Text("d\(best.depth)")
                                   .font(.caption2.monospaced())
                                   .foregroundColor(.secondary)
                               Text(engine.sourcesUsed)
                                   .font(.caption2.monospaced())
-                                  .foregroundColor(.secondary)
+                                  .foregroundColor(.secondary).lineLimit(1)
                           }
                       }
-                      .padding(.horizontal, 14).padding(.vertical, 8)
+                      .padding(.horizontal, 10).padding(.vertical, 6)
                       .background(confidenceColor.opacity(0.15))
-                      .overlay(
-                          RoundedRectangle(cornerRadius: 8)
-                              .stroke(confidenceColor.opacity(0.4), lineWidth: 1)
-                      )
-                      .padding(.horizontal, 8).padding(.vertical, 4)
+                      .overlay(RoundedRectangle(cornerRadius: 6).stroke(confidenceColor.opacity(0.4), lineWidth: 1))
+                      .padding(.horizontal, 6).padding(.vertical, 3)
                   }
               }
+
               private var confidenceColor: Color {
                   switch engine.engineConfidence {
                   case 3: return .green
@@ -1261,7 +1432,7 @@ jobs:
               }
               private var confidenceLabel: String {
                   switch engine.engineConfidence {
-                  case 3: return "3/3 ✓"
+                  case 3: return "3/3"
                   case 2: return "2/3"
                   case 1: return "1/3"
                   default: return "?"
@@ -1270,102 +1441,23 @@ jobs:
               private var confidenceBadge: some View {
                   Text(confidenceLabel)
                       .font(.caption2.bold().monospaced())
-                      .padding(.horizontal, 5).padding(.vertical, 1)
+                      .padding(.horizontal, 4).padding(.vertical, 0)
                       .background(confidenceColor.opacity(0.25))
                       .foregroundColor(confidenceColor)
                       .cornerRadius(3)
               }
-              private var header: some View {
-                  HStack(spacing: 10) {
-                      Circle().fill(engine.isOffline ? Color.red : (engine.enabled ? Color.green : Color.gray))
-                          .frame(width: 8, height: 8)
-                      Text("Helper").font(.subheadline.bold())
-                      HStack(spacing: 4) {
-                          Image(systemName: engine.isMyTurn ? "person.fill" : "hourglass").font(.caption2)
-                          Text(engine.isMyTurn ? "Your turn" : "Waiting").font(.caption2.bold())
-                      }
-                      .foregroundColor(engine.isMyTurn ? .green : .secondary)
-                      if engine.isThinking { ProgressView().scaleEffect(0.7) }
-                      Spacer()
-                      Button { stealth.toggleMinimalMode() } label: {
-                          Image(systemName: stealth.minimalMode ? "eye.slash.fill" : "eye.fill").font(.footnote)
-                      }
-                      Toggle("", isOn: $engine.enabled).labelsHidden().scaleEffect(0.8)
-                      Button { withAnimation { expanded.toggle() } } label: {
-                          Image(systemName: expanded ? "chevron.down" : "chevron.up").font(.footnote.bold())
-                      }
-                  }
-                  .padding(.horizontal, 12).padding(.vertical, 8).contentShape(Rectangle())
-              }
-              private var colorRow: some View {
-                  HStack(spacing: 6) {
-                      Text("I play:").font(.caption2).foregroundColor(.secondary)
-                      cbtn("w", "White", "♔")
-                      cbtn("b", "Black", "♚")
-                      if engine.manualPlayerColor != nil {
-                          Button { engine.setManualColor(nil) } label: {
-                              Text("Auto").font(.caption2)
-                                  .padding(.horizontal, 6).padding(.vertical, 3)
-                                  .background(Color.blue.opacity(0.25)).foregroundColor(.blue).cornerRadius(4)
-                          }
-                      }
-                      Spacer()
-                      if engine.plyCount >= 0 {
-                          Text("ply \(engine.plyCount)").font(.caption2.monospaced()).foregroundColor(.secondary)
-                      }
-                  }
-                  .padding(.horizontal, 12).padding(.bottom, 6)
-              }
-              private func cbtn(_ color: String, _ label: String, _ sym: String) -> some View {
-                  let active = engine.effectivePlayerColor == color
-                  return Button { engine.setManualColor(color) } label: {
-                      HStack(spacing: 3) {
-                          Text(sym).font(.subheadline)
-                          Text(label).font(.caption2.bold())
-                      }
-                      .padding(.horizontal, 8).padding(.vertical, 4)
-                      .background(active ? Color.green.opacity(0.35) : Color.white.opacity(0.10))
-                      .foregroundColor(active ? .green : .white.opacity(0.85))
-                      .cornerRadius(6)
-                  }
-              }
+
               private var movesSection: some View {
-                  VStack(alignment: .leading, spacing: 4) {
+                  VStack(alignment: .leading, spacing: 2) {
                       Divider().opacity(0.3)
-                      HStack {
-                          Text("All candidates (\(engine.topMoves.count))")
-                              .font(.caption).foregroundColor(.secondary)
-                          Spacer()
-                          if !engine.sourcesUsed.isEmpty {
-                              Text(engine.sourcesUsed)
-                                  .font(.caption2.monospaced()).foregroundColor(.secondary)
-                          }
+                      ForEach(Array(engine.topMoves.enumerated()), id: \.element.id) { idx, m in
+                          moveRow(rank: idx + 1, move: m)
                       }
-                      .padding(.horizontal, 14).padding(.top, 6)
-                      if engine.topMoves.isEmpty {
-                          Text(engine.isThinking ? "Analyzing…" : "—")
-                              .font(.body).foregroundColor(.secondary)
-                              .padding(.horizontal, 14).padding(.bottom, 4)
-                      } else {
-                          ForEach(Array(engine.topMoves.enumerated()), id: \.element.id) { idx, m in
-                              moveRow(rank: idx + 1, move: m, isSelected: selectedMoveIdx == idx)
-                                  .onTapGesture {
-                                      selectedMoveIdx = (selectedMoveIdx == idx) ? nil : idx
-                                  }
-                          }
-                      }
-                      GeometryReader { geo in
-                          ZStack(alignment: .leading) {
-                              RoundedRectangle(cornerRadius: 4).fill(Color.black.opacity(0.6))
-                              RoundedRectangle(cornerRadius: 4).fill(Color.white)
-                                  .frame(width: geo.size.width * CGFloat(myWin / 100.0))
-                          }
-                      }
-                      .frame(height: 8).padding(.horizontal, 14).padding(.top, 4)
                   }
+                  .padding(.horizontal, 6).padding(.vertical, 3)
               }
+
               private func rankColor(_ rank: Int, votes: Int) -> Color {
-                  // Color by votes primarily
                   if votes >= 3 { return .green }
                   if votes >= 2 { return .yellow }
                   switch rank {
@@ -1377,73 +1469,46 @@ jobs:
               private func deltaFromBest(_ move: TopMove) -> String? {
                   guard let best = engine.bestMove, best.id != move.id else { return nil }
                   let delta = Int(best.rankScore - move.rankScore)
-                  if delta <= 0 { return "≈" }
-                  return "-\(delta)cp"
+                  if delta <= 0 { return nil }
+                  return "-\(delta)"
               }
-              private func moveRow(rank: Int, move: TopMove, isSelected: Bool) -> some View {
+              private func moveRow(rank: Int, move: TopMove) -> some View {
                   let rc = rankColor(rank, votes: move.votes)
-                  let isBest = rank == 1
-                  return HStack(spacing: 6) {
-                      if isBest {
-                          Image(systemName: "star.fill").foregroundColor(rc).font(.caption).frame(width: 18)
-                      } else {
-                          Text("#\(rank)").font(.caption.bold().monospaced()).foregroundColor(rc).frame(width: 18)
-                      }
+                  return HStack(spacing: 5) {
+                      Text("#\(rank)").font(.caption2.bold().monospaced()).foregroundColor(rc).frame(width: 18)
                       Text(move.san.isEmpty ? move.uci : move.san)
-                          .font(isBest ? .title3.bold() : .callout.bold()).foregroundColor(rc)
-                      Text(move.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
+                          .font(.caption.bold()).foregroundColor(rc)
                       Spacer()
-                      // Votes badge
                       Text("\(move.votes)v")
                           .font(.caption2.bold().monospaced())
-                          .padding(.horizontal, 4).padding(.vertical, 1)
-                          .background(rc.opacity(0.2))
-                          .foregroundColor(rc)
-                          .cornerRadius(3)
-                      if let delta = deltaFromBest(move) {
-                          Text(delta)
-                              .font(.caption2.monospaced())
-                              .foregroundColor(.orange)
+                          .foregroundColor(rc.opacity(0.9))
+                      if let d = deltaFromBest(move) {
+                          Text(d).font(.caption2.monospaced()).foregroundColor(.orange)
                       }
-                      Text(move.evalString).font(.caption.bold().monospaced()).foregroundColor(rc)
-                      if isSelected {
-                          Image(systemName: "checkmark.circle.fill").foregroundColor(rc).font(.caption)
-                      }
+                      Text(move.evalString).font(.caption2.bold().monospaced()).foregroundColor(rc)
                   }
-                  .padding(.horizontal, 14).padding(.vertical, 5)
-                  .background(isSelected ? rc.opacity(0.20) : (isBest ? rc.opacity(0.08) : Color.clear))
-                  .contentShape(Rectangle())
+                  .padding(.horizontal, 6).padding(.vertical, 2)
               }
+
               @ViewBuilder private var lastMoveSection: some View {
-                  if engine.lastMoveQuality != .none && !engine.lastMoveUCI.isEmpty {
-                      HStack(spacing: 8) {
-                          Text(engine.lastMoveWasMine ? "You:" : "Opp:").font(.caption).foregroundColor(.secondary)
-                          Text(engine.lastMoveUCI).font(.caption.monospaced()).foregroundColor(.white.opacity(0.85))
-                          Spacer()
-                          Text(engine.lastMoveQuality.rawValue).font(.caption.bold())
-                              .padding(.horizontal, 6).padding(.vertical, 2)
-                              .background(engine.lastMoveQuality.color.opacity(0.25))
-                              .foregroundColor(engine.lastMoveQuality.color).cornerRadius(4)
-                          if engine.lastMoveCentipawnLoss >= 30 {
-                              Text("-\(engine.lastMoveCentipawnLoss)cp").font(.caption2.monospaced()).foregroundColor(.orange)
-                          }
-                      }
-                      .padding(.horizontal, 14).padding(.top, 4)
+                  HStack(spacing: 4) {
+                      Text(engine.lastMoveWasMine ? "You:" : "Opp:").font(.caption2).foregroundColor(.secondary)
+                      Text(engine.lastMoveUCI).font(.caption2.monospaced()).foregroundColor(.white.opacity(0.85))
+                      Spacer()
+                      Text(engine.lastMoveQuality.rawValue).font(.caption2.bold())
+                          .padding(.horizontal, 4).padding(.vertical, 1)
+                          .background(engine.lastMoveQuality.color.opacity(0.25))
+                          .foregroundColor(engine.lastMoveQuality.color).cornerRadius(3)
                   }
+                  .padding(.horizontal, 10).padding(.bottom, 4)
               }
+
               @ViewBuilder private var errorSection: some View {
-                  if !engine.errorMessage.isEmpty && !engine.isOffline {
-                      HStack(spacing: 6) {
-                          Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange).font(.caption2)
-                          Text(engine.errorMessage).font(.caption2).foregroundColor(.orange).lineLimit(2)
-                      }
-                      .padding(.horizontal, 14).padding(.bottom, 8)
-                  } else {
-                      Color.clear.frame(height: 8)
+                  HStack(spacing: 4) {
+                      Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange).font(.caption2)
+                      Text(engine.errorMessage).font(.caption2).foregroundColor(.orange).lineLimit(2)
                   }
-              }
-              private var myWin: Double {
-                  engine.effectivePlayerColor == engine.sideToMove ? engine.winChance : (100 - engine.winChance)
+                  .padding(.horizontal, 10).padding(.bottom, 4)
               }
           }
           '''
@@ -1562,8 +1627,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>4.3.0</string>
-            <key>CFBundleVersion</key><string>43</string>
+            <key>CFBundleShortVersionString</key><string>4.4.0</string>
+            <key>CFBundleVersion</key><string>44</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -1636,9 +1701,7 @@ jobs:
                 if (grid[r][c] === 'K') wkRow = r;
                 if (grid[r][c] === 'k') bkRow = r;
               }
-              if (wkRow >= 0 && bkRow >= 0) {
-                return { flipped: wkRow < bkRow, confident: true };
-              }
+              if (wkRow >= 0 && bkRow >= 0) return { flipped: wkRow < bkRow, confident: true };
               if (wkRow >= 0) return { flipped: wkRow < 4, confident: true };
               if (bkRow >= 0) return { flipped: bkRow >= 4, confident: true };
               return { flipped: false, confident: false };
@@ -1692,8 +1755,7 @@ jobs:
               var gs='';
               for(var r=0;r<8;r++) for(var c=0;c<8;c++) gs+=g[r][c];
               var py={grid:gs, sideToMove:side, flipped:fi.flipped, flippedConfident:fi.confident,
-                      lastMoveUCI:m?m.uci:'', plyCount:p, detectionConfidence:cf,
-                      bottomColor:bc};
+                      lastMoveUCI:m?m.uci:'', plyCount:p, detectionConfidence:cf, bottomColor:bc};
               var k=JSON.stringify(py);
               if(k!==lastPayload){
                 lastPayload=k;
