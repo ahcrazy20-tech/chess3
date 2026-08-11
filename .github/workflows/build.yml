@@ -1,4 +1,4 @@
-name: Build ChessHelper v4.4
+name: Build ChessHelper v4.5
 
 on:
   push:
@@ -32,8 +32,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "4.4.0"
-              CURRENT_PROJECT_VERSION: "44"
+              MARKETING_VERSION: "4.5.0"
+              CURRENT_PROJECT_VERSION: "45"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -145,7 +145,7 @@ jobs:
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
               ]
               static func randomUserAgent() -> String { userAgents.randomElement()! }
-              static func readerInterval() -> Int { Int.random(in: 600...1200) }
+              static func readerInterval() -> Int { Int.random(in: 500...900) }
               private static func randomName(prefix: String, length: Int) -> String {
                   let chars = "abcdefghijklmnopqrstuvwxyz0123456789"
                   return prefix + String((0..<length).map { _ in chars.randomElement()! })
@@ -184,146 +184,136 @@ jobs:
           }
           '''
 
-          # ============ FIXED FEN Builder with proper castling & EP tracking ============
+          # ============ NEW: Smart FEN Builder (no history accumulation) ============
           files["Sources/FenBuilder.swift"] = r'''
           import Foundation
 
-          /// Builds accurate FEN by tracking game state over time.
-          /// Fixes castling rights and en-passant detection which were broken before.
+          /// Smart FEN builder that DOES NOT accumulate errors.
+          /// Instead of tracking history, it uses direct position analysis.
           @MainActor
           final class FenBuilder {
-              // State that persists across positions
-              private var whiteKingMoved = false
-              private var blackKingMoved = false
-              private var whiteRookA1Moved = false
-              private var whiteRookH1Moved = false
-              private var blackRookA8Moved = false
-              private var blackRookH8Moved = false
-              private var lastEPTarget: String? = nil  // "e3" if pawn just moved 2 squares
-              private var halfmoveClock: Int = 0        // for 50-move rule
-              private var lastGridState: [[Character]]? = nil
+              // Only track things we're SURE about (king/rook that we saw move)
+              private var knownWhiteKingMoved = false
+              private var knownBlackKingMoved = false
+              private var knownWhiteRookA1Moved = false
+              private var knownWhiteRookH1Moved = false
+              private var knownBlackRookA8Moved = false
+              private var knownBlackRookH8Moved = false
+              private var lastEP: String? = nil
+              private var halfmoveClock: Int = 0
+              private var lastGrid: [[Character]]? = nil
               private var lastPly: Int = -1
 
-              /// Reset all tracking (for new game)
               func reset() {
-                  whiteKingMoved = false
-                  blackKingMoved = false
-                  whiteRookA1Moved = false
-                  whiteRookH1Moved = false
-                  blackRookA8Moved = false
-                  blackRookH8Moved = false
-                  lastEPTarget = nil
+                  knownWhiteKingMoved = false
+                  knownBlackKingMoved = false
+                  knownWhiteRookA1Moved = false
+                  knownWhiteRookH1Moved = false
+                  knownBlackRookA8Moved = false
+                  knownBlackRookH8Moved = false
+                  lastEP = nil
                   halfmoveClock = 0
-                  lastGridState = nil
+                  lastGrid = nil
                   lastPly = -1
               }
 
-              /// Build accurate FEN from grid + game state
+              /// Build FEN from current grid state.
+              /// grid: 8x8 chars, grid[0] = rank 8 (top), grid[7] = rank 1 (bottom)
               func build(grid: [[Character]], sideToMove: String, plyCount: Int) -> String {
-                  // Detect what moved since last position
-                  updateStateFromDiff(newGrid: grid, newPly: plyCount)
-                  lastGridState = grid
-                  lastPly = plyCount
+                  // If this is starting position, reset all tracking
+                  if isStartingPosition(grid) {
+                      reset()
+                      lastGrid = grid
+                      lastPly = plyCount
+                  } else {
+                      // Track moves ONLY if we have valid history
+                      if let old = lastGrid, plyCount >= lastPly && plyCount <= lastPly + 2 {
+                          detectMoveAndUpdate(oldGrid: old, newGrid: grid)
+                      } else if lastGrid == nil {
+                          // First read wasn't starting position → probably mid-game
+                          // Trust current position for castling
+                      }
+                      lastGrid = grid
+                      lastPly = plyCount
+                  }
 
                   let boardFen = buildBoardFen(from: grid)
-                  let castling = deriveCastlingRights(from: grid)
-                  let ep = lastEPTarget ?? "-"
+                  let castling = deriveCastling(from: grid)
+                  let ep = lastEP ?? "-"
                   let fullmove = max(1, (plyCount / 2) + 1)
                   return "\(boardFen) \(sideToMove) \(castling) \(ep) \(halfmoveClock) \(fullmove)"
               }
 
-              /// Detect what changed and update state
-              private func updateStateFromDiff(newGrid: [[Character]], newPly: Int) {
-                  guard let old = lastGridState else {
-                      // First position: reset if it's the starting position
-                      if isStartingPosition(newGrid) { reset() }
-                      return
-                  }
-                  // If ply went backwards or jumped, treat as new game
-                  if newPly < lastPly || newPly > lastPly + 2 {
-                      reset()
-                      lastGridState = newGrid
-                      return
-                  }
-                  // Find changed squares
+              /// Detect what moved and update tracking
+              private func detectMoveAndUpdate(oldGrid: [[Character]], newGrid: [[Character]]) {
+                  // Find all changed squares
                   var changes: [(row: Int, col: Int, before: Character, after: Character)] = []
                   for r in 0..<8 {
                       for c in 0..<8 {
-                          if old[r][c] != newGrid[r][c] {
-                              changes.append((r, c, old[r][c], newGrid[r][c]))
+                          if oldGrid[r][c] != newGrid[r][c] {
+                              changes.append((r, c, oldGrid[r][c], newGrid[r][c]))
                           }
                       }
                   }
-                  // No change? nothing to update
                   guard !changes.isEmpty else { return }
 
-                  // Find "from" square (had piece, now empty) and "to" square (had different, now has piece)
-                  let fromSquare = changes.first { $0.before != "." && $0.after == "." }
-                  let toSquare = changes.first { $0.after != "." && $0.after != $0.before }
-                  guard let from = fromSquare, let to = toSquare else {
-                      // Complex change (probably castling) - handle separately
-                      handleCastlingIfNeeded(changes: changes)
-                      lastEPTarget = nil
-                      return
-                  }
-                  let movedPiece = to.after
                   // Track king moves
-                  if movedPiece == "K" { whiteKingMoved = true }
-                  if movedPiece == "k" { blackKingMoved = true }
-                  // Track rook moves (using ORIGINAL row indices: 7=rank 1 white, 0=rank 8 black)
-                  if from.row == 7 && from.col == 0 && movedPiece == "R" { whiteRookA1Moved = true }
-                  if from.row == 7 && from.col == 7 && movedPiece == "R" { whiteRookH1Moved = true }
-                  if from.row == 0 && from.col == 0 && movedPiece == "r" { blackRookA8Moved = true }
-                  if from.row == 0 && from.col == 7 && movedPiece == "r" { blackRookH8Moved = true }
-                  // Track rook captures on original squares
-                  if to.row == 7 && to.col == 0 { whiteRookA1Moved = true }
-                  if to.row == 7 && to.col == 7 { whiteRookH1Moved = true }
-                  if to.row == 0 && to.col == 0 { blackRookA8Moved = true }
-                  if to.row == 0 && to.col == 7 { blackRookH8Moved = true }
-                  // Castling detection: king moved 2 squares
-                  handleCastlingIfNeeded(changes: changes)
-                  // En passant detection: pawn moved 2 squares
-                  lastEPTarget = nil
-                  if (movedPiece == "P" || movedPiece == "p") && abs(from.row - to.row) == 2 {
-                      let epRow = (from.row + to.row) / 2
-                      lastEPTarget = squareName(row: epRow, col: to.col)
-                  }
-                  // Halfmove clock (increment unless pawn move or capture)
-                  let isCapture = changes.count >= 2 && changes.contains { $0.before != "." && $0.after != "." }
-                  if movedPiece == "P" || movedPiece == "p" || isCapture {
-                      halfmoveClock = 0
-                  } else {
-                      halfmoveClock += 1
-                  }
-              }
-
-              private func handleCastlingIfNeeded(changes: [(row: Int, col: Int, before: Character, after: Character)]) {
-                  // Castling produces 4 changes: king from e1/e8, king to g1/c1 (or g8/c8), rook from h1/a1, rook to f1/d1
-                  guard changes.count >= 3 else { return }
                   for change in changes {
                       if change.before == "K" && change.after == "." && change.row == 7 && change.col == 4 {
-                          whiteKingMoved = true
+                          knownWhiteKingMoved = true
                       }
                       if change.before == "k" && change.after == "." && change.row == 0 && change.col == 4 {
-                          blackKingMoved = true
+                          knownBlackKingMoved = true
+                      }
+                  }
+
+                  // Track rook moves (from original squares)
+                  for change in changes {
+                      if change.before == "R" && change.after == "." {
+                          if change.row == 7 && change.col == 0 { knownWhiteRookA1Moved = true }
+                          if change.row == 7 && change.col == 7 { knownWhiteRookH1Moved = true }
+                      }
+                      if change.before == "r" && change.after == "." {
+                          if change.row == 0 && change.col == 0 { knownBlackRookA8Moved = true }
+                          if change.row == 0 && change.col == 7 { knownBlackRookH8Moved = true }
+                      }
+                      // Track rook captures on original squares
+                      if change.after != "." && change.before != change.after {
+                          if change.row == 7 && change.col == 0 { knownWhiteRookA1Moved = true }
+                          if change.row == 7 && change.col == 7 { knownWhiteRookH1Moved = true }
+                          if change.row == 0 && change.col == 0 { knownBlackRookA8Moved = true }
+                          if change.row == 0 && change.col == 7 { knownBlackRookH8Moved = true }
+                      }
+                  }
+
+                  // Detect en passant target: pawn moved 2 squares
+                  lastEP = nil
+                  let fromSq = changes.first { $0.before != "." && $0.after == "." }
+                  let toSq = changes.first { $0.after != "." && $0.after != $0.before }
+                  if let from = fromSq, let to = toSq {
+                      let piece = to.after
+                      let rowDiff = abs(from.row - to.row)
+                      if (piece == "P" || piece == "p") && rowDiff == 2 && from.col == to.col {
+                          let epRow = (from.row + to.row) / 2
+                          lastEP = squareName(row: epRow, col: to.col)
+                      }
+                      // Halfmove clock
+                      let isPawnMove = piece == "P" || piece == "p"
+                      let isCapture = changes.contains { $0.before != "." && $0.after != "." && $0.before != $0.after }
+                      if isPawnMove || isCapture {
+                          halfmoveClock = 0
+                      } else {
+                          halfmoveClock += 1
                       }
                   }
               }
 
               private func isStartingPosition(_ grid: [[Character]]) -> Bool {
-                  // Row 0 (rank 8, black back rank)
-                  let row0 = String(grid[0])
-                  guard row0 == "rnbqkbnr" else { return false }
-                  // Row 1 (rank 7, black pawns)
-                  let row1 = String(grid[1])
-                  guard row1 == "pppppppp" else { return false }
-                  // Row 6 (rank 2, white pawns)
-                  let row6 = String(grid[6])
-                  guard row6 == "PPPPPPPP" else { return false }
-                  // Row 7 (rank 1, white back rank)
-                  let row7 = String(grid[7])
-                  guard row7 == "RNBQKBNR" else { return false }
-                  return true
+                  guard grid.count == 8 else { return false }
+                  return String(grid[0]) == "rnbqkbnr"
+                      && String(grid[1]) == "pppppppp"
+                      && String(grid[6]) == "PPPPPPPP"
+                      && String(grid[7]) == "RNBQKBNR"
               }
 
               private func buildBoardFen(from grid: [[Character]]) -> String {
@@ -346,16 +336,20 @@ jobs:
                   return rows.joined(separator: "/")
               }
 
-              private func deriveCastlingRights(from grid: [[Character]]) -> String {
+              /// Derive castling rights combining "known moved" tracking + current position check
+              private func deriveCastling(from grid: [[Character]]) -> String {
                   var s = ""
-                  // White kingside: K not moved, H1 rook not moved, both still in place
-                  if !whiteKingMoved && !whiteRookH1Moved
+                  // White kingside
+                  if !knownWhiteKingMoved && !knownWhiteRookH1Moved
                       && grid[7][4] == "K" && grid[7][7] == "R" { s += "K" }
-                  if !whiteKingMoved && !whiteRookA1Moved
+                  // White queenside
+                  if !knownWhiteKingMoved && !knownWhiteRookA1Moved
                       && grid[7][4] == "K" && grid[7][0] == "R" { s += "Q" }
-                  if !blackKingMoved && !blackRookH8Moved
+                  // Black kingside
+                  if !knownBlackKingMoved && !knownBlackRookH8Moved
                       && grid[0][4] == "k" && grid[0][7] == "r" { s += "k" }
-                  if !blackKingMoved && !blackRookA8Moved
+                  // Black queenside
+                  if !knownBlackKingMoved && !knownBlackRookA8Moved
                       && grid[0][4] == "k" && grid[0][0] == "r" { s += "q" }
                   return s.isEmpty ? "-" : s
               }
@@ -368,19 +362,17 @@ jobs:
           }
           '''
 
-          # ============ Overlay Position (draggable) ============
           files["Sources/OverlayPosition.swift"] = r'''
           import SwiftUI
 
-          /// Persists overlay position across launches
           @MainActor
           final class OverlayPosition: ObservableObject {
               @Published var offset: CGSize = .zero
               @Published var isCompact: Bool = false
-              @Published var transparency: Double = 0.85  // 0=fully transparent, 1=solid
+              @Published var transparency: Double = 0.85
 
-              private let offsetXKey = "overlay_offset_x"
-              private let offsetYKey = "overlay_offset_y"
+              private let offsetXKey = "overlay_offset_x_v45"
+              private let offsetYKey = "overlay_offset_y_v45"
               private let compactKey = "overlay_compact"
               private let transparencyKey = "overlay_transparency"
 
@@ -432,7 +424,6 @@ jobs:
                   OpeningEntry(name: "Pirc Defense", moves: ["e2e4","d7d6","d2d4","g8f6","b1c3","g7g6"]),
                   OpeningEntry(name: "Alekhine Defense", moves: ["e2e4","g8f6"]),
                   OpeningEntry(name: "Bird's Opening", moves: ["f2f4"]),
-                  OpeningEntry(name: "From's Gambit", moves: ["f2f4","e7e5"]),
                   OpeningEntry(name: "Queen's Gambit", moves: ["d2d4","d7d5","c2c4"]),
                   OpeningEntry(name: "Queen's Gambit Declined", moves: ["d2d4","d7d5","c2c4","e7e6"]),
                   OpeningEntry(name: "Queen's Gambit Accepted", moves: ["d2d4","d7d5","c2c4","d5c4"]),
@@ -493,10 +484,6 @@ jobs:
                       cache.removeValue(forKey: oldest)
                   }
               }
-              func remove(fen: String) {
-                  cache.removeValue(forKey: fen)
-                  accessOrder.removeAll { $0 == fen }
-              }
               func clear() {
                   cache.removeAll()
                   accessOrder.removeAll()
@@ -552,7 +539,7 @@ jobs:
                   switch self {
                   case .badFen(let msg): return "Bad FEN: \(msg)"
                   case .networkOffline: return "No internet"
-                  case .allEnginesFailed: return "All 3 engines offline"
+                  case .allEnginesFailed: return "All engines offline"
                   case .cancelled: return "Cancelled"
                   }
               }
@@ -653,33 +640,27 @@ jobs:
                   } catch { return nil }
               }
 
-              static func analyzeStreaming(fen: String,
-                                            moveHistory: [String],
+              static func analyzeStreaming(fen: String, moveHistory: [String],
                                             onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
                   if let issue = FenValidator.validate(fen) {
                       throw EngineError.badFen(issue)
                   }
-
-                  // Cache lookup
                   if let cached = await AnalysisCache.shared.get(fen: fen) {
                       let cachedMoves = cached.moves.enumerated().map { (i, m) in
                           TopMove(rank: i + 1, uci: m.uci, san: m.san,
                                   evaluationCp: m.evaluationCp, mateIn: m.mateIn,
                                   depth: m.depth, source: "cache", votes: m.votes)
                       }
-                      let a = EngineAnalysis(
-                          topMoves: cachedMoves, bestMove: cachedMoves.first,
-                          depth: cached.depth, sourcesUsed: "cache",
-                          confidence: cached.confidence, debugFen: fen)
+                      let a = EngineAnalysis(topMoves: cachedMoves, bestMove: cachedMoves.first,
+                                             depth: cached.depth, sourcesUsed: "cache",
+                                             confidence: cached.confidence, debugFen: fen)
                       await MainActor.run { onUpdate(a) }
                       return a
                   }
 
-                  // 3 engines in parallel
                   async let lichessResult = callLichessCloud(fen: fen)
                   async let chessApiResult = callChessApi(fen: fen)
                   async let stockfishResult = callStockfishOnline(fen: fen)
-
                   let lichess = await lichessResult
                   try Task.checkCancellation()
                   let cA = await chessApiResult
@@ -687,7 +668,6 @@ jobs:
                   let sf = await stockfishResult
                   try Task.checkCancellation()
 
-                  // Merge results by voting
                   var moveVotes: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
                   if let lcMoves = lichess {
                       for m in lcMoves {
@@ -743,24 +723,19 @@ jobs:
                   let allSources = Array(Set(moveVotes.values.flatMap { $0.sources })).sorted().joined(separator: "+")
                   let bestDepth = finalMoves.map { $0.depth }.max() ?? 13
 
-                  // SANITY CHECK: if all 3 moves have identical eval, FEN is likely wrong
-                  // Don't cache in this case!
+                  // Sanity check: if all moves have same eval, FEN is suspicious - don't cache
                   let evalsAreIdentical = finalMoves.count >= 2 &&
                       finalMoves.allSatisfy { $0.evaluationCp == finalMoves.first?.evaluationCp }
                   let shouldCache = !evalsAreIdentical
 
-                  let analysis = EngineAnalysis(
-                      topMoves: finalMoves, bestMove: finalMoves.first,
-                      depth: bestDepth, sourcesUsed: allSources,
-                      confidence: min(topVotes, 3), debugFen: fen
-                  )
-
+                  let analysis = EngineAnalysis(topMoves: finalMoves, bestMove: finalMoves.first,
+                                                depth: bestDepth, sourcesUsed: allSources,
+                                                confidence: min(topVotes, 3), debugFen: fen)
                   if shouldCache {
-                      await AnalysisCache.shared.set(
-                          fen: fen, moves: finalMoves, depth: bestDepth,
-                          sources: allSources, confidence: min(topVotes, 3))
+                      await AnalysisCache.shared.set(fen: fen, moves: finalMoves,
+                                                     depth: bestDepth, sources: allSources,
+                                                     confidence: min(topVotes, 3))
                   }
-
                   await MainActor.run { onUpdate(analysis) }
                   return analysis
               }
@@ -828,10 +803,10 @@ jobs:
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section("Overlay (v4.4 draggable)") {
-                              Text("Drag the overlay anywhere on screen. Long-press = pick up. Tap Reset to return to bottom.")
+                          Section("Overlay") {
+                              Text("Drag anywhere. Reset button below returns to bottom.")
                                   .font(.caption).foregroundColor(.secondary)
-                              Toggle("Compact mode (40% smaller)", isOn: $overlayPos.isCompact)
+                              Toggle("Compact mode (smaller)", isOn: $overlayPos.isCompact)
                                   .onChange(of: overlayPos.isCompact) { _ in overlayPos.save() }
                               VStack(alignment: .leading) {
                                   Text("Transparency: \(Int(overlayPos.transparency * 100))%").font(.caption)
@@ -839,13 +814,12 @@ jobs:
                                       .onChange(of: overlayPos.transparency) { _ in overlayPos.save() }
                               }
                               Button("Reset overlay position") { overlayPos.reset() }
+                              Toggle("Use tiny dot instead of panel", isOn: $stealth.minimalMode)
                           }
-                          Section("Engine (Hybrid 3-way)") {
+                          Section("Engine") {
                               HStack { Circle().fill(.blue).frame(width: 10, height: 10); Text("Lichess Cloud").font(.subheadline) }
                               HStack { Circle().fill(.orange).frame(width: 10, height: 10); Text("chess-api.com").font(.subheadline) }
                               HStack { Circle().fill(.cyan).frame(width: 10, height: 10); Text("stockfish.online").font(.subheadline) }
-                              Text("Fixed FEN: proper castling tracking + en-passant detection.")
-                                  .font(.caption).foregroundColor(.secondary)
                           }
                           Section("Debug") {
                               Text("Current FEN:").font(.caption)
@@ -862,13 +836,12 @@ jobs:
                                   engine.resetFenTracker()
                               }
                           }
-                          Section("Panic (shake to hide/show)") {
-                              Label("Shake phone", systemImage: "iphone.gen3.radiowaves.left.and.right")
+                          Section("Panic") {
+                              Label("Shake phone to hide/show", systemImage: "iphone.gen3.radiowaves.left.and.right")
                           }
-                          Section("Safety auto-hide") {
+                          Section("Safety") {
                               Label("On screen recording", systemImage: "record.circle")
                               Label("On screenshot", systemImage: "camera.viewfinder")
-                              Toggle("Minimal mode (tiny dot)", isOn: $stealth.minimalMode)
                           }
                           Section("Status") {
                               LabeledContent("Visible", value: stealth.overlayVisible ? "Yes" : "No")
@@ -877,8 +850,7 @@ jobs:
                               Button("Hide overlay", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "4.4.0 (44)")
-                              LabeledContent("Engine", value: "Hybrid + fixed FEN")
+                              LabeledContent("Version", value: "4.5.0 (45)")
                           }
                       }
                       .navigationTitle("Settings")
@@ -946,8 +918,6 @@ jobs:
               private var analysisTask: Task<Void, Never>?
               private var debounceTask: Task<Void, Never>?
               private var retryTask: Task<Void, Never>?
-              private var pendingFEN = ""
-              private var pendingFENCount = 0
               private var moveHistoryUCI: [String] = []
               private var lastKnownPly: Int = -1
 
@@ -965,6 +935,7 @@ jobs:
                   moveHistoryUCI = []
                   lastKnownPly = -1
                   openingName = ""
+                  lastSuccessfulFEN = ""
                   Task { await AnalysisCache.shared.clear() }
               }
 
@@ -984,18 +955,15 @@ jobs:
                   if p.bottomColor == "w" || p.bottomColor == "b" {
                       detectedPlayerColor = p.bottomColor
                   }
-                  // Track move history
                   if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
                       moveHistoryUCI.append(p.lastMoveUCI)
                       lastKnownPly = p.plyCount
                   }
-                  // Reset on new game
                   if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 {
                       resetFenTracker()
                       lastKnownPly = p.plyCount
                   }
 
-                  // Convert grid string to 2D array
                   let chars = Array(p.grid)
                   guard chars.count == 64 else { return }
                   var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
@@ -1004,7 +972,6 @@ jobs:
                           grid[r][c] = chars[r * 8 + c]
                       }
                   }
-                  // Unflip if needed
                   if p.flipped {
                       var flipped: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
                       for r in 0..<8 {
@@ -1015,13 +982,11 @@ jobs:
                       grid = flipped
                   }
 
-                  // Build accurate FEN using the tracker
                   let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
-
                   if let _ = FenValidator.validate(fen) { return }
-                  if fen == pendingFEN { pendingFENCount += 1 }
-                  else { pendingFEN = fen; pendingFENCount = 1 }
-                  if pendingFENCount >= 2 && fen != currentFEN {
+
+                  // FIX: NO double-stability check. Analyze immediately if FEN is different.
+                  if fen != currentFEN {
                       currentFEN = fen
                       topMoves = []
                       evaluation = "—"
@@ -1037,7 +1002,8 @@ jobs:
                   debounceTask?.cancel()
                   retryTask?.cancel()
                   debounceTask = Task { [weak self] in
-                      if !immediate { try? await Task.sleep(nanoseconds: 250_000_000) }
+                      // Short debounce (150ms) to catch board settlement without missing moves
+                      if !immediate { try? await Task.sleep(nanoseconds: 150_000_000) }
                       if Task.isCancelled { return }
                       await self?.run(fen: fen)
                   }
@@ -1056,9 +1022,7 @@ jobs:
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
-                          let a = try await EngineService.analyzeStreaming(
-                              fen: fen, moveHistory: self.moveHistoryUCI
-                          ) { partial in
+                          let a = try await EngineService.analyzeStreaming(fen: fen, moveHistory: self.moveHistoryUCI) { partial in
                               guard fen == self.currentFEN else { return }
                               self.topMoves = partial.topMoves
                               if let best = partial.bestMove {
@@ -1175,11 +1139,13 @@ jobs:
                       nav
                       ZStack {
                           ChessWebView(engine: engine, router: router)
-                          // Draggable overlay - positioned absolutely
+                          // Overlay (draggable panel) shown when visible
                           if stealth.overlayVisible {
                               draggableOverlay
-                          } else {
-                              revealButton
+                          }
+                          // FIXED reveal button - always at bottom center when hidden
+                          if !stealth.overlayVisible {
+                              fixedRevealButton
                           }
                       }
                   }
@@ -1217,25 +1183,26 @@ jobs:
                   }
               }
 
-              private var revealButton: some View {
+              // FIXED: Reveal button ALWAYS at bottom center, big and obvious
+              private var fixedRevealButton: some View {
                   VStack {
                       Spacer()
-                      HStack {
-                          Spacer()
-                          Button { stealth.show() } label: {
-                              HStack(spacing: 6) {
-                                  Image(systemName: "eye.fill").font(.body)
-                                  Text("Show").font(.footnote.bold())
-                              }
-                              .padding(.horizontal, 14).padding(.vertical, 10)
-                              .background(Color.green)
-                              .foregroundColor(.white)
-                              .cornerRadius(20)
-                              .shadow(color: .black.opacity(0.5), radius: 6, y: 2)
+                      Button {
+                          stealth.show()
+                      } label: {
+                          HStack(spacing: 8) {
+                              Image(systemName: "eye.fill").font(.title3)
+                              Text("Show Helper").font(.subheadline.bold())
                           }
-                          .padding()
+                          .padding(.horizontal, 20).padding(.vertical, 12)
+                          .background(Color.green)
+                          .foregroundColor(.white)
+                          .cornerRadius(24)
+                          .shadow(color: .black.opacity(0.6), radius: 8, y: 3)
                       }
+                      .padding(.bottom, 24)
                   }
+                  .frame(maxWidth: .infinity)
               }
 
               private var nav: some View {
@@ -1265,8 +1232,8 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v4.4").font(.title2.bold())
-                      Text("FIXED FEN + DRAGGABLE\n\n✅ Accurate castling tracking\n✅ En-passant detection\n✅ Drag overlay anywhere\n✅ Adjustable transparency\n✅ Compact mode\n\nShake = hide/show")
+                      Text("Chess Helper v4.5").font(.title2.bold())
+                      Text("MAJOR FIXES\n\n✅ Fixed reveal button (always at bottom)\n✅ Fixed FEN accumulation errors\n✅ Instant analysis (no double-check delay)\n✅ Direct move detection\n\nShake to hide/show")
                           .font(.footnote).foregroundColor(.white.opacity(0.85))
                           .multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -1287,15 +1254,13 @@ jobs:
               @ObservedObject var overlayPos: OverlayPosition
               @State private var expanded = true
 
-              private var scale: CGFloat { overlayPos.isCompact ? 0.75 : 1.0 }
               private var maxWidth: CGFloat { overlayPos.isCompact ? 280 : 360 }
 
               var body: some View {
                   if stealth.minimalMode {
                       dot
                   } else {
-                      panel
-                          .frame(maxWidth: maxWidth)
+                      panel.frame(maxWidth: maxWidth)
                   }
               }
 
@@ -1342,18 +1307,16 @@ jobs:
 
               private var header: some View {
                   HStack(spacing: 8) {
-                      Image(systemName: "hand.draw.fill")
-                          .font(.caption2).foregroundColor(.white.opacity(0.5))
-                      Circle().fill(engine.isOffline ? Color.red : Color.green)
-                          .frame(width: 6, height: 6)
+                      Image(systemName: "hand.draw.fill").font(.caption2).foregroundColor(.white.opacity(0.5))
+                      Circle().fill(engine.isOffline ? Color.red : Color.green).frame(width: 6, height: 6)
                       Text("Helper").font(.caption.bold())
                       if engine.isThinking { ProgressView().scaleEffect(0.5) }
                       Spacer()
                       Text(engine.isMyTurn ? "Your turn" : "Wait")
                           .font(.caption2.bold())
                           .foregroundColor(engine.isMyTurn ? .green : .secondary)
-                      Button { stealth.toggleMinimalMode() } label: {
-                          Image(systemName: "eye.slash.fill").font(.caption)
+                      Button { stealth.hide(reason: "manual") } label: {
+                          Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(.red.opacity(0.7))
                       }
                       Button { withAnimation { expanded.toggle() } } label: {
                           Image(systemName: expanded ? "chevron.down" : "chevron.up").font(.caption2)
@@ -1627,8 +1590,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>4.4.0</string>
-            <key>CFBundleVersion</key><string>44</string>
+            <key>CFBundleShortVersionString</key><string>4.5.0</string>
+            <key>CFBundleVersion</key><string>45</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -1766,7 +1729,7 @@ jobs:
             Object.defineProperty(window, '__START_FUNC__', {
               value: function(){
                 if(tickTimer) return;
-                var iv = __READER_INTERVAL__ + Math.floor(Math.random()*200);
+                var iv = __READER_INTERVAL__ + Math.floor(Math.random()*150);
                 tickTimer = setInterval(tick, iv);
               },
               enumerable: false, writable: false, configurable: false
@@ -1775,13 +1738,13 @@ jobs:
             try {
               var mo = new MutationObserver(function(){
                 var now = Date.now();
-                if (now - lastMutTick < 800) return;
+                if (now - lastMutTick < 400) return;
                 lastMutTick = now;
                 try{ tick(); }catch(e){}
               });
               mo.observe(document.documentElement, {childList:true, subtree:true});
             } catch(e){}
-            setTimeout(function(){ try{ window['__START_FUNC__'](); }catch(e){} }, 500 + Math.floor(Math.random()*500));
+            setTimeout(function(){ try{ window['__START_FUNC__'](); }catch(e){} }, 400);
           })();
           EOF
 
