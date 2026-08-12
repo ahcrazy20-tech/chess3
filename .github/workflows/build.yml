@@ -1,4 +1,4 @@
-name: Build ChessHelper v5.1
+name: Build ChessHelper v5.2
 
 on:
   push:
@@ -31,8 +31,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "5.1.0"
-              CURRENT_PROJECT_VERSION: "51"
+              MARKETING_VERSION: "5.2.0"
+              CURRENT_PROJECT_VERSION: "52"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -71,7 +71,7 @@ jobs:
           import os, textwrap
           files = {}
 
-          # ===== Files unchanged from v5.0 =====
+          # ========== Base files ==========
           files["Sources/ChessHelperApp.swift"] = r'''
           import SwiftUI
           @main
@@ -103,12 +103,8 @@ jobs:
               enum Lang: String, CaseIterable {
                   case arabic = "ar"
                   case english = "en"
-                  var display: String {
-                      switch self {
-                      case .arabic: return "العربية"
-                      case .english: return "English"
-                      }
-                  }
+                  var display: String { self == .arabic ? "العربية" : "English" }
+                  var voiceCode: String { self == .arabic ? "ar-SA" : "en-US" }
               }
               @Published var current: Lang {
                   didSet { UserDefaults.standard.set(current.rawValue, forKey: "app_language") }
@@ -129,35 +125,20 @@ jobs:
               static let service = "com.chesshelper.app"
               static func save(_ value: String, account: String) -> Bool {
                   let data = value.data(using: .utf8)!
-                  let query: [String: Any] = [
-                      kSecClass as String: kSecClassGenericPassword,
-                      kSecAttrService as String: service,
-                      kSecAttrAccount as String: account
-                  ]
+                  let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
                   SecItemDelete(query as CFDictionary)
                   var newItem = query
                   newItem[kSecValueData as String] = data
                   return SecItemAdd(newItem as CFDictionary, nil) == errSecSuccess
               }
               static func load(account: String) -> String? {
-                  let query: [String: Any] = [
-                      kSecClass as String: kSecClassGenericPassword,
-                      kSecAttrService as String: service,
-                      kSecAttrAccount as String: account,
-                      kSecReturnData as String: true,
-                      kSecMatchLimit as String: kSecMatchLimitOne
-                  ]
+                  let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
                   var item: CFTypeRef?
-                  guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-                        let data = item as? Data else { return nil }
+                  guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data else { return nil }
                   return String(data: data, encoding: .utf8)
               }
               static func delete(account: String) {
-                  let query: [String: Any] = [
-                      kSecClass as String: kSecClassGenericPassword,
-                      kSecAttrService as String: service,
-                      kSecAttrAccount as String: account
-                  ]
+                  let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
                   SecItemDelete(query as CFDictionary)
               }
           }
@@ -204,6 +185,87 @@ jobs:
                   if total < 4 { return "only \(total) pieces" }
                   if total > 32 { return "\(total) pieces" }
                   return nil
+              }
+          }
+          '''
+
+          # ========== NEW: Move Validator (KEY FIX for accuracy) ==========
+          files["Sources/MoveValidator.swift"] = r'''
+          import Foundation
+
+          /// Validates that a UCI move is actually legal in the given position.
+          /// This fixes the "wrong moves" bug where engines return moves that don't exist on board.
+          enum MoveValidator {
+
+              /// Parse FEN board into 8x8 grid. grid[0] = rank 8, grid[7] = rank 1
+              static func parseFen(_ fen: String) -> [[Character]]? {
+                  let parts = fen.split(separator: " ").map(String.init)
+                  guard let boardPart = parts.first else { return nil }
+                  let ranks = boardPart.split(separator: "/").map(String.init)
+                  guard ranks.count == 8 else { return nil }
+                  var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
+                  for (rIdx, rank) in ranks.enumerated() {
+                      var col = 0
+                      for ch in rank {
+                          if let empty = ch.wholeNumberValue {
+                              col += empty
+                          } else {
+                              if col < 8 { grid[rIdx][col] = ch }
+                              col += 1
+                          }
+                      }
+                  }
+                  return grid
+              }
+
+              /// Convert square name like "e4" to (row, col). row 0 = rank 8, col 0 = file a
+              static func squareToCoord(_ square: String) -> (row: Int, col: Int)? {
+                  guard square.count >= 2 else { return nil }
+                  let chars = Array(square)
+                  let fileChar = chars[0]
+                  guard let fileScalar = fileChar.asciiValue, fileScalar >= 97, fileScalar <= 104 else { return nil }
+                  let col = Int(fileScalar) - 97
+                  guard let rankDigit = chars[1].wholeNumberValue, rankDigit >= 1, rankDigit <= 8 else { return nil }
+                  let row = 8 - rankDigit
+                  return (row, col)
+              }
+
+              /// Validate that a UCI move (like "e2e4") is possible in this position.
+              /// Returns true if valid, false if not.
+              /// This does BASIC validation - checks that:
+              /// 1. From square has a piece
+              /// 2. Piece belongs to side to move
+              /// 3. Move is not into own piece
+              static func isPlausibleMove(uci: String, fen: String) -> Bool {
+                  guard uci.count >= 4 else { return false }
+                  guard let grid = parseFen(fen) else { return false }
+                  let parts = fen.split(separator: " ").map(String.init)
+                  guard parts.count >= 2 else { return false }
+                  let sideToMove = parts[1]
+
+                  let fromStr = String(uci.prefix(2))
+                  let toStr = String(uci.dropFirst(2).prefix(2))
+
+                  guard let from = squareToCoord(fromStr) else { return false }
+                  guard let to = squareToCoord(toStr) else { return false }
+
+                  // Check from square has a piece
+                  let fromPiece = grid[from.row][from.col]
+                  guard fromPiece != "." else { return false }
+
+                  // Check piece belongs to side to move
+                  let isWhitePiece = fromPiece.isUppercase
+                  let isWhiteTurn = sideToMove == "w"
+                  if isWhitePiece != isWhiteTurn { return false }
+
+                  // Check destination is not own piece
+                  let toPiece = grid[to.row][to.col]
+                  if toPiece != "." {
+                      let toIsWhite = toPiece.isUppercase
+                      if toIsWhite == isWhitePiece { return false }
+                  }
+
+                  return true
               }
           }
           '''
@@ -316,7 +378,7 @@ jobs:
               @Published var offset: CGSize = .zero
               @Published var isCompact: Bool = false
               @Published var transparency: Double = 0.85
-              private let xK = "ov_x_v51", yK = "ov_y_v51", cK = "ov_c_v51", tK = "ov_t_v51"
+              private let xK = "ov_x_v52", yK = "ov_y_v52", cK = "ov_c_v52", tK = "ov_t_v52"
               init() {
                   let x = UserDefaults.standard.double(forKey: xK)
                   let y = UserDefaults.standard.double(forKey: yK)
@@ -333,13 +395,12 @@ jobs:
               }
               func reset() { offset = .zero; isCompact = false; transparency = 0.85; save() }
           }
-
           @MainActor
           final class AIOverlayPosition: ObservableObject {
               @Published var offset: CGSize = CGSize(width: 0, height: -220)
               @Published var isVisible: Bool = false
               @Published var isChatMode: Bool = false
-              private let xK = "ai_x_v51", yK = "ai_y_v51"
+              private let xK = "ai_x_v52", yK = "ai_y_v52"
               init() {
                   let x = UserDefaults.standard.double(forKey: xK)
                   let y = UserDefaults.standard.double(forKey: yK)
@@ -375,205 +436,298 @@ jobs:
           }
           '''
 
-          # ===== GroqService (same as v5.0) =====
-          files["Sources/GroqService.swift"] = r'''
-          import Foundation
-          enum GroqService {
-              struct ChatMessage: Codable { let role: String; let content: String }
-              enum GroqError: Error, LocalizedError {
-                  case noKey, invalidKey, networkError(String), rateLimited, parseError
-                  var errorDescription: String? {
-                      switch self {
-                      case .noKey: return "No Groq API key. Add it in Settings."
-                      case .invalidKey: return "Invalid API key."
-                      case .networkError(let m): return "Network: \(m)"
-                      case .rateLimited: return "Too many requests."
-                      case .parseError: return "Bad AI response"
-                      }
-                  }
+          # ========== NEW: Haptic Manager ==========
+          files["Sources/HapticManager.swift"] = r'''
+          import UIKit
+
+          /// Manages haptic feedback (vibrations) for chess events.
+          /// All haptics are LIGHT as per user preference.
+          enum HapticManager {
+
+              /// Light tap - move ready notification
+              static func moveReady() {
+                  let g = UIImpactFeedbackGenerator(style: .light)
+                  g.prepare()
+                  g.impactOccurred(intensity: 0.5)
               }
-              static func chat(messages: [ChatMessage], temperature: Double = 0.3) async throws -> String {
-                  guard let apiKey = KeychainStore.load(account: KeychainStore.groqKeyAccount), !apiKey.isEmpty else { throw GroqError.noKey }
-                  guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else { throw GroqError.networkError("Bad URL") }
-                  var req = URLRequest(url: url)
-                  req.httpMethod = "POST"
-                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                  req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                  req.timeoutInterval = 30
-                  let body: [String: Any] = [
-                      "model": "llama-3.3-70b-versatile",
-                      "messages": messages.map { ["role": $0.role, "content": $0.content] },
-                      "temperature": temperature, "max_tokens": 500, "top_p": 0.9
-                  ]
-                  req.httpBody = try JSONSerialization.data(withJSONObject: body)
-                  let (data, resp) = try await URLSession.shared.data(for: req)
-                  guard let http = resp as? HTTPURLResponse else { throw GroqError.networkError("No response") }
-                  if http.statusCode == 401 { throw GroqError.invalidKey }
-                  if http.statusCode == 429 { throw GroqError.rateLimited }
-                  guard (200..<300).contains(http.statusCode) else { throw GroqError.networkError("HTTP \(http.statusCode)") }
-                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                        let choices = json["choices"] as? [[String: Any]],
-                        let first = choices.first,
-                        let message = first["message"] as? [String: Any],
-                        let content = message["content"] as? String else { throw GroqError.parseError }
-                  return content.trimmingCharacters(in: .whitespacesAndNewlines)
+
+              /// Slightly stronger - blunder warning
+              static func blunderWarning() {
+                  let g = UINotificationFeedbackGenerator()
+                  g.prepare()
+                  g.notificationOccurred(.warning)
               }
-              static func explainMove(fen: String, uci: String, san: String, eval: String, isArabic: Bool, ranking: Int, totalMoves: Int) async throws -> String {
-                  let sys = isArabic ? "أنت مدرب شطرنج محترف. اشرح النقلات بالعربية بشكل مفصل ومفيد." : "You are a GM-level chess coach. Explain moves clearly and professionally."
-                  let usr = isArabic ? "الموقف: \(fen)\nالنقلة #\(ranking): \(san) (\(uci))\nالتقييم: \(eval)\n\nاشرحلي:\n1. لماذا هذه النقلة جيدة؟\n2. الخطة الاستراتيجية\n3. تهديدات الخصم\n4. نصائح تكتيكية\n\n4-6 أسطر." : "Position: \(fen)\nMove #\(ranking): \(san) (\(uci))\nEval: \(eval)\n\nExplain:\n1. Why is this good?\n2. Strategic plan\n3. Opponent threats\n4. Tactical tips\n\n4-6 lines."
-                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.4)
+
+              /// Success - great move played
+              static func success() {
+                  let g = UINotificationFeedbackGenerator()
+                  g.prepare()
+                  g.notificationOccurred(.success)
               }
-              static func askAboutPosition(fen: String, question: String, isArabic: Bool, history: [ChatMessage] = []) async throws -> String {
-                  let sys = isArabic ? "أنت مدرب شطرنج. الموقف: \(fen). أجب بالعربية بشكل مفصل." : "You are a chess coach. Position: \(fen). Answer clearly."
-                  var msgs: [ChatMessage] = [ChatMessage(role: "system", content: sys)]
-                  msgs.append(contentsOf: history)
-                  msgs.append(ChatMessage(role: "user", content: question))
-                  return try await chat(messages: msgs, temperature: 0.7)
-              }
-              // NEW: Analyze threats in position
-              static func analyzeThreats(fen: String, isArabic: Bool) async throws -> String {
-                  let sys = isArabic ? "أنت مدرب شطرنج. حلل التهديدات في الموقف بإيجاز." : "You are a chess coach. Analyze threats concisely."
-                  let usr = isArabic ? "الموقف: \(fen)\n\nحدد:\n1. كل التهديدات الحالية للخصم\n2. القطع المعرضة للخطر\n3. أي فخاخ محتملة\n\nكن مختصراً في 3-5 أسطر." : "Position: \(fen)\n\nIdentify:\n1. All current opponent threats\n2. Pieces in danger\n3. Any traps\n\nBe concise in 3-5 lines."
-                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.3)
+
+              /// Selection - tap on button
+              static func selection() {
+                  let g = UISelectionFeedbackGenerator()
+                  g.prepare()
+                  g.selectionChanged()
               }
           }
           '''
 
-          files["Sources/AIAssistantViewModel.swift"] = r'''
+          # ========== NEW: Voice Manager ==========
+          files["Sources/VoiceManager.swift"] = r'''
+          import Foundation
+          import AVFoundation
+
+          /// Text-to-speech for announcing moves.
+          /// Uses system TTS (free, works with AirPods/Bluetooth).
+          @MainActor
+          final class VoiceManager: ObservableObject {
+              static let shared = VoiceManager()
+              private let synth = AVSpeechSynthesizer()
+              @Published var isEnabled: Bool = false  // must be manually triggered
+
+              private init() {
+                  configureAudio()
+              }
+
+              private func configureAudio() {
+                  do {
+                      try AVAudioSession.sharedInstance().setCategory(.playback, mode: .voicePrompt, options: [.mixWithOthers, .duckOthers])
+                      try AVAudioSession.sharedInstance().setActive(true)
+                  } catch {
+                      print("Audio session error: \(error)")
+                  }
+              }
+
+              /// Speak a move in the given language
+              func speakMove(uci: String, san: String, isArabic: Bool) {
+                  // Convert UCI to readable form
+                  let text: String
+                  if isArabic {
+                      text = describeInArabic(uci: uci, san: san)
+                  } else {
+                      text = describeInEnglish(uci: uci, san: san)
+                  }
+                  speak(text: text, isArabic: isArabic)
+              }
+
+              /// Speak arbitrary text
+              func speak(text: String, isArabic: Bool) {
+                  synth.stopSpeaking(at: .immediate)
+                  let utterance = AVSpeechUtterance(string: text)
+                  utterance.voice = AVSpeechSynthesisVoice(language: isArabic ? "ar-SA" : "en-US")
+                  utterance.rate = 0.5
+                  utterance.pitchMultiplier = 1.0
+                  utterance.volume = 1.0
+                  synth.speak(utterance)
+              }
+
+              func stop() {
+                  synth.stopSpeaking(at: .immediate)
+              }
+
+              // MARK: - Move description
+
+              private func describeInArabic(uci: String, san: String) -> String {
+                  // Try to extract piece and square from SAN
+                  let piece = detectPiece(san: san, isArabic: true)
+                  let toSquare = extractSquare(uci: uci)
+                  let squareArabic = arabicSquare(toSquare)
+                  return "\(piece) إلى \(squareArabic)"
+              }
+
+              private func describeInEnglish(uci: String, san: String) -> String {
+                  let piece = detectPiece(san: san, isArabic: false)
+                  let toSquare = extractSquare(uci: uci)
+                  return "\(piece) to \(toSquare)"
+              }
+
+              private func detectPiece(san: String, isArabic: Bool) -> String {
+                  let first = san.first ?? "P"
+                  switch first {
+                  case "K": return isArabic ? "الملك" : "King"
+                  case "Q": return isArabic ? "الوزير" : "Queen"
+                  case "R": return isArabic ? "القلعة" : "Rook"
+                  case "B": return isArabic ? "الفيل" : "Bishop"
+                  case "N": return isArabic ? "الحصان" : "Knight"
+                  case "O":
+                      if san.hasPrefix("O-O-O") { return isArabic ? "تبييت طويل" : "Long castle" }
+                      return isArabic ? "تبييت قصير" : "Short castle"
+                  default:
+                      return isArabic ? "الجندي" : "Pawn"
+                  }
+              }
+
+              private func extractSquare(uci: String) -> String {
+                  // UCI like "e2e4" - take last 2 chars
+                  guard uci.count >= 4 else { return uci }
+                  return String(uci.dropFirst(2).prefix(2))
+              }
+
+              private func arabicSquare(_ sq: String) -> String {
+                  // Convert file letter to Arabic
+                  guard let file = sq.first, let rank = sq.last else { return sq }
+                  let fileAr: String
+                  switch file {
+                  case "a": fileAr = "أ"
+                  case "b": fileAr = "ب"
+                  case "c": fileAr = "ج"
+                  case "d": fileAr = "د"
+                  case "e": fileAr = "هـ"
+                  case "f": fileAr = "و"
+                  case "g": fileAr = "ز"
+                  case "h": fileAr = "ح"
+                  default: fileAr = String(file)
+                  }
+                  return "\(fileAr)\(rank)"
+              }
+          }
+          '''
+
+          # ========== NEW: Game Recording ==========
+          files["Sources/GameRecorder.swift"] = r'''
           import Foundation
           import SwiftUI
+
+          /// Records all moves played in a game for review
           @MainActor
-          final class AIAssistantViewModel: ObservableObject {
-              @Published var currentExplanation: String = ""
-              @Published var isLoadingExplanation = false
-              @Published var explanationError: String = ""
-              @Published var currentExplainedMove: String = ""
-              @Published var chatMessages: [ChatEntry] = []
-              @Published var isLoadingChat = false
-              @Published var chatInput: String = ""
-              // NEW Phase 2
-              @Published var threatAnalysis: String = ""
-              @Published var isLoadingThreats = false
-              @Published var isPuzzleDetected = false
-              @Published var puzzleHint: String = ""
-
-              struct ChatEntry: Identifiable, Equatable {
-                  let id = UUID()
-                  let role: String
-                  let text: String
+          final class GameRecorder: ObservableObject {
+              struct MoveRecord: Identifiable, Codable {
+                  let id: UUID
+                  let ply: Int
+                  let uci: String
+                  let san: String
+                  let fenBefore: String
+                  let fenAfter: String
+                  let evalBefore: Int?  // in centipawns from white POV
+                  let evalAfter: Int?
+                  let wasMyMove: Bool
+                  let quality: String  // "brilliant", "best", "good", "inaccuracy", "mistake", "blunder"
+                  let bestAlternative: String?  // UCI of best move if this wasn't best
+                  let cpLoss: Int  // centipawn loss
+                  let timestamp: Date
               }
 
-              private var explanationCache: [String: String] = [:]
-              private var explanationTask: Task<Void, Never>?
+              @Published var moves: [MoveRecord] = []
+              @Published var gameId: UUID = UUID()
+              @Published var currentAccuracy: Double = 100.0
+              @Published var myMoveCount: Int = 0
+              @Published var brilliantCount: Int = 0
+              @Published var bestCount: Int = 0
+              @Published var goodCount: Int = 0
+              @Published var inaccuracyCount: Int = 0
+              @Published var mistakeCount: Int = 0
+              @Published var blunderCount: Int = 0
 
-              func explainMove(fen: String, uci: String, san: String, eval: String,
-                               ranking: Int, totalMoves: Int, isArabic: Bool) {
-                  let cacheKey = "\(fen)|\(uci)|\(isArabic ? "ar" : "en")"
-                  if let cached = explanationCache[cacheKey] {
-                      currentExplanation = cached; currentExplainedMove = san
-                      explanationError = ""; isLoadingExplanation = false; return
+              private var lastFenBefore: String = ""
+              private var lastEvalBefore: Int? = nil
+
+              /// Called when we detect a NEW position after opponent/self move
+              func recordMove(previousFen: String, previousEval: Int?,
+                              currentFen: String, currentEval: Int?,
+                              lastMoveUCI: String, wasMyMove: Bool,
+                              bestMoveUCI: String?, plyCount: Int) {
+                  guard !lastMoveUCI.isEmpty else { return }
+                  // Compute centipawn loss (positive = loss)
+                  var cpLoss = 0
+                  if let prev = previousEval, let curr = currentEval {
+                      // From perspective of the side that just moved
+                      let sideMul = wasMyMove ? 1 : -1  // simplified
+                      cpLoss = max(0, (prev - curr) * sideMul)
                   }
-                  currentExplanation = ""; currentExplainedMove = san
-                  explanationError = ""; isLoadingExplanation = true
-                  explanationTask?.cancel()
-                  explanationTask = Task { [weak self] in
-                      guard let self = self else { return }
-                      do {
-                          let result = try await GroqService.explainMove(fen: fen, uci: uci, san: san, eval: eval, isArabic: isArabic, ranking: ranking, totalMoves: totalMoves)
-                          if Task.isCancelled { return }
-                          await MainActor.run {
-                              self.currentExplanation = result
-                              self.explanationCache[cacheKey] = result
-                              self.isLoadingExplanation = false
-                          }
-                      } catch {
-                          if Task.isCancelled { return }
-                          await MainActor.run {
-                              self.explanationError = error.localizedDescription
-                              self.isLoadingExplanation = false
-                          }
+                  // Determine quality
+                  let quality: String
+                  switch cpLoss {
+                  case ..<(-30): quality = "brilliant"
+                  case (-30)...15: quality = "best"
+                  case 16...49: quality = "good"
+                  case 50...99: quality = "inaccuracy"
+                  case 100...299: quality = "mistake"
+                  default: quality = "blunder"
+                  }
+                  // Was it best move?
+                  let isBest = (bestMoveUCI == lastMoveUCI)
+                  let finalQuality = isBest ? "best" : quality
+                  let record = MoveRecord(
+                      id: UUID(), ply: plyCount, uci: lastMoveUCI, san: lastMoveUCI,
+                      fenBefore: previousFen, fenAfter: currentFen,
+                      evalBefore: previousEval, evalAfter: currentEval,
+                      wasMyMove: wasMyMove, quality: finalQuality,
+                      bestAlternative: (isBest ? nil : bestMoveUCI),
+                      cpLoss: cpLoss, timestamp: Date()
+                  )
+                  moves.append(record)
+                  // Update stats only for MY moves
+                  if wasMyMove {
+                      myMoveCount += 1
+                      switch finalQuality {
+                      case "brilliant": brilliantCount += 1
+                      case "best": bestCount += 1
+                      case "good": goodCount += 1
+                      case "inaccuracy": inaccuracyCount += 1
+                      case "mistake": mistakeCount += 1
+                      case "blunder": blunderCount += 1
+                      default: break
                       }
+                      recomputeAccuracy()
                   }
               }
 
-              func clearExplanation() { currentExplanation = ""; currentExplainedMove = ""; explanationError = "" }
+              func startNewGame() {
+                  moves = []
+                  gameId = UUID()
+                  currentAccuracy = 100.0
+                  myMoveCount = 0
+                  brilliantCount = 0; bestCount = 0; goodCount = 0
+                  inaccuracyCount = 0; mistakeCount = 0; blunderCount = 0
+              }
 
-              func sendChat(fen: String, isArabic: Bool) {
-                  let q = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                  guard !q.isEmpty else { return }
-                  chatInput = ""
-                  chatMessages.append(ChatEntry(role: "user", text: q))
-                  isLoadingChat = true
-                  let hist: [GroqService.ChatMessage] = chatMessages.suffix(6).dropLast().map {
-                      GroqService.ChatMessage(role: $0.role == "user" ? "user" : "assistant", content: $0.text)
-                  }
-                  Task { [weak self] in
-                      guard let self = self else { return }
-                      do {
-                          let r = try await GroqService.askAboutPosition(fen: fen, question: q, isArabic: isArabic, history: hist)
-                          await MainActor.run {
-                              self.chatMessages.append(ChatEntry(role: "ai", text: r))
-                              self.isLoadingChat = false
-                          }
-                      } catch {
-                          await MainActor.run {
-                              self.chatMessages.append(ChatEntry(role: "ai", text: "⚠️ \(error.localizedDescription)"))
-                              self.isLoadingChat = false
-                          }
-                      }
+              private func recomputeAccuracy() {
+                  guard myMoveCount > 0 else { currentAccuracy = 100.0; return }
+                  // Weight moves: brilliant=100, best=100, good=90, inaccuracy=70, mistake=40, blunder=10
+                  let total = brilliantCount * 100 + bestCount * 100 + goodCount * 90
+                             + inaccuracyCount * 70 + mistakeCount * 40 + blunderCount * 10
+                  currentAccuracy = Double(total) / Double(myMoveCount)
+              }
+
+              // MARK: - Persistence
+              private let storeKey = "chess_helper_game_history"
+
+              func saveCurrentGame() {
+                  guard !moves.isEmpty else { return }
+                  var history = loadHistory()
+                  let entry = GameHistoryEntry(id: gameId, date: Date(), moves: moves, accuracy: currentAccuracy)
+                  history.insert(entry, at: 0)
+                  // Keep last 20 games
+                  if history.count > 20 { history = Array(history.prefix(20)) }
+                  if let data = try? JSONEncoder().encode(history) {
+                      UserDefaults.standard.set(data, forKey: storeKey)
                   }
               }
 
-              func clearChat() { chatMessages.removeAll() }
-
-              // NEW Phase 2: Threat Analysis
-              func analyzeThreats(fen: String, isArabic: Bool) {
-                  threatAnalysis = ""
-                  isLoadingThreats = true
-                  Task { [weak self] in
-                      guard let self = self else { return }
-                      do {
-                          let r = try await GroqService.analyzeThreats(fen: fen, isArabic: isArabic)
-                          await MainActor.run {
-                              self.threatAnalysis = r
-                              self.isLoadingThreats = false
-                          }
-                      } catch {
-                          await MainActor.run {
-                              self.threatAnalysis = "⚠️ \(error.localizedDescription)"
-                              self.isLoadingThreats = false
-                          }
-                      }
+              func loadHistory() -> [GameHistoryEntry] {
+                  guard let data = UserDefaults.standard.data(forKey: storeKey),
+                        let history = try? JSONDecoder().decode([GameHistoryEntry].self, from: data) else {
+                      return []
                   }
+                  return history
               }
 
-              // NEW Phase 2: Puzzle Detection
-              func checkForPuzzle(topMoves: [TopMove]) {
-                  guard topMoves.count >= 2 else {
-                      isPuzzleDetected = false; puzzleHint = ""; return
-                  }
-                  let best = topMoves[0]
-                  let second = topMoves[1]
-                  // Puzzle = huge eval gap between #1 and #2 (>= 150cp or mate)
-                  let bestScore = best.rankScore
-                  let secondScore = second.rankScore
-                  let gap = bestScore - secondScore
-                  if gap >= 150 || best.mateIn != nil {
-                      isPuzzleDetected = true
-                      if let mate = best.mateIn {
-                          puzzleHint = "🧩 M\(abs(mate))!"
-                      } else {
-                          puzzleHint = "🧩 +\(Int(gap))cp!"
-                      }
-                  } else {
-                      isPuzzleDetected = false
-                      puzzleHint = ""
-                  }
+              func clearHistory() {
+                  UserDefaults.standard.removeObject(forKey: storeKey)
               }
+          }
+
+          struct GameHistoryEntry: Identifiable, Codable {
+              let id: UUID
+              let date: Date
+              let moves: [GameRecorder.MoveRecord]
+              let accuracy: Double
           }
           '''
 
-          # ===== EngineService (same as v5.0) =====
+          # ========== EngineService (unchanged from v5.1) ==========
           files["Sources/EngineService.swift"] = r'''
           import Foundation
 
@@ -637,6 +791,8 @@ jobs:
                           let ms = (pv["moves"] as? String) ?? ""
                           let fm = String(ms.split(separator: " ").first ?? "")
                           guard !fm.isEmpty else { continue }
+                          // VALIDATE MOVE
+                          guard MoveValidator.isPlausibleMove(uci: fm, fen: fen) else { continue }
                           let cp = pv["cp"] as? Int; let mate = pv["mate"] as? Int
                           moves.append(TopMove(rank: idx + 1, uci: fm, san: fm, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: depth, source: "lc", votes: 1))
                       }
@@ -657,6 +813,8 @@ jobs:
                       let (data, _) = try await URLSession.shared.data(for: req)
                       guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
                       let uci = (json["move"] as? String) ?? ""; guard !uci.isEmpty else { return nil }
+                      // VALIDATE MOVE
+                      guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
                       let san = (json["san"] as? String) ?? uci
                       let eval = json["eval"] as? Double; let mate = json["mate"] as? Int
                       let cp = eval.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? 13
@@ -681,6 +839,8 @@ jobs:
                       for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count { uci = parts[i+1]; break }
                       if uci.isEmpty { uci = parts.first ?? "" }
                       guard !uci.isEmpty else { return nil }
+                      // VALIDATE MOVE
+                      guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
                       let ev = json["evaluation"] as? Double; let mate = json["mate"] as? Int
                       let cp: Int? = ev.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? 13
                       return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "sf", votes: 1)
@@ -744,6 +904,206 @@ jobs:
           }
           '''
 
+          # ========== GroqService (with new puzzle explanation) ==========
+          files["Sources/GroqService.swift"] = r'''
+          import Foundation
+          enum GroqService {
+              struct ChatMessage: Codable { let role: String; let content: String }
+              enum GroqError: Error, LocalizedError {
+                  case noKey, invalidKey, networkError(String), rateLimited, parseError
+                  var errorDescription: String? {
+                      switch self {
+                      case .noKey: return "No Groq API key. Add it in Settings."
+                      case .invalidKey: return "Invalid API key."
+                      case .networkError(let m): return "Network: \(m)"
+                      case .rateLimited: return "Too many requests."
+                      case .parseError: return "Bad AI response"
+                      }
+                  }
+              }
+              static func chat(messages: [ChatMessage], temperature: Double = 0.3) async throws -> String {
+                  guard let apiKey = KeychainStore.load(account: KeychainStore.groqKeyAccount), !apiKey.isEmpty else { throw GroqError.noKey }
+                  guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else { throw GroqError.networkError("Bad URL") }
+                  var req = URLRequest(url: url); req.httpMethod = "POST"
+                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                  req.timeoutInterval = 30
+                  let body: [String: Any] = ["model": "llama-3.3-70b-versatile", "messages": messages.map { ["role": $0.role, "content": $0.content] }, "temperature": temperature, "max_tokens": 500, "top_p": 0.9]
+                  req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                  let (data, resp) = try await URLSession.shared.data(for: req)
+                  guard let http = resp as? HTTPURLResponse else { throw GroqError.networkError("No response") }
+                  if http.statusCode == 401 { throw GroqError.invalidKey }
+                  if http.statusCode == 429 { throw GroqError.rateLimited }
+                  guard (200..<300).contains(http.statusCode) else { throw GroqError.networkError("HTTP \(http.statusCode)") }
+                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                        let choices = json["choices"] as? [[String: Any]],
+                        let first = choices.first,
+                        let message = first["message"] as? [String: Any],
+                        let content = message["content"] as? String else { throw GroqError.parseError }
+                  return content.trimmingCharacters(in: .whitespacesAndNewlines)
+              }
+              static func explainMove(fen: String, uci: String, san: String, eval: String, isArabic: Bool, ranking: Int, totalMoves: Int) async throws -> String {
+                  let sys = isArabic ? "أنت مدرب شطرنج محترف. اشرح النقلات بالعربية بشكل مفصل ومفيد." : "You are a GM-level chess coach. Explain moves clearly."
+                  let usr = isArabic ? "الموقف: \(fen)\nالنقلة #\(ranking): \(san) (\(uci))\nالتقييم: \(eval)\n\nاشرحلي:\n1. لماذا هذه النقلة جيدة؟\n2. الخطة الاستراتيجية\n3. تهديدات الخصم\n4. نصائح تكتيكية\n\n4-6 أسطر." : "Position: \(fen)\nMove #\(ranking): \(san) (\(uci))\nEval: \(eval)\n\nExplain:\n1. Why is this good?\n2. Strategic plan\n3. Opponent threats\n4. Tactical tips\n\n4-6 lines."
+                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.4)
+              }
+              static func askAboutPosition(fen: String, question: String, isArabic: Bool, history: [ChatMessage] = []) async throws -> String {
+                  let sys = isArabic ? "أنت مدرب شطرنج. الموقف: \(fen). أجب بالعربية بشكل مفصل." : "You are a chess coach. Position: \(fen). Answer clearly."
+                  var msgs: [ChatMessage] = [ChatMessage(role: "system", content: sys)]
+                  msgs.append(contentsOf: history)
+                  msgs.append(ChatMessage(role: "user", content: question))
+                  return try await chat(messages: msgs, temperature: 0.7)
+              }
+              static func analyzeThreats(fen: String, isArabic: Bool) async throws -> String {
+                  let sys = isArabic ? "أنت مدرب شطرنج. حلل التهديدات بإيجاز." : "Chess coach. Analyze threats concisely."
+                  let usr = isArabic ? "الموقف: \(fen)\n\nحدد:\n1. كل تهديدات الخصم\n2. القطع المعرضة للخطر\n3. أي فخاخ\n\nمختصر 3-5 أسطر." : "Position: \(fen)\n\nIdentify:\n1. All threats\n2. Pieces in danger\n3. Traps\n\nConcise 3-5 lines."
+                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.3)
+              }
+              // NEW: Explain puzzle/tactical opportunity
+              static func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) async throws -> String {
+                  let sys = isArabic ? "أنت مدرب شطرنج تكتيكي محترف." : "You are a tactical chess coach."
+                  let usr = isArabic ? "الموقف: \(fen)\nأفضل نقلة: \(bestMove)\n\nهذه فرصة تكتيكية! اشرح:\n1. نوع التكتيك (شوكة، سيخ، اكتشاف، إلخ)\n2. لماذا هذه النقلة تفوز؟\n3. ما هو الرد المتوقع؟\n4. النتيجة النهائية\n\n4-6 أسطر واضحة." : "Position: \(fen)\nBest move: \(bestMove)\n\nThis is a tactical opportunity! Explain:\n1. Type of tactic (fork, pin, discovered, etc.)\n2. Why does this move win?\n3. What's the expected response?\n4. Final outcome\n\n4-6 clear lines."
+                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.3)
+              }
+              // NEW: Review a full game
+              static func reviewGame(movesUCI: [String], accuracy: Double, blunders: Int, mistakes: Int, isArabic: Bool) async throws -> String {
+                  let sys = isArabic ? "أنت مدرب شطرنج محترف. راجع اللعبة بأسلوب مشجع لكن صادق." : "You are a professional chess coach. Review the game encouragingly but honestly."
+                  let movesStr = movesUCI.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: " ")
+                  let usr = isArabic ? "اللعبة:\n\(movesStr)\n\nالدقة: \(Int(accuracy))%\nأخطاء فادحة: \(blunders)\nأخطاء: \(mistakes)\n\nاعطني:\n1. ملخص أداء اللاعب\n2. أهم نقاط القوة\n3. أهم نقاط الضعف\n4. نصيحة للتحسن\n\n5-8 أسطر." : "Game:\n\(movesStr)\n\nAccuracy: \(Int(accuracy))%\nBlunders: \(blunders)\nMistakes: \(mistakes)\n\nGive me:\n1. Performance summary\n2. Key strengths\n3. Key weaknesses\n4. Improvement tip\n\n5-8 lines."
+                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.5)
+              }
+          }
+          '''
+
+          # ========== AIAssistantViewModel with puzzle explanation ==========
+          files["Sources/AIAssistantViewModel.swift"] = r'''
+          import Foundation
+          import SwiftUI
+          @MainActor
+          final class AIAssistantViewModel: ObservableObject {
+              @Published var currentExplanation: String = ""
+              @Published var isLoadingExplanation = false
+              @Published var explanationError: String = ""
+              @Published var currentExplainedMove: String = ""
+              @Published var chatMessages: [ChatEntry] = []
+              @Published var isLoadingChat = false
+              @Published var chatInput: String = ""
+              @Published var threatAnalysis: String = ""
+              @Published var isLoadingThreats = false
+              @Published var isPuzzleDetected = false
+              @Published var puzzleHint: String = ""
+
+              struct ChatEntry: Identifiable, Equatable {
+                  let id = UUID()
+                  let role: String
+                  let text: String
+              }
+
+              private var explanationCache: [String: String] = [:]
+              private var explanationTask: Task<Void, Never>?
+
+              func explainMove(fen: String, uci: String, san: String, eval: String, ranking: Int, totalMoves: Int, isArabic: Bool) {
+                  let cacheKey = "\(fen)|\(uci)|\(isArabic ? "ar" : "en")"
+                  if let cached = explanationCache[cacheKey] {
+                      currentExplanation = cached; currentExplainedMove = san
+                      explanationError = ""; isLoadingExplanation = false; return
+                  }
+                  currentExplanation = ""; currentExplainedMove = san
+                  explanationError = ""; isLoadingExplanation = true
+                  explanationTask?.cancel()
+                  explanationTask = Task { [weak self] in
+                      guard let self = self else { return }
+                      do {
+                          let r = try await GroqService.explainMove(fen: fen, uci: uci, san: san, eval: eval, isArabic: isArabic, ranking: ranking, totalMoves: totalMoves)
+                          if Task.isCancelled { return }
+                          await MainActor.run {
+                              self.currentExplanation = r
+                              self.explanationCache[cacheKey] = r
+                              self.isLoadingExplanation = false
+                          }
+                      } catch {
+                          if Task.isCancelled { return }
+                          await MainActor.run { self.explanationError = error.localizedDescription; self.isLoadingExplanation = false }
+                      }
+                  }
+              }
+
+              // NEW: Explain puzzle
+              func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) {
+                  currentExplanation = ""
+                  currentExplainedMove = "🧩 " + (isArabic ? "فرصة تكتيكية" : "Tactical Opportunity")
+                  explanationError = ""
+                  isLoadingExplanation = true
+                  explanationTask?.cancel()
+                  explanationTask = Task { [weak self] in
+                      guard let self = self else { return }
+                      do {
+                          let r = try await GroqService.explainPuzzle(fen: fen, bestMove: bestMove, isArabic: isArabic)
+                          if Task.isCancelled { return }
+                          await MainActor.run {
+                              self.currentExplanation = r
+                              self.isLoadingExplanation = false
+                          }
+                      } catch {
+                          if Task.isCancelled { return }
+                          await MainActor.run { self.explanationError = error.localizedDescription; self.isLoadingExplanation = false }
+                      }
+                  }
+              }
+
+              func clearExplanation() { currentExplanation = ""; currentExplainedMove = ""; explanationError = "" }
+
+              func sendChat(fen: String, isArabic: Bool) {
+                  let q = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                  guard !q.isEmpty else { return }
+                  chatInput = ""
+                  chatMessages.append(ChatEntry(role: "user", text: q))
+                  isLoadingChat = true
+                  let hist: [GroqService.ChatMessage] = chatMessages.suffix(6).dropLast().map {
+                      GroqService.ChatMessage(role: $0.role == "user" ? "user" : "assistant", content: $0.text)
+                  }
+                  Task { [weak self] in
+                      guard let self = self else { return }
+                      do {
+                          let r = try await GroqService.askAboutPosition(fen: fen, question: q, isArabic: isArabic, history: hist)
+                          await MainActor.run { self.chatMessages.append(ChatEntry(role: "ai", text: r)); self.isLoadingChat = false }
+                      } catch {
+                          await MainActor.run { self.chatMessages.append(ChatEntry(role: "ai", text: "⚠️ \(error.localizedDescription)")); self.isLoadingChat = false }
+                      }
+                  }
+              }
+
+              func clearChat() { chatMessages.removeAll() }
+
+              func analyzeThreats(fen: String, isArabic: Bool) {
+                  threatAnalysis = ""; isLoadingThreats = true
+                  Task { [weak self] in
+                      guard let self = self else { return }
+                      do {
+                          let r = try await GroqService.analyzeThreats(fen: fen, isArabic: isArabic)
+                          await MainActor.run { self.threatAnalysis = r; self.isLoadingThreats = false }
+                      } catch {
+                          await MainActor.run { self.threatAnalysis = "⚠️ \(error.localizedDescription)"; self.isLoadingThreats = false }
+                      }
+                  }
+              }
+
+              func checkForPuzzle(topMoves: [TopMove]) {
+                  guard topMoves.count >= 2 else { isPuzzleDetected = false; puzzleHint = ""; return }
+                  let best = topMoves[0]; let second = topMoves[1]
+                  let gap = best.rankScore - second.rankScore
+                  if gap >= 150 || best.mateIn != nil {
+                      isPuzzleDetected = true
+                      if let mate = best.mateIn { puzzleHint = "🧩 M\(abs(mate))!" }
+                      else { puzzleHint = "🧩 +\(Int(gap))cp!" }
+                  } else {
+                      isPuzzleDetected = false; puzzleHint = ""
+                  }
+              }
+          }
+          '''
+
+          # ========== StealthManager (unchanged) ==========
           files["Sources/StealthManager.swift"] = r'''
           import SwiftUI
           import UIKit
@@ -784,9 +1144,7 @@ jobs:
           extension Notification.Name { static let stealthPanic = Notification.Name("StealthPanicGesture") }
           '''
 
-          # I need to split the remaining files into a continuation because this is getting very long.
-          # Let me include the most critical remaining files inline and reference unchanged ones.
-
+          # ========== EngineViewModel with recording + blunder detection ==========
           files["Sources/EngineViewModel.swift"] = r'''
           import Foundation
           import SwiftUI
@@ -827,6 +1185,9 @@ jobs:
               @Published var lastMoveCentipawnLoss = 0
               @Published var lastMoveWasMine = false
               @Published var enabled = true
+              // NEW: blunder alert
+              @Published var showBlunderAlert = false
+              @Published var blunderAlertText = ""
 
               var bestMove: TopMove? { topMoves.first }
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
@@ -834,12 +1195,17 @@ jobs:
 
               private let fenBuilder = FenBuilder()
               private var previousEvalWhitePOV: Double? = nil
+              private var previousFEN: String = ""
+              private var previousBestMove: String? = nil
               private var lastSuccessfulFEN = ""
               private var analysisTask: Task<Void, Never>?
               private var debounceTask: Task<Void, Never>?
               private var retryTask: Task<Void, Never>?
               private var moveHistoryUCI: [String] = []
               private var lastKnownPly: Int = -1
+
+              // Recorder reference (set from ContentView)
+              weak var recorder: GameRecorder?
 
               func setManualColor(_ c: String?) {
                   manualPlayerColor = c
@@ -848,7 +1214,9 @@ jobs:
               func flipColor() { setManualColor(effectivePlayerColor == "w" ? "b" : "w") }
               func resetFenTracker() {
                   fenBuilder.reset(); moveHistoryUCI = []; lastKnownPly = -1; lastSuccessfulFEN = ""
+                  previousEvalWhitePOV = nil; previousFEN = ""; previousBestMove = nil
                   Task { await AnalysisCache.shared.clear() }
+                  recorder?.startNewGame()
               }
               func deepAnalyze() {
                   guard !currentFEN.isEmpty else { return }
@@ -883,6 +1251,8 @@ jobs:
                   let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
                   if let _ = FenValidator.validate(fen) { return }
                   if fen != currentFEN {
+                      // Save previous state for recorder
+                      previousFEN = currentFEN
                       currentFEN = fen; topMoves = []; evaluation = "—"; winChance = 50
                       errorMessage = ""; sourcesUsed = ""; engineConfidence = 0
                       queueAnalyze(fen: fen)
@@ -921,7 +1291,34 @@ jobs:
                               self.isThinking = false; self.isDeepAnalyzing = false; self.isOffline = false
                               self.errorMessage = ""; self.lastSuccessfulFEN = fen
                               let wpov = self.evalWhitePOV(a.bestMove)
-                              self.computeQuality(cur: wpov); self.previousEvalWhitePOV = wpov
+                              self.computeQuality(cur: wpov)
+
+                              // NEW: Record move + check blunder
+                              if !self.previousFEN.isEmpty && !self.lastMoveUCI.isEmpty {
+                                  let prevCP = self.previousEvalWhitePOV.map { Int(($0 * 100).rounded()) }
+                                  let currCP = a.bestMove?.evaluationCp
+                                  self.recorder?.recordMove(
+                                      previousFen: self.previousFEN, previousEval: prevCP,
+                                      currentFen: fen, currentEval: currCP,
+                                      lastMoveUCI: self.lastMoveUCI, wasMyMove: self.lastMoveWasMine,
+                                      bestMoveUCI: self.previousBestMove, plyCount: self.plyCount
+                                  )
+                                  // Blunder alert (for my moves only)
+                                  if self.lastMoveWasMine && self.lastMoveCentipawnLoss >= 100 {
+                                      let qualityText = self.lastMoveQuality.rawValue
+                                      self.blunderAlertText = "\(qualityText) −\(self.lastMoveCentipawnLoss)cp"
+                                      self.showBlunderAlert = true
+                                      HapticManager.blunderWarning()
+                                      // Auto-hide after 3 seconds
+                                      Task {
+                                          try? await Task.sleep(nanoseconds: 3_000_000_000)
+                                          await MainActor.run { self.showBlunderAlert = false }
+                                      }
+                                  }
+                              }
+
+                              self.previousBestMove = a.bestMove?.uci
+                              self.previousEvalWhitePOV = wpov
                           }
                       } catch {
                           if Task.isCancelled { return }
@@ -981,8 +1378,319 @@ jobs:
           }
           '''
 
-          # ===== UI FILES - with FIXES + NEW Phase 2 features =====
+          # ========== NEW: ReviewView (complete Review tab) ==========
+          files["Sources/ReviewView.swift"] = r'''
+          import SwiftUI
 
+          struct ReviewView: View {
+              @ObservedObject var recorder: GameRecorder
+              @ObservedObject var language: AppLanguage
+              @State private var showAIReview = false
+              @State private var aiReviewText = ""
+              @State private var isLoadingReview = false
+              @State private var showHistory = false
+
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(spacing: 12) {
+                              statsCard
+                              accuracyBar
+                              qualityBreakdown
+                              aiReviewButton
+                              if !aiReviewText.isEmpty { aiReviewCard }
+                              movesListCard
+                              actionButtons
+                          }
+                          .padding()
+                      }
+                      .navigationTitle(language.isArabic ? "المراجعة" : "Review")
+                      .toolbar {
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button { showHistory = true } label: {
+                                  Image(systemName: "clock.arrow.circlepath")
+                              }
+                          }
+                      }
+                      .sheet(isPresented: $showHistory) {
+                          HistoryView(recorder: recorder, language: language)
+                      }
+                  }
+              }
+
+              private var statsCard: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      HStack {
+                          Image(systemName: "chart.bar.fill").foregroundColor(.green)
+                          Text(language.isArabic ? "إحصائيات اللعبة" : "Game Stats").font(.headline)
+                          Spacer()
+                          Text("\(recorder.moves.count) " + (language.isArabic ? "نقلة" : "moves"))
+                              .font(.caption).foregroundColor(.secondary)
+                      }
+                      HStack(spacing: 20) {
+                          statItem(value: "\(recorder.myMoveCount)", label: language.isArabic ? "نقلاتك" : "Your moves", color: .blue)
+                          statItem(value: "\(recorder.moves.count - recorder.myMoveCount)", label: language.isArabic ? "الخصم" : "Opponent", color: .gray)
+                      }
+                  }
+                  .padding()
+                  .background(Color.gray.opacity(0.15))
+                  .cornerRadius(12)
+              }
+
+              private func statItem(value: String, label: String, color: Color) -> some View {
+                  VStack(alignment: .leading, spacing: 2) {
+                      Text(value).font(.title2.bold()).foregroundColor(color)
+                      Text(label).font(.caption).foregroundColor(.secondary)
+                  }
+              }
+
+              private var accuracyBar: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      HStack {
+                          Text(language.isArabic ? "الدقة" : "Accuracy").font(.subheadline.bold())
+                          Spacer()
+                          Text("\(Int(recorder.currentAccuracy))%")
+                              .font(.title.bold())
+                              .foregroundColor(accuracyColor)
+                      }
+                      GeometryReader { geo in
+                          ZStack(alignment: .leading) {
+                              RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3))
+                              RoundedRectangle(cornerRadius: 6).fill(accuracyColor)
+                                  .frame(width: geo.size.width * CGFloat(recorder.currentAccuracy / 100))
+                          }
+                      }
+                      .frame(height: 12)
+                  }
+                  .padding()
+                  .background(Color.gray.opacity(0.15))
+                  .cornerRadius(12)
+              }
+
+              private var accuracyColor: Color {
+                  if recorder.currentAccuracy >= 90 { return .green }
+                  if recorder.currentAccuracy >= 75 { return .yellow }
+                  if recorder.currentAccuracy >= 60 { return .orange }
+                  return .red
+              }
+
+              private var qualityBreakdown: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      Text(language.isArabic ? "تفاصيل جودة النقلات" : "Move Quality").font(.subheadline.bold())
+                      qualityRow(icon: "✨", label: language.isArabic ? "رائعة" : "Brilliant", count: recorder.brilliantCount, color: .cyan)
+                      qualityRow(icon: "⭐", label: language.isArabic ? "أفضل" : "Best", count: recorder.bestCount, color: .green)
+                      qualityRow(icon: "✓", label: language.isArabic ? "جيدة" : "Good", count: recorder.goodCount, color: Color.green.opacity(0.7))
+                      qualityRow(icon: "?!", label: language.isArabic ? "غير دقيقة" : "Inaccuracy", count: recorder.inaccuracyCount, color: .yellow)
+                      qualityRow(icon: "?", label: language.isArabic ? "خطأ" : "Mistake", count: recorder.mistakeCount, color: .orange)
+                      qualityRow(icon: "??", label: language.isArabic ? "خطأ فادح" : "Blunder", count: recorder.blunderCount, color: .red)
+                  }
+                  .padding()
+                  .background(Color.gray.opacity(0.15))
+                  .cornerRadius(12)
+              }
+
+              private func qualityRow(icon: String, label: String, count: Int, color: Color) -> some View {
+                  HStack {
+                      Text(icon).frame(width: 30)
+                      Text(label).font(.caption)
+                      Spacer()
+                      Text("\(count)").font(.caption.bold()).foregroundColor(color)
+                  }
+                  .padding(.vertical, 2)
+              }
+
+              private var aiReviewButton: some View {
+                  Button {
+                      requestAIReview()
+                  } label: {
+                      HStack {
+                          if isLoadingReview {
+                              ProgressView().scaleEffect(0.7)
+                              Text(language.isArabic ? "جاري التحليل..." : "Analyzing...").font(.subheadline.bold())
+                          } else {
+                              Image(systemName: "sparkles")
+                              Text(language.isArabic ? "طلب تحليل AI للعبة" : "Request AI Game Review").font(.subheadline.bold())
+                          }
+                      }
+                      .frame(maxWidth: .infinity)
+                      .padding()
+                      .background(Color.purple.opacity(0.3))
+                      .foregroundColor(.purple)
+                      .cornerRadius(10)
+                  }
+                  .disabled(isLoadingReview || recorder.moves.isEmpty)
+              }
+
+              private var aiReviewCard: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      HStack {
+                          Image(systemName: "sparkles").foregroundColor(.purple)
+                          Text(language.isArabic ? "تحليل AI" : "AI Review").font(.headline)
+                      }
+                      Text(aiReviewText)
+                          .font(.callout)
+                          .foregroundColor(.white.opacity(0.9))
+                          .fixedSize(horizontal: false, vertical: true)
+                  }
+                  .padding()
+                  .background(Color.purple.opacity(0.15))
+                  .cornerRadius(12)
+              }
+
+              private var movesListCard: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      Text(language.isArabic ? "قائمة النقلات" : "Move List").font(.subheadline.bold())
+                      if recorder.moves.isEmpty {
+                          Text(language.isArabic ? "لا توجد نقلات بعد" : "No moves yet")
+                              .font(.caption).foregroundColor(.secondary).padding()
+                      } else {
+                          ForEach(recorder.moves) { move in
+                              moveRow(move)
+                          }
+                      }
+                  }
+                  .padding()
+                  .background(Color.gray.opacity(0.15))
+                  .cornerRadius(12)
+              }
+
+              private func moveRow(_ move: GameRecorder.MoveRecord) -> some View {
+                  HStack {
+                      Text("\(move.ply).").font(.caption.monospaced()).foregroundColor(.secondary).frame(width: 30)
+                      Text(move.san.isEmpty ? move.uci : move.san)
+                          .font(.callout.bold())
+                          .foregroundColor(move.wasMyMove ? .white : .gray)
+                      Spacer()
+                      qualityBadge(move.quality)
+                      if move.cpLoss >= 30 {
+                          Text("-\(move.cpLoss)").font(.caption2.monospaced()).foregroundColor(.orange)
+                      }
+                      if let alt = move.bestAlternative, alt != move.uci {
+                          Text("→ \(alt)").font(.caption2.monospaced()).foregroundColor(.green)
+                      }
+                  }
+                  .padding(.vertical, 2)
+              }
+
+              private func qualityBadge(_ q: String) -> some View {
+                  let (label, color): (String, Color) = {
+                      switch q {
+                      case "brilliant": return ("!!", .cyan)
+                      case "best": return ("⭐", .green)
+                      case "good": return ("✓", .green.opacity(0.7))
+                      case "inaccuracy": return ("?!", .yellow)
+                      case "mistake": return ("?", .orange)
+                      case "blunder": return ("??", .red)
+                      default: return ("", .gray)
+                      }
+                  }()
+                  return Text(label)
+                      .font(.caption.bold())
+                      .foregroundColor(color)
+                      .padding(.horizontal, 6).padding(.vertical, 2)
+                      .background(color.opacity(0.2))
+                      .cornerRadius(4)
+              }
+
+              private var actionButtons: some View {
+                  HStack(spacing: 8) {
+                      Button {
+                          recorder.saveCurrentGame()
+                          HapticManager.success()
+                      } label: {
+                          Label(language.isArabic ? "حفظ" : "Save", systemImage: "square.and.arrow.down")
+                              .frame(maxWidth: .infinity)
+                              .padding()
+                              .background(Color.blue.opacity(0.3))
+                              .cornerRadius(8)
+                      }
+                      Button {
+                          recorder.startNewGame()
+                          aiReviewText = ""
+                          HapticManager.selection()
+                      } label: {
+                          Label(language.isArabic ? "لعبة جديدة" : "New Game", systemImage: "arrow.clockwise")
+                              .frame(maxWidth: .infinity)
+                              .padding()
+                              .background(Color.red.opacity(0.3))
+                              .cornerRadius(8)
+                      }
+                  }
+              }
+
+              private func requestAIReview() {
+                  guard !recorder.moves.isEmpty else { return }
+                  isLoadingReview = true
+                  aiReviewText = ""
+                  let movesUCI = recorder.moves.map { $0.uci }
+                  Task {
+                      do {
+                          let r = try await GroqService.reviewGame(
+                              movesUCI: movesUCI,
+                              accuracy: recorder.currentAccuracy,
+                              blunders: recorder.blunderCount,
+                              mistakes: recorder.mistakeCount,
+                              isArabic: language.isArabic
+                          )
+                          await MainActor.run {
+                              aiReviewText = r
+                              isLoadingReview = false
+                          }
+                      } catch {
+                          await MainActor.run {
+                              aiReviewText = "⚠️ \(error.localizedDescription)"
+                              isLoadingReview = false
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct HistoryView: View {
+              @ObservedObject var recorder: GameRecorder
+              @ObservedObject var language: AppLanguage
+              @Environment(\.dismiss) var dismiss
+              @State private var history: [GameHistoryEntry] = []
+
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          if history.isEmpty {
+                              Text(language.isArabic ? "لا توجد ألعاب محفوظة" : "No saved games")
+                                  .foregroundColor(.secondary)
+                          } else {
+                              ForEach(history) { entry in
+                                  VStack(alignment: .leading, spacing: 4) {
+                                      HStack {
+                                          Text(entry.date, style: .date).font(.caption)
+                                          Spacer()
+                                          Text("\(Int(entry.accuracy))%").font(.caption.bold()).foregroundColor(.green)
+                                      }
+                                      Text("\(entry.moves.count) " + (language.isArabic ? "نقلة" : "moves"))
+                                          .font(.caption2).foregroundColor(.secondary)
+                                  }
+                              }
+                          }
+                      }
+                      .navigationTitle(language.isArabic ? "السجل" : "History")
+                      .toolbar {
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button(language.isArabic ? "مسح" : "Clear", role: .destructive) {
+                                  recorder.clearHistory()
+                                  history = []
+                              }
+                          }
+                          ToolbarItem(placement: .topBarLeading) {
+                              Button(language.isArabic ? "إغلاق" : "Close") { dismiss() }
+                          }
+                      }
+                      .onAppear { history = recorder.loadHistory() }
+                  }
+              }
+          }
+          '''
+
+          # ========== ContentView with recorder ==========
           files["Sources/ContentView.swift"] = r'''
           import SwiftUI
           struct ContentView: View {
@@ -991,11 +1699,13 @@ jobs:
               @StateObject private var router = AppRouter()
               @StateObject private var aiVM = AIAssistantViewModel()
               @StateObject private var language = AppLanguage()
+              @StateObject private var recorder = GameRecorder()
+
               var body: some View {
                   TabView(selection: $router.selectedTab) {
-                      PlayView(engine: engine, stealth: stealth, router: router, aiVM: aiVM, language: language)
+                      PlayView(engine: engine, stealth: stealth, router: router, aiVM: aiVM, language: language, recorder: recorder)
                           .tabItem { Label(language.isArabic ? "لعب" : "Play", systemImage: "gamecontroller.fill") }.tag(0)
-                      SimpleTabView(title: language.isArabic ? "مراجعة" : "Review", icon: "magnifyingglass")
+                      ReviewView(recorder: recorder, language: language)
                           .tabItem { Label(language.isArabic ? "مراجعة" : "Review", systemImage: "magnifyingglass") }.tag(1)
                       SimpleTabView(title: language.isArabic ? "افتتاحيات" : "Openings", icon: "book.fill")
                           .tabItem { Label(language.isArabic ? "افتتاحيات" : "Openings", systemImage: "book.fill") }.tag(2)
@@ -1006,6 +1716,9 @@ jobs:
                   }
                   .tint(.green)
                   .environment(\.layoutDirection, language.isArabic ? .rightToLeft : .leftToRight)
+                  .onAppear {
+                      engine.recorder = recorder
+                  }
               }
           }
           struct SimpleTabView: View {
@@ -1015,63 +1728,14 @@ jobs:
                       VStack(spacing: 20) {
                           Image(systemName: icon).font(.system(size: 60)).foregroundColor(.green)
                           Text(title).font(.largeTitle.bold())
-                          Text("v5.2 Coming").foregroundColor(.secondary)
+                          Text("v6.0 Coming").foregroundColor(.secondary)
                       }.navigationTitle(title)
                   }
               }
           }
           '''
 
-          # The remaining UI files (PlayView, HelperOverlay, AIAssistantPanel, SettingsView, ChessWebView)
-          # are very long. Let me write them with the fixes applied.
-
-          # Due to message length limits, I'll include the key changes inline
-          # and keep unchanged parts compact.
-
-          files["Sources/EvalBar.swift"] = r'''
-          import SwiftUI
-
-          /// Professional evaluation bar on the left side of the screen
-          struct EvalBar: View {
-              let winChance: Double  // 0-100 for current player
-              let evaluation: String
-              let isMyTurn: Bool
-
-              var body: some View {
-                  VStack(spacing: 0) {
-                      // Black portion (top)
-                      Rectangle()
-                          .fill(Color.black.opacity(0.8))
-                          .frame(width: 22)
-                      // White portion (bottom)
-                      Rectangle()
-                          .fill(Color.white.opacity(0.9))
-                          .frame(width: 22)
-                  }
-                  .frame(maxHeight: .infinity)
-                  .mask(alignment: .bottom) {
-                      VStack(spacing: 0) {
-                          Color.clear
-                              .frame(height: CGFloat(100 - winChance) / 100 * 400)
-                          Color.black
-                              .frame(height: CGFloat(winChance) / 100 * 400)
-                      }
-                      .frame(height: 400)
-                  }
-                  .overlay(alignment: .center) {
-                      Text(evaluation)
-                          .font(.system(size: 9, weight: .bold, design: .monospaced))
-                          .foregroundColor(.green)
-                          .shadow(color: .black, radius: 2)
-                          .rotationEffect(.degrees(-90))
-                  }
-                  .frame(width: 22)
-                  .cornerRadius(4)
-                  .shadow(radius: 3)
-              }
-          }
-          '''
-
+          # ========== PlayView (with Puzzle tap + Blunder alert + Voice button) ==========
           files["Sources/PlayView.swift"] = r'''
           import SwiftUI
           struct PlayView: View {
@@ -1080,6 +1744,7 @@ jobs:
               @ObservedObject var router: AppRouter
               @ObservedObject var aiVM: AIAssistantViewModel
               @ObservedObject var language: AppLanguage
+              @ObservedObject var recorder: GameRecorder
               @StateObject private var overlayPos = OverlayPosition()
               @StateObject private var aiPos = AIOverlayPosition()
               @State private var showDisclaimer = true
@@ -1091,13 +1756,10 @@ jobs:
                       nav
                       ZStack {
                           HStack(spacing: 0) {
-                              // NEW: Eval bar on the left
                               if stealth.overlayVisible && !engine.topMoves.isEmpty {
                                   EvalBar(
-                                      winChance: engine.effectivePlayerColor == engine.sideToMove
-                                          ? engine.winChance : (100 - engine.winChance),
-                                      evaluation: engine.evaluation,
-                                      isMyTurn: engine.isMyTurn
+                                      winChance: engine.effectivePlayerColor == engine.sideToMove ? engine.winChance : (100 - engine.winChance),
+                                      evaluation: engine.evaluation, isMyTurn: engine.isMyTurn
                                   )
                               }
                               ChessWebView(engine: engine, router: router)
@@ -1105,10 +1767,10 @@ jobs:
                           if stealth.overlayVisible { draggableOverlay }
                           if !stealth.overlayVisible { fixedRevealButton }
                           if aiPos.isVisible { draggableAIPanel }
-                          // NEW: Puzzle banner
-                          if aiVM.isPuzzleDetected {
-                              puzzleBanner
-                          }
+                          // Puzzle banner - now tappable!
+                          if aiVM.isPuzzleDetected { puzzleBanner }
+                          // NEW: Blunder alert
+                          if engine.showBlunderAlert { blunderAlertBanner }
                       }
                   }
                   .overlay(alignment: .center) {
@@ -1116,29 +1778,65 @@ jobs:
                           DisclaimerCard(language: language) { withAnimation { showDisclaimer = false } }.padding(24)
                       }
                   }
-                  // Puzzle detection on move update
                   .onChange(of: engine.topMoves.count) { _ in
                       aiVM.checkForPuzzle(topMoves: engine.topMoves)
+                      // Haptic when new moves arrive
+                      if !engine.topMoves.isEmpty && engine.isMyTurn {
+                          HapticManager.moveReady()
+                      }
                   }
               }
 
-              // NEW: Puzzle detected banner at top
+              // TAPPABLE puzzle banner
               private var puzzleBanner: some View {
                   VStack {
-                      HStack(spacing: 8) {
-                          Image(systemName: "puzzlepiece.fill").foregroundColor(.yellow)
-                          Text(language.isArabic ? "🧩 فيه فرصة تكتيكية!" : "🧩 Tactical opportunity!")
-                              .font(.caption.bold()).foregroundColor(.yellow)
-                          Spacer()
-                          Text(aiVM.puzzleHint).font(.caption.bold().monospaced()).foregroundColor(.yellow)
+                      Button {
+                          if let best = engine.bestMove {
+                              aiPos.isVisible = true
+                              aiPos.isChatMode = false
+                              aiVM.explainPuzzle(fen: engine.currentFEN, bestMove: best.san.isEmpty ? best.uci : best.san, isArabic: language.isArabic)
+                              HapticManager.selection()
+                          }
+                      } label: {
+                          HStack(spacing: 8) {
+                              Image(systemName: "puzzlepiece.fill").foregroundColor(.yellow)
+                              Text(language.isArabic ? "🧩 فرصة تكتيكية! (اضغط للشرح)" : "🧩 Tactical opportunity! (tap for AI)")
+                                  .font(.caption.bold()).foregroundColor(.yellow)
+                              Spacer()
+                              Text(aiVM.puzzleHint).font(.caption.bold().monospaced()).foregroundColor(.yellow)
+                              Image(systemName: "sparkles").foregroundColor(.purple).font(.caption)
+                          }
+                          .padding(.horizontal, 12).padding(.vertical, 8)
+                          .background(Color.yellow.opacity(0.25))
+                          .cornerRadius(10)
+                          .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.yellow.opacity(0.6), lineWidth: 1))
                       }
-                      .padding(.horizontal, 12).padding(.vertical, 6)
-                      .background(Color.yellow.opacity(0.2))
-                      .cornerRadius(8)
-                      .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.yellow.opacity(0.5), lineWidth: 1))
-                      .padding(.horizontal, 30).padding(.top, 4)
+                      .padding(.horizontal, 20).padding(.top, 6)
                       Spacer()
                   }
+              }
+
+              // NEW: Blunder alert banner (auto-hides after 3s)
+              private var blunderAlertBanner: some View {
+                  VStack {
+                      Spacer()
+                      HStack(spacing: 8) {
+                          Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
+                          Text(language.isArabic ? "⚠️ نقلة سيئة!" : "⚠️ Bad move!")
+                              .font(.subheadline.bold()).foregroundColor(.red)
+                          Spacer()
+                          Text(engine.blunderAlertText).font(.caption.bold().monospaced()).foregroundColor(.red)
+                      }
+                      .padding(.horizontal, 16).padding(.vertical, 12)
+                      .background(Color.red.opacity(0.25))
+                      .cornerRadius(12)
+                      .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.red.opacity(0.7), lineWidth: 2))
+                      .padding(.horizontal, 20)
+                      .padding(.bottom, 140)
+                      .shadow(color: .red.opacity(0.5), radius: 10)
+                      .transition(.move(edge: .bottom).combined(with: .opacity))
+                  }
+                  .animation(.spring(), value: engine.showBlunderAlert)
               }
 
               private var draggableOverlay: some View {
@@ -1154,31 +1852,24 @@ jobs:
                               DragGesture(minimumDistance: 5)
                                   .onChanged { v in isDragging = true; dragOffset = v.translation }
                                   .onEnded { v in
-                                      overlayPos.offset = CGSize(
-                                          width: overlayPos.offset.width + v.translation.width,
-                                          height: overlayPos.offset.height + v.translation.height
-                                      )
+                                      overlayPos.offset = CGSize(width: overlayPos.offset.width + v.translation.width, height: overlayPos.offset.height + v.translation.height)
                                       dragOffset = .zero; isDragging = false; overlayPos.save()
                                   }
                           )
                   }
               }
 
-              // FIX: AI panel drag only from header — scroll works inside
               private var draggableAIPanel: some View {
                   GeometryReader { geo in
                       AIAssistantPanel(aiVM: aiVM, aiPos: aiPos, engine: engine, language: language)
-                          .position(
-                              x: geo.size.width / 2 + aiPos.offset.width,
-                              y: geo.size.height / 2 + aiPos.offset.height
-                          )
+                          .position(x: geo.size.width / 2 + aiPos.offset.width, y: geo.size.height / 2 + aiPos.offset.height)
                   }
               }
 
               private var fixedRevealButton: some View {
                   VStack {
                       Spacer()
-                      Button { stealth.show() } label: {
+                      Button { stealth.show(); HapticManager.selection() } label: {
                           HStack(spacing: 8) {
                               Image(systemName: "eye.fill").font(.title3)
                               Text(language.isArabic ? "إظهار المساعد" : "Show Helper").font(.subheadline.bold())
@@ -1220,21 +1911,25 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v5.1").font(.title2.bold())
+                      Text("Chess Helper v5.2").font(.title2.bold())
                       Text(language.isArabic ? """
-                      Phase 2 - التحليل الاحترافي!
+                      إصدار احترافي - Phase 3!
 
-                      ✅ شريط التقييم الاحترافي
-                      ✅ كشف الألغاز التكتيكية تلقائياً
-                      ✅ تحليل التهديدات بالـ AI
-                      ✅ شات AI مع scroll محسّن
+                      ✅ Move Validator (نقلات دقيقة 100%)
+                      ✅ شرح الفرص التكتيكية (اضغط عليها)
+                      ✅ تحذير من النقلات السيئة
+                      ✅ صوت (اضغط 🔊 للسماع)
+                      ✅ اهتزاز خفيف
+                      ✅ Tab المراجعة الكامل + تحليل AI للعبة
                       """ : """
-                      Phase 2 - Professional Analysis!
+                      Professional v5.2!
 
-                      ✅ Professional evaluation bar
-                      ✅ Auto puzzle detection
-                      ✅ AI-powered threat analysis
-                      ✅ Fixed AI chat scrolling
+                      ✅ Move Validator (100% accurate moves)
+                      ✅ Tap puzzle banner for AI explanation
+                      ✅ Blunder warnings
+                      ✅ Voice announcements (tap 🔊)
+                      ✅ Light haptic feedback
+                      ✅ Full Review tab with AI game analysis
                       """)
                       .font(.footnote).foregroundColor(.white.opacity(0.85)).multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -1247,206 +1942,39 @@ jobs:
           }
           '''
 
-          # FIX: AI Panel with drag only from header + proper scroll
-          files["Sources/AIAssistantPanel.swift"] = r'''
+          # ========== EvalBar (unchanged) ==========
+          files["Sources/EvalBar.swift"] = r'''
           import SwiftUI
-          struct AIAssistantPanel: View {
-              @ObservedObject var aiVM: AIAssistantViewModel
-              @ObservedObject var aiPos: AIOverlayPosition
-              @ObservedObject var engine: EngineViewModel
-              @ObservedObject var language: AppLanguage
-              @FocusState private var chatFocused: Bool
-              @State private var panelDragOffset: CGSize = .zero
-
+          struct EvalBar: View {
+              let winChance: Double
+              let evaluation: String
+              let isMyTurn: Bool
               var body: some View {
                   VStack(spacing: 0) {
-                      // DRAGGABLE HEADER ONLY
-                      header
-                          .gesture(
-                              DragGesture(minimumDistance: 5)
-                                  .onChanged { v in panelDragOffset = v.translation }
-                                  .onEnded { v in
-                                      aiPos.offset = CGSize(
-                                          width: aiPos.offset.width + v.translation.width,
-                                          height: aiPos.offset.height + v.translation.height
-                                      )
-                                      panelDragOffset = .zero
-                                      aiPos.save()
-                                  }
-                          )
-                      // SCROLLABLE CONTENT (not draggable)
-                      if aiPos.isChatMode { chatContent }
-                      else { explanationContent }
-                      // NEW: Threat Analysis button
-                      if !aiPos.isChatMode {
-                          threatSection
-                      }
+                      Rectangle().fill(Color.black.opacity(0.8)).frame(width: 22)
+                      Rectangle().fill(Color.white.opacity(0.9)).frame(width: 22)
                   }
-                  .frame(maxWidth: 320)
-                  .background(.ultraThinMaterial)
-                  .cornerRadius(14)
-                  .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.purple.opacity(0.4), lineWidth: 1.5))
-                  .shadow(color: .purple.opacity(0.3), radius: 10, y: 4)
-                  .offset(panelDragOffset)
-              }
-
-              private var header: some View {
-                  HStack(spacing: 6) {
-                      Image(systemName: "hand.draw.fill").font(.caption2).foregroundColor(.white.opacity(0.5))
-                      Image(systemName: "sparkles").font(.caption).foregroundColor(.purple)
-                      Text("AI").font(.caption.bold()).foregroundColor(.purple)
-                      Spacer()
-                      Button { withAnimation { aiPos.isChatMode.toggle() } } label: {
-                          Image(systemName: aiPos.isChatMode ? "text.bubble.fill" : "bubble.left.and.bubble.right.fill")
-                              .font(.caption).foregroundColor(.blue)
+                  .frame(maxHeight: .infinity)
+                  .mask(alignment: .bottom) {
+                      VStack(spacing: 0) {
+                          Color.clear.frame(height: CGFloat(100 - winChance) / 100 * 400)
+                          Color.black.frame(height: CGFloat(winChance) / 100 * 400)
                       }
-                      Button { aiPos.isVisible = false } label: {
-                          Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(.red.opacity(0.7))
-                      }
+                      .frame(height: 400)
                   }
-                  .padding(.horizontal, 10).padding(.vertical, 6)
-                  .background(Color.purple.opacity(0.15))
-                  .contentShape(Rectangle())
-              }
-
-              private var explanationContent: some View {
-                  ScrollView {
-                      VStack(alignment: .leading, spacing: 6) {
-                          if !aiVM.currentExplainedMove.isEmpty {
-                              HStack {
-                                  Image(systemName: "star.fill").font(.caption).foregroundColor(.purple)
-                                  Text(aiVM.currentExplainedMove).font(.callout.bold()).foregroundColor(.purple)
-                              }
-                          }
-                          if aiVM.isLoadingExplanation {
-                              HStack {
-                                  ProgressView().scaleEffect(0.7)
-                                  Text(language.isArabic ? "AI يفكر..." : "AI thinking...").font(.caption).foregroundColor(.secondary)
-                              }
-                          } else if !aiVM.explanationError.isEmpty {
-                              Text("⚠️ \(aiVM.explanationError)").font(.caption).foregroundColor(.orange)
-                          } else if !aiVM.currentExplanation.isEmpty {
-                              Text(aiVM.currentExplanation)
-                                  .font(.callout)
-                                  .foregroundColor(.white.opacity(0.9))
-                                  .fixedSize(horizontal: false, vertical: true)
-                          } else {
-                              Text(language.isArabic ? "اضغط 'اسأل AI' للحصول على شرح" : "Tap 'Ask AI' for explanation")
-                                  .font(.caption).foregroundColor(.secondary)
-                          }
-                      }
-                      .padding(10)
+                  .overlay(alignment: .center) {
+                      Text(evaluation)
+                          .font(.system(size: 9, weight: .bold, design: .monospaced))
+                          .foregroundColor(.green)
+                          .shadow(color: .black, radius: 2)
+                          .rotationEffect(.degrees(-90))
                   }
-                  .frame(maxHeight: 280)
-              }
-
-              // NEW: Threat Analysis Section
-              private var threatSection: some View {
-                  VStack(spacing: 4) {
-                      Divider().opacity(0.3)
-                      Button {
-                          aiVM.analyzeThreats(fen: engine.currentFEN, isArabic: language.isArabic)
-                      } label: {
-                          HStack(spacing: 4) {
-                              if aiVM.isLoadingThreats {
-                                  ProgressView().scaleEffect(0.5)
-                              } else {
-                                  Image(systemName: "exclamationmark.shield.fill").font(.caption2)
-                              }
-                              Text(language.isArabic ? "تحليل التهديدات" : "Analyze Threats").font(.caption2.bold())
-                          }
-                          .padding(.horizontal, 8).padding(.vertical, 4)
-                          .background(Color.red.opacity(0.2))
-                          .foregroundColor(.red)
-                          .cornerRadius(6)
-                      }
-                      .disabled(aiVM.isLoadingThreats)
-
-                      if !aiVM.threatAnalysis.isEmpty {
-                          ScrollView {
-                              Text(aiVM.threatAnalysis)
-                                  .font(.caption)
-                                  .foregroundColor(.white.opacity(0.85))
-                                  .fixedSize(horizontal: false, vertical: true)
-                                  .padding(.horizontal, 10)
-                          }
-                          .frame(maxHeight: 120)
-                      }
-                  }
-                  .padding(.bottom, 6)
-              }
-
-              private var chatContent: some View {
-                  VStack(spacing: 0) {
-                      ScrollViewReader { proxy in
-                          ScrollView {
-                              VStack(alignment: .leading, spacing: 8) {
-                                  if aiVM.chatMessages.isEmpty {
-                                      Text(language.isArabic
-                                           ? "اسأل AI أي سؤال!\n\nمثال:\n• إيه أحسن استراتيجية؟\n• إيه هدف الخصم؟"
-                                           : "Ask AI anything!\n\nExamples:\n• Best strategy?\n• Opponent's plan?")
-                                          .font(.caption).foregroundColor(.secondary).padding(12)
-                                  }
-                                  ForEach(aiVM.chatMessages) { msg in
-                                      HStack {
-                                          if msg.role == "user" { Spacer() }
-                                          Text(msg.text)
-                                              .font(.caption)
-                                              .padding(.horizontal, 10).padding(.vertical, 6)
-                                              .background(msg.role == "user" ? Color.blue.opacity(0.3) : Color.purple.opacity(0.2))
-                                              .foregroundColor(.white.opacity(0.9))
-                                              .cornerRadius(8)
-                                              .frame(maxWidth: 240, alignment: msg.role == "user" ? .trailing : .leading)
-                                          if msg.role == "ai" { Spacer() }
-                                      }
-                                      .id(msg.id)
-                                  }
-                                  if aiVM.isLoadingChat {
-                                      HStack {
-                                          ProgressView().scaleEffect(0.6)
-                                          Text(language.isArabic ? "يكتب..." : "typing...").font(.caption2).foregroundColor(.secondary)
-                                      }.padding(.horizontal, 10)
-                                  }
-                              }
-                              .padding(6)
-                          }
-                          .frame(maxHeight: 280)
-                          .onChange(of: aiVM.chatMessages.count) { _ in
-                              if let last = aiVM.chatMessages.last {
-                                  withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                              }
-                          }
-                      }
-                      HStack(spacing: 6) {
-                          TextField(language.isArabic ? "اكتب سؤالك..." : "Your question...", text: $aiVM.chatInput)
-                              .font(.caption)
-                              .padding(.horizontal, 8).padding(.vertical, 6)
-                              .background(Color.black.opacity(0.3))
-                              .cornerRadius(8)
-                              .focused($chatFocused)
-                              .onSubmit { aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic) }
-                          Button {
-                              aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic)
-                              chatFocused = false
-                          } label: {
-                              Image(systemName: "paperplane.fill").foregroundColor(.blue)
-                                  .padding(6).background(Color.blue.opacity(0.2)).cornerRadius(6)
-                          }
-                          .disabled(aiVM.chatInput.trimmingCharacters(in: .whitespaces).isEmpty || aiVM.isLoadingChat)
-                          if !aiVM.chatMessages.isEmpty {
-                              Button { aiVM.clearChat() } label: {
-                                  Image(systemName: "trash").foregroundColor(.red.opacity(0.7)).font(.caption)
-                              }
-                          }
-                      }
-                      .padding(8).background(Color.black.opacity(0.2))
-                  }
+                  .frame(width: 22).cornerRadius(4).shadow(radius: 3)
               }
           }
           '''
 
-          # HelperOverlay - same as v5.0 but referenced from previous version
-          # (keeping it identical since it's unchanged)
+          # ========== HelperOverlay with Voice button ==========
           files["Sources/HelperOverlay.swift"] = r'''
           import SwiftUI
           struct HelperOverlay: View {
@@ -1466,9 +1994,7 @@ jobs:
                               .overlay(Circle().stroke(Color.white.opacity(0.4), lineWidth: 1))
                               .shadow(radius: 3)
                       }
-                  } else {
-                      panel.frame(maxWidth: maxWidth)
-                  }
+                  } else { panel.frame(maxWidth: maxWidth) }
               }
               private var panel: some View {
                   VStack(spacing: 0) {
@@ -1480,8 +2006,7 @@ jobs:
                                   Text("OFFLINE").font(.caption2.bold()).foregroundColor(.red)
                                   Spacer(); ProgressView().scaleEffect(0.5)
                               }
-                              .padding(.horizontal, 10).padding(.vertical, 3)
-                              .background(Color.red.opacity(0.15))
+                              .padding(.horizontal, 10).padding(.vertical, 3).background(Color.red.opacity(0.15))
                           }
                           bestMoveHighlight
                           if !overlayPos.isCompact { movesSection }
@@ -1533,7 +2058,14 @@ jobs:
                           VStack(alignment: .trailing, spacing: 1) {
                               Text(best.evalString).font(.callout.bold().monospaced()).foregroundColor(cc)
                               Text("d\(best.depth)").font(.caption2.monospaced()).foregroundColor(.secondary)
-                              Text(engine.sourcesUsed).font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(1)
+                              // NEW: Voice button
+                              Button {
+                                  VoiceManager.shared.speakMove(uci: best.uci, san: best.san, isArabic: language.isArabic)
+                                  HapticManager.selection()
+                              } label: {
+                                  Image(systemName: "speaker.wave.2.fill").font(.caption).foregroundColor(.blue)
+                                      .padding(3).background(Color.blue.opacity(0.2)).cornerRadius(4)
+                              }
                           }
                       }
                       .padding(.horizontal, 10).padding(.vertical, 6)
@@ -1600,8 +2132,7 @@ jobs:
                           }
                           .padding(.horizontal, 8).padding(.vertical, 5)
                           .background(Color.cyan.opacity(0.3)).foregroundColor(.cyan).cornerRadius(6)
-                      }
-                      .disabled(engine.isDeepAnalyzing)
+                      }.disabled(engine.isDeepAnalyzing)
                       Button {
                           aiPos.isVisible = true; aiPos.isChatMode = true
                       } label: {
@@ -1642,6 +2173,177 @@ jobs:
           }
           '''
 
+          # ========== AI Panel (with fixed scroll from v5.1) ==========
+          files["Sources/AIAssistantPanel.swift"] = r'''
+          import SwiftUI
+          struct AIAssistantPanel: View {
+              @ObservedObject var aiVM: AIAssistantViewModel
+              @ObservedObject var aiPos: AIOverlayPosition
+              @ObservedObject var engine: EngineViewModel
+              @ObservedObject var language: AppLanguage
+              @FocusState private var chatFocused: Bool
+              @State private var panelDragOffset: CGSize = .zero
+              var body: some View {
+                  VStack(spacing: 0) {
+                      header.gesture(
+                          DragGesture(minimumDistance: 5)
+                              .onChanged { v in panelDragOffset = v.translation }
+                              .onEnded { v in
+                                  aiPos.offset = CGSize(width: aiPos.offset.width + v.translation.width, height: aiPos.offset.height + v.translation.height)
+                                  panelDragOffset = .zero
+                                  aiPos.save()
+                              }
+                      )
+                      if aiPos.isChatMode { chatContent } else { explanationContent }
+                      if !aiPos.isChatMode { threatSection }
+                  }
+                  .frame(maxWidth: 320)
+                  .background(.ultraThinMaterial).cornerRadius(14)
+                  .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.purple.opacity(0.4), lineWidth: 1.5))
+                  .shadow(color: .purple.opacity(0.3), radius: 10, y: 4)
+                  .offset(panelDragOffset)
+              }
+              private var header: some View {
+                  HStack(spacing: 6) {
+                      Image(systemName: "hand.draw.fill").font(.caption2).foregroundColor(.white.opacity(0.5))
+                      Image(systemName: "sparkles").font(.caption).foregroundColor(.purple)
+                      Text("AI").font(.caption.bold()).foregroundColor(.purple)
+                      Spacer()
+                      // Speak explanation button
+                      if !aiVM.currentExplanation.isEmpty && !aiPos.isChatMode {
+                          Button {
+                              VoiceManager.shared.speak(text: aiVM.currentExplanation, isArabic: language.isArabic)
+                              HapticManager.selection()
+                          } label: {
+                              Image(systemName: "speaker.wave.2.fill").font(.caption).foregroundColor(.blue)
+                          }
+                      }
+                      Button { withAnimation { aiPos.isChatMode.toggle() } } label: {
+                          Image(systemName: aiPos.isChatMode ? "text.bubble.fill" : "bubble.left.and.bubble.right.fill")
+                              .font(.caption).foregroundColor(.blue)
+                      }
+                      Button { aiPos.isVisible = false } label: {
+                          Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(.red.opacity(0.7))
+                      }
+                  }
+                  .padding(.horizontal, 10).padding(.vertical, 6).background(Color.purple.opacity(0.15))
+                  .contentShape(Rectangle())
+              }
+              private var explanationContent: some View {
+                  ScrollView {
+                      VStack(alignment: .leading, spacing: 6) {
+                          if !aiVM.currentExplainedMove.isEmpty {
+                              HStack {
+                                  Image(systemName: "star.fill").font(.caption).foregroundColor(.purple)
+                                  Text(aiVM.currentExplainedMove).font(.callout.bold()).foregroundColor(.purple)
+                              }
+                          }
+                          if aiVM.isLoadingExplanation {
+                              HStack {
+                                  ProgressView().scaleEffect(0.7)
+                                  Text(language.isArabic ? "AI يفكر..." : "AI thinking...").font(.caption).foregroundColor(.secondary)
+                              }
+                          } else if !aiVM.explanationError.isEmpty {
+                              Text("⚠️ \(aiVM.explanationError)").font(.caption).foregroundColor(.orange)
+                          } else if !aiVM.currentExplanation.isEmpty {
+                              Text(aiVM.currentExplanation).font(.callout).foregroundColor(.white.opacity(0.9))
+                                  .fixedSize(horizontal: false, vertical: true)
+                          } else {
+                              Text(language.isArabic ? "اضغط 'اسأل AI' للحصول على شرح" : "Tap 'Ask AI' for explanation")
+                                  .font(.caption).foregroundColor(.secondary)
+                          }
+                      }
+                      .padding(10)
+                  }
+                  .frame(maxHeight: 280)
+              }
+              private var threatSection: some View {
+                  VStack(spacing: 4) {
+                      Divider().opacity(0.3)
+                      Button {
+                          aiVM.analyzeThreats(fen: engine.currentFEN, isArabic: language.isArabic)
+                      } label: {
+                          HStack(spacing: 4) {
+                              if aiVM.isLoadingThreats { ProgressView().scaleEffect(0.5) }
+                              else { Image(systemName: "exclamationmark.shield.fill").font(.caption2) }
+                              Text(language.isArabic ? "تحليل التهديدات" : "Analyze Threats").font(.caption2.bold())
+                          }
+                          .padding(.horizontal, 8).padding(.vertical, 4)
+                          .background(Color.red.opacity(0.2)).foregroundColor(.red).cornerRadius(6)
+                      }.disabled(aiVM.isLoadingThreats)
+                      if !aiVM.threatAnalysis.isEmpty {
+                          ScrollView {
+                              Text(aiVM.threatAnalysis).font(.caption).foregroundColor(.white.opacity(0.85))
+                                  .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 10)
+                          }
+                          .frame(maxHeight: 120)
+                      }
+                  }
+                  .padding(.bottom, 6)
+              }
+              private var chatContent: some View {
+                  VStack(spacing: 0) {
+                      ScrollViewReader { proxy in
+                          ScrollView {
+                              VStack(alignment: .leading, spacing: 8) {
+                                  if aiVM.chatMessages.isEmpty {
+                                      Text(language.isArabic ? "اسأل AI!\n\nمثال:\n• إيه أحسن استراتيجية؟" : "Ask AI!\n\nExamples:\n• Best strategy?")
+                                          .font(.caption).foregroundColor(.secondary).padding(12)
+                                  }
+                                  ForEach(aiVM.chatMessages) { msg in
+                                      HStack {
+                                          if msg.role == "user" { Spacer() }
+                                          Text(msg.text).font(.caption)
+                                              .padding(.horizontal, 10).padding(.vertical, 6)
+                                              .background(msg.role == "user" ? Color.blue.opacity(0.3) : Color.purple.opacity(0.2))
+                                              .foregroundColor(.white.opacity(0.9)).cornerRadius(8)
+                                              .frame(maxWidth: 240, alignment: msg.role == "user" ? .trailing : .leading)
+                                          if msg.role == "ai" { Spacer() }
+                                      }
+                                      .id(msg.id)
+                                  }
+                                  if aiVM.isLoadingChat {
+                                      HStack {
+                                          ProgressView().scaleEffect(0.6)
+                                          Text(language.isArabic ? "يكتب..." : "typing...").font(.caption2).foregroundColor(.secondary)
+                                      }.padding(.horizontal, 10)
+                                  }
+                              }
+                              .padding(6)
+                          }
+                          .frame(maxHeight: 280)
+                          .onChange(of: aiVM.chatMessages.count) { _ in
+                              if let last = aiVM.chatMessages.last {
+                                  withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                              }
+                          }
+                      }
+                      HStack(spacing: 6) {
+                          TextField(language.isArabic ? "اكتب سؤالك..." : "Your question...", text: $aiVM.chatInput)
+                              .font(.caption).padding(.horizontal, 8).padding(.vertical, 6)
+                              .background(Color.black.opacity(0.3)).cornerRadius(8)
+                              .focused($chatFocused)
+                              .onSubmit { aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic) }
+                          Button {
+                              aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic)
+                              chatFocused = false
+                          } label: {
+                              Image(systemName: "paperplane.fill").foregroundColor(.blue)
+                                  .padding(6).background(Color.blue.opacity(0.2)).cornerRadius(6)
+                          }.disabled(aiVM.chatInput.trimmingCharacters(in: .whitespaces).isEmpty || aiVM.isLoadingChat)
+                          if !aiVM.chatMessages.isEmpty {
+                              Button { aiVM.clearChat() } label: {
+                                  Image(systemName: "trash").foregroundColor(.red.opacity(0.7)).font(.caption)
+                              }
+                          }
+                      }
+                      .padding(8).background(Color.black.opacity(0.2))
+                  }
+              }
+          }
+          '''
+
+          # ========== SettingsView ==========
           files["Sources/SettingsView.swift"] = r'''
           import SwiftUI
           struct SettingsView: View {
@@ -1691,10 +2393,8 @@ jobs:
                                   HStack {
                                       Button(language.isArabic ? "حفظ" : "Save") {
                                           let t = apiKeyInput.trimmingCharacters(in: .whitespaces)
-                                          if !t.isEmpty {
-                                              if KeychainStore.save(t, account: KeychainStore.groqKeyAccount) {
-                                                  apiKeySaved = true; showKeyInput = false; apiKeyInput = ""
-                                              }
+                                          if !t.isEmpty && KeychainStore.save(t, account: KeychainStore.groqKeyAccount) {
+                                              apiKeySaved = true; showKeyInput = false; apiKeyInput = ""
                                           }
                                       }.buttonStyle(.borderedProminent)
                                       Spacer()
@@ -1727,8 +2427,8 @@ jobs:
                               Button(language.isArabic ? "إخفاء" : "Hide", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "5.1.0 (51)")
-                              LabeledContent("Phase", value: "2 of 3")
+                              LabeledContent("Version", value: "5.2.0 (52)")
+                              LabeledContent("Features", value: "Voice+Haptic+Review")
                           }
                       }
                       .navigationTitle(language.isArabic ? "الإعدادات" : "Settings")
@@ -1741,6 +2441,7 @@ jobs:
           }
           '''
 
+          # ========== ChessWebView (unchanged) ==========
           files["Sources/ChessWebView.swift"] = r'''
           import SwiftUI
           import WebKit
@@ -1841,8 +2542,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>5.1.0</string>
-            <key>CFBundleVersion</key><string>51</string>
+            <key>CFBundleShortVersionString</key><string>5.2.0</string>
+            <key>CFBundleVersion</key><string>52</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
