@@ -731,249 +731,581 @@ jobs:
           files["Sources/EngineService.swift"] = r'''
           import Foundation
 
-          struct TopMove: Identifiable, Equatable {
-              let id = UUID()
-              let rank: Int; let uci: String; let san: String
-              let evaluationCp: Int?; let mateIn: Int?; let depth: Int
-              let source: String; let votes: Int
-              var evalString: String {
-                  if let m = mateIn, m != 0 { return "M\(abs(m))" }
-                  if let cp = evaluationCp { return String(format: "%+.2f", Double(cp)/100.0) }
-                  return "—"
-              }
-              var winChance: Double {
-                  if let m = mateIn, m != 0 { return m > 0 ? 99 : 1 }
-                  guard let cp = evaluationCp else { return 50 }
-                  return 50 + 50 * tanh(Double(cp)/400.0)
-              }
-              var rankScore: Double {
-                  if let m = mateIn, m != 0 { return m > 0 ? 100000 - Double(m) : -100000 - Double(m) }
-                  return Double(evaluationCp ?? 0)
-              }
-          }
+struct TopMove: Identifiable, Equatable {
+    let id = UUID()
+    let rank: Int
+    let uci: String
+    let san: String
+    let evaluationCp: Int?
+    let mateIn: Int?
+    let depth: Int
+    let source: String
+    let votes: Int
+    
+    var evalString: String {
+        if let m = mateIn, m != 0 { return "M\(abs(m))" }
+        if let cp = evaluationCp { return String(format: "%+.2f", Double(cp)/100.0) }
+        return "—"
+    }
+    
+    var winChance: Double {
+        if let m = mateIn, m != 0 { return m > 0 ? 99 : 1 }
+        guard let cp = evaluationCp else { return 50 }
+        return 50 + 50 * tanh(Double(cp)/400.0)
+    }
+    
+    var rankScore: Double {
+        if let m = mateIn, m != 0 { return m > 0 ? 100000 - Double(m) : -100000 - Double(m) }
+        return Double(evaluationCp ?? 0)
+    }
+}
 
-          struct EngineAnalysis {
-              let topMoves: [TopMove]; let bestMove: TopMove?
-              let depth: Int; let sourcesUsed: String
-              let confidence: Int; let debugFen: String
-          }
+struct EngineAnalysis {
+    let topMoves: [TopMove]
+    let bestMove: TopMove?
+    let depth: Int
+    let sourcesUsed: String
+    let confidence: Int
+    let debugFen: String
+}
 
-          enum EngineError: Error, LocalizedError {
-              case badFen(String), networkOffline, allEnginesFailed, cancelled
-              var errorDescription: String? {
-                  switch self {
-                  case .badFen(let m): return "Bad FEN: \(m)"
-                  case .networkOffline: return "No internet"
-                  case .allEnginesFailed: return "All engines offline"
-                  case .cancelled: return "Cancelled"
-                  }
-              }
-          }
+enum EngineError: Error, LocalizedError {
+    case badFen(String)
+    case networkOffline
+    case allEnginesFailed
+    case cancelled
+    
+    var errorDescription: String? {
+        switch self {
+        case .badFen(let m):
+            return "Bad FEN: \(m)"
+        case .networkOffline:
+            return "No internet"
+        case .allEnginesFailed:
+            return "All engines offline"
+        case .cancelled:
+            return "Cancelled"
+        }
+    }
+}
 
-          enum EngineService {
-              static func callLichessCloud(fen: String, multiPv: Int = 3) async -> [TopMove]? {
-                  var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
-                  comps.queryItems = [URLQueryItem(name: "fen", value: fen), URLQueryItem(name: "multiPv", value: "\(multiPv)")]
-                  guard let url = comps.url else { return nil }
-                  var req = URLRequest(url: url); req.timeoutInterval = 5
-                  req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  do {
-                      let (data, resp) = try await URLSession.shared.data(for: req)
-                      guard let http = resp as? HTTPURLResponse else { return nil }
-                      if http.statusCode == 404 { return [] }
-                      guard http.statusCode == 200 else { return nil }
-                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-                      let depth = (json["depth"] as? Int) ?? 20
-                      guard let pvs = json["pvs"] as? [[String: Any]] else { return [] }
-                      var moves: [TopMove] = []
-                      for (idx, pv) in pvs.prefix(multiPv).enumerated() {
-                          let ms = (pv["moves"] as? String) ?? ""
-                          let fm = String(ms.split(separator: " ").first ?? "")
-                          guard !fm.isEmpty else { continue }
-                          // VALIDATE MOVE
-                          guard MoveValidator.isPlausibleMove(uci: fm, fen: fen) else { continue }
-                          let cp = pv["cp"] as? Int; let mate = pv["mate"] as? Int
-                          moves.append(TopMove(rank: idx + 1, uci: fm, san: fm, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: depth, source: "lc", votes: 1))
-                      }
-                      return moves
-                  } catch { return nil }
-              }
-
-              static func callChessApi(fen: String, deep: Bool = false) async -> TopMove? {
-                  guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
-                  var req = URLRequest(url: url); req.httpMethod = "POST"
-                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  req.timeoutInterval = deep ? 15 : 6; req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-                  let body: [String: Any] = ["fen": fen, "depth": deep ? 18 : 13, "maxThinkingTime": deep ? 800 : 200]
-                  guard let hb = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-                  req.httpBody = hb
-                  do {
-                      let (data, _) = try await URLSession.shared.data(for: req)
-                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-                      let uci = (json["move"] as? String) ?? ""; guard !uci.isEmpty else { return nil }
-                      // VALIDATE MOVE
-                      guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
-                      let san = (json["san"] as? String) ?? uci
-                      let eval = json["eval"] as? Double; let mate = json["mate"] as? Int
-                      let cp = eval.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? 13
-                      return TopMove(rank: 1, uci: uci, san: san, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "cA", votes: 1)
-                  } catch { return nil }
-              }
-
-              static func callStockfishOnline(fen: String, deep: Bool = false) async -> TopMove? {
-                  var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
-                  comps.queryItems = [URLQueryItem(name: "fen", value: fen), URLQueryItem(name: "depth", value: deep ? "15" : "13")]
-                  guard let url = comps.url else { return nil }
-                  var req = URLRequest(url: url); req.timeoutInterval = deep ? 15 : 6
-                  req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  do {
-                      let (data, _) = try await URLSession.shared.data(for: req)
-                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-                      if let s = json["success"] as? Bool, !s { return nil }
-                      let bf = (json["bestmove"] as? String) ?? ""
-                      let parts = bf.split(separator: " ").map(String.init)
-                      var uci = ""
-                      for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count { uci = parts[i+1]; break }
-                      if uci.isEmpty { uci = parts.first ?? "" }
-                      guard !uci.isEmpty else { return nil }
-                      // VALIDATE MOVE
-                      guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
-                      let ev = json["evaluation"] as? Double; let mate = json["mate"] as? Int
-                      let cp: Int? = ev.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? 13
-                      return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "sf", votes: 1)
-                  } catch { return nil }
-              }
-
-              static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
-                                            onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
-                  if let issue = FenValidator.validate(fen) { throw EngineError.badFen(issue) }
-                  if !deep, let cached = await AnalysisCache.shared.get(fen: fen) {
-                      let cm = cached.moves.enumerated().map { (i, m) in
-                          TopMove(rank: i + 1, uci: m.uci, san: m.san, evaluationCp: m.evaluationCp, mateIn: m.mateIn, depth: m.depth, source: "cache", votes: m.votes)
-                      }
-                      let a = EngineAnalysis(topMoves: cm, bestMove: cm.first, depth: cached.depth, sourcesUsed: "cache", confidence: cached.confidence, debugFen: fen)
-                      await MainActor.run { onUpdate(a) }
-                      return a
-                  }
-                  async let lr = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
-                  async let cr = callChessApi(fen: fen, deep: deep)
-                  async let sr = callStockfishOnline(fen: fen, deep: deep)
-                  let lichess = await lr; try Task.checkCancellation()
-                  let cA = await cr; try Task.checkCancellation()
-                  let sf = await sr; try Task.checkCancellation()
-
-                  var mv: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
-                  if let lm = lichess { for m in lm {
-                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("lc"); mv[m.uci] = e }
-                      else { mv[m.uci] = (m, 1, ["lc"]) }
-                  }}
-                  if let m = cA {
-                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("cA"); mv[m.uci] = e }
-                      else { mv[m.uci] = (m, 1, ["cA"]) }
-                  }
-                  if let m = sf {
-                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("sf"); mv[m.uci] = e }
-                      else { mv[m.uci] = (m, 1, ["sf"]) }
-                  }
-                  guard !mv.isEmpty else {
-                      if lichess == nil && cA == nil && sf == nil { throw EngineError.networkOffline }
-                      throw EngineError.allEnginesFailed
-                  }
-                  let sorted = mv.values.sorted { a, b in
-                      if a.votes != b.votes { return a.votes > b.votes }
-                      return a.move.rankScore > b.move.rankScore
-                  }
-                  let limit = deep ? 5 : 3
-                  let final: [TopMove] = sorted.prefix(limit).enumerated().map { (idx, e) in
-                      TopMove(rank: idx + 1, uci: e.move.uci, san: e.move.san, evaluationCp: e.move.evaluationCp, mateIn: e.move.mateIn, depth: e.move.depth, source: e.sources.joined(separator: "+"), votes: e.votes)
-                  }
-                  let topV = final.first?.votes ?? 1
-                  let allS = Array(Set(mv.values.flatMap { $0.sources })).sorted().joined(separator: "+")
-                  let bestD = final.map { $0.depth }.max() ?? 13
-                  let identical = final.count >= 2 && final.allSatisfy { $0.evaluationCp == final.first?.evaluationCp }
-                  let analysis = EngineAnalysis(topMoves: final, bestMove: final.first, depth: bestD, sourcesUsed: allS, confidence: min(topV, 3), debugFen: fen)
-                  if !identical && !deep {
-                      await AnalysisCache.shared.set(fen: fen, moves: final, depth: bestD, sources: allS, confidence: min(topV, 3))
-                  }
-                  await MainActor.run { onUpdate(analysis) }
-                  return analysis
-              }
-          }
-          '''
-
+enum EngineService {
+    
+    // ✅ LICHESS CLOUD
+    static func callLichessCloud(fen: String, multiPv: Int = 3) async -> [TopMove]? {
+        var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
+        comps.queryItems = [
+            URLQueryItem(name: "fen", value: fen),
+            URLQueryItem(name: "multiPv", value: "\(multiPv)")
+        ]
+        guard let url = comps.url else { return nil }
+        
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 4  // ✅ قصير
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+        
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { return nil }
+            
+            if http.statusCode == 404 { return [] }
+            guard http.statusCode == 200 else { return nil }
+            
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            
+            let depth = (json["depth"] as? Int) ?? 20
+            guard let pvs = json["pvs"] as? [[String: Any]] else { return [] }
+            
+            var moves: [TopMove] = []
+            for (idx, pv) in pvs.prefix(multiPv).enumerated() {
+                let ms = (pv["moves"] as? String) ?? ""
+                let fm = String(ms.split(separator: " ").first ?? "")
+                guard !fm.isEmpty else { continue }
+                
+                // ✅ VALIDATE MOVE
+                guard MoveValidator.isPlausibleMove(uci: fm, fen: fen) else { continue }
+                
+                let cp = pv["cp"] as? Int
+                let mate = pv["mate"] as? Int
+                
+                moves.append(TopMove(
+                    rank: idx + 1,
+                    uci: fm,
+                    san: fm,
+                    evaluationCp: cp,
+                    mateIn: (mate == 0 ? nil : mate),
+                    depth: depth,
+                    source: "lc",
+                    votes: 1
+                ))
+            }
+            return moves
+        } catch {
+            return nil
+        }
+    }
+    
+    // ✅ CHESS-API
+    static func callChessApi(fen: String, deep: Bool = false) async -> TopMove? {
+        guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
+        
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = deep ? 12 : 5  // ✅ قصير
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        
+        let body: [String: Any] = [
+            "fen": fen,
+            "depth": deep ? 18 : 13,
+            "maxThinkingTime": deep ? 800 : 200
+        ]
+        
+        guard let hb = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+        req.httpBody = hb
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            
+            let uci = (json["move"] as? String) ?? ""
+            guard !uci.isEmpty else { return nil }
+            
+            // ✅ VALIDATE MOVE
+            guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
+            
+            let san = (json["san"] as? String) ?? uci
+            let eval = json["eval"] as? Double
+            let mate = json["mate"] as? Int
+            let cp = eval.map { Int(($0 * 100).rounded()) }
+            let d = (json["depth"] as? Int) ?? 13
+            
+            return TopMove(
+                rank: 1,
+                uci: uci,
+                san: san,
+                evaluationCp: cp,
+                mateIn: (mate == 0 ? nil : mate),
+                depth: d,
+                source: "cA",
+                votes: 1
+            )
+        } catch {
+            return nil
+        }
+    }
+    
+    // ✅ STOCKFISH ONLINE
+    static func callStockfishOnline(fen: String, deep: Bool = false) async -> TopMove? {
+        var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
+        comps.queryItems = [
+            URLQueryItem(name: "fen", value: fen),
+            URLQueryItem(name: "depth", value: deep ? "15" : "13")
+        ]
+        guard let url = comps.url else { return nil }
+        
+        var req = URLRequest(url: url)
+        req.timeoutInterval = deep ? 12 : 5  // ✅ قصير
+        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            
+            if let s = json["success"] as? Bool, !s { return nil }
+            
+            let bf = (json["bestmove"] as? String) ?? ""
+            let parts = bf.split(separator: " ").map(String.init)
+            
+            var uci = ""
+            for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count {
+                uci = parts[i+1]
+                break
+            }
+            if uci.isEmpty { uci = parts.first ?? "" }
+            guard !uci.isEmpty else { return nil }
+            
+            // ✅ VALIDATE MOVE
+            guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
+            
+            let ev = json["evaluation"] as? Double
+            let mate = json["mate"] as? Int
+            let cp: Int? = ev.map { Int(($0 * 100).rounded()) }
+            let d = (json["depth"] as? Int) ?? 13
+            
+            return TopMove(
+                rank: 1,
+                uci: uci,
+                san: uci,
+                evaluationCp: cp,
+                mateIn: (mate == 0 ? nil : mate),
+                depth: d,
+                source: "sf",
+                votes: 1
+            )
+        } catch {
+            return nil
+        }
+    }
+    
+    // ✅ MAIN ANALYZER with FAST RACE
+    static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
+                                  onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
+        
+        if let issue = FenValidator.validate(fen) {
+            throw EngineError.badFen(issue)
+        }
+        
+        // Check cache first
+        if !deep, let cached = await AnalysisCache.shared.get(fen: fen) {
+            let cm = cached.moves.enumerated().map { (i, m) in
+                TopMove(
+                    rank: i + 1,
+                    uci: m.uci,
+                    san: m.san,
+                    evaluationCp: m.evaluationCp,
+                    mateIn: m.mateIn,
+                    depth: m.depth,
+                    source: "cache",
+                    votes: m.votes
+                )
+            }
+            let a = EngineAnalysis(
+                topMoves: cm,
+                bestMove: cm.first,
+                depth: cached.depth,
+                sourcesUsed: "cache",
+                confidence: cached.confidence,
+                debugFen: fen
+            )
+            await MainActor.run { onUpdate(a) }
+            return a
+        }
+        
+        // ✅ RACE STRATEGY: Get results in parallel
+        async let lichessTask = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
+        async let chessApiTask = callChessApi(fen: fen, deep: deep)
+        async let stockfishTask = callStockfishOnline(fen: fen, deep: deep)
+        
+        let lichess = await lichessTask
+        try Task.checkCancellation()
+        
+        let cA = await chessApiTask
+        try Task.checkCancellation()
+        
+        let sf = await stockfishTask
+        try Task.checkCancellation()
+        
+        // ✅ Collect all moves with voting
+        var mv: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
+        
+        if let lm = lichess {
+            for m in lm {
+                if var e = mv[m.uci] {
+                    e.votes += 1
+                    e.sources.append("lc")
+                    mv[m.uci] = e
+                } else {
+                    mv[m.uci] = (m, 1, ["lc"])
+                }
+            }
+        }
+        
+        if let m = cA {
+            if var e = mv[m.uci] {
+                e.votes += 1
+                e.sources.append("cA")
+                mv[m.uci] = e
+            } else {
+                mv[m.uci] = (m, 1, ["cA"])
+            }
+        }
+        
+        if let m = sf {
+            if var e = mv[m.uci] {
+                e.votes += 1
+                e.sources.append("sf")
+                mv[m.uci] = e
+            } else {
+                mv[m.uci] = (m, 1, ["sf"])
+            }
+        }
+        
+        // ✅ No results = error
+        guard !mv.isEmpty else {
+            if lichess == nil && cA == nil && sf == nil {
+                throw EngineError.networkOffline
+            }
+            throw EngineError.allEnginesFailed
+        }
+        
+        // Sort by votes + score
+        let sorted = mv.values.sorted { a, b in
+            if a.votes != b.votes { return a.votes > b.votes }
+            return a.move.rankScore > b.move.rankScore
+        }
+        
+        let limit = deep ? 5 : 3
+        let final: [TopMove] = sorted.prefix(limit).enumerated().map { (idx, e) in
+            TopMove(
+                rank: idx + 1,
+                uci: e.move.uci,
+                san: e.move.san,
+                evaluationCp: e.move.evaluationCp,
+                mateIn: e.move.mateIn,
+                depth: e.move.depth,
+                source: e.sources.joined(separator: "+"),
+                votes: e.votes
+            )
+        }
+        
+        let topV = final.first?.votes ?? 1
+        let allS = Array(Set(mv.values.flatMap { $0.sources })).sorted().joined(separator: "+")
+        let bestD = final.map { $0.depth }.max() ?? 13
+        let identical = final.count >= 2 && final.allSatisfy { $0.evaluationCp == final.first?.evaluationCp }
+        
+        let analysis = EngineAnalysis(
+            topMoves: final,
+            bestMove: final.first,
+            depth: bestD,
+            sourcesUsed: allS,
+            confidence: min(topV, 3),
+            debugFen: fen
+        )
+        
+        // Cache if not identical and not deep
+        if !identical && !deep {
+            await AnalysisCache.shared.set(
+                fen: fen,
+                moves: final,
+                depth: bestD,
+                sources: allS,
+                confidence: min(topV, 3)
+            )
+        }
+        
+        await MainActor.run { onUpdate(analysis) }
+        return analysis
+    }
+}
           # ========== GroqService (with new puzzle explanation) ==========
           files["Sources/GroqService.swift"] = r'''
-          import Foundation
-          enum GroqService {
-              struct ChatMessage: Codable { let role: String; let content: String }
-              enum GroqError: Error, LocalizedError {
-                  case noKey, invalidKey, networkError(String), rateLimited, parseError
-                  var errorDescription: String? {
-                      switch self {
-                      case .noKey: return "No Groq API key. Add it in Settings."
-                      case .invalidKey: return "Invalid API key."
-                      case .networkError(let m): return "Network: \(m)"
-                      case .rateLimited: return "Too many requests."
-                      case .parseError: return "Bad AI response"
-                      }
-                  }
-              }
-              static func chat(messages: [ChatMessage], temperature: Double = 0.3) async throws -> String {
-                  guard let apiKey = KeychainStore.load(account: KeychainStore.groqKeyAccount), !apiKey.isEmpty else { throw GroqError.noKey }
-                  guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else { throw GroqError.networkError("Bad URL") }
-                  var req = URLRequest(url: url); req.httpMethod = "POST"
-                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                  req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                  req.timeoutInterval = 30
-                  let body: [String: Any] = ["model": "llama-3.3-70b-versatile", "messages": messages.map { ["role": $0.role, "content": $0.content] }, "temperature": temperature, "max_tokens": 500, "top_p": 0.9]
-                  req.httpBody = try JSONSerialization.data(withJSONObject: body)
-                  let (data, resp) = try await URLSession.shared.data(for: req)
-                  guard let http = resp as? HTTPURLResponse else { throw GroqError.networkError("No response") }
-                  if http.statusCode == 401 { throw GroqError.invalidKey }
-                  if http.statusCode == 429 { throw GroqError.rateLimited }
-                  guard (200..<300).contains(http.statusCode) else { throw GroqError.networkError("HTTP \(http.statusCode)") }
-                  guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                        let choices = json["choices"] as? [[String: Any]],
-                        let first = choices.first,
-                        let message = first["message"] as? [String: Any],
-                        let content = message["content"] as? String else { throw GroqError.parseError }
-                  return content.trimmingCharacters(in: .whitespacesAndNewlines)
-              }
-              static func explainMove(fen: String, uci: String, san: String, eval: String, isArabic: Bool, ranking: Int, totalMoves: Int) async throws -> String {
-                  let sys = isArabic ? "أنت مدرب شطرنج محترف. اشرح النقلات بالعربية بشكل مفصل ومفيد." : "You are a GM-level chess coach. Explain moves clearly."
-                  let usr = isArabic ? "الموقف: \(fen)\nالنقلة #\(ranking): \(san) (\(uci))\nالتقييم: \(eval)\n\nاشرحلي:\n1. لماذا هذه النقلة جيدة؟\n2. الخطة الاستراتيجية\n3. تهديدات الخصم\n4. نصائح تكتيكية\n\n4-6 أسطر." : "Position: \(fen)\nMove #\(ranking): \(san) (\(uci))\nEval: \(eval)\n\nExplain:\n1. Why is this good?\n2. Strategic plan\n3. Opponent threats\n4. Tactical tips\n\n4-6 lines."
-                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.4)
-              }
-              static func askAboutPosition(fen: String, question: String, isArabic: Bool, history: [ChatMessage] = []) async throws -> String {
-                  let sys = isArabic ? "أنت مدرب شطرنج. الموقف: \(fen). أجب بالعربية بشكل مفصل." : "You are a chess coach. Position: \(fen). Answer clearly."
-                  var msgs: [ChatMessage] = [ChatMessage(role: "system", content: sys)]
-                  msgs.append(contentsOf: history)
-                  msgs.append(ChatMessage(role: "user", content: question))
-                  return try await chat(messages: msgs, temperature: 0.7)
-              }
-              static func analyzeThreats(fen: String, isArabic: Bool) async throws -> String {
-                  let sys = isArabic ? "أنت مدرب شطرنج. حلل التهديدات بإيجاز." : "Chess coach. Analyze threats concisely."
-                  let usr = isArabic ? "الموقف: \(fen)\n\nحدد:\n1. كل تهديدات الخصم\n2. القطع المعرضة للخطر\n3. أي فخاخ\n\nمختصر 3-5 أسطر." : "Position: \(fen)\n\nIdentify:\n1. All threats\n2. Pieces in danger\n3. Traps\n\nConcise 3-5 lines."
-                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.3)
-              }
-              // NEW: Explain puzzle/tactical opportunity
-              static func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) async throws -> String {
-                  let sys = isArabic ? "أنت مدرب شطرنج تكتيكي محترف." : "You are a tactical chess coach."
-                  let usr = isArabic ? "الموقف: \(fen)\nأفضل نقلة: \(bestMove)\n\nهذه فرصة تكتيكية! اشرح:\n1. نوع التكتيك (شوكة، سيخ، اكتشاف، إلخ)\n2. لماذا هذه النقلة تفوز؟\n3. ما هو الرد المتوقع؟\n4. النتيجة النهائية\n\n4-6 أسطر واضحة." : "Position: \(fen)\nBest move: \(bestMove)\n\nThis is a tactical opportunity! Explain:\n1. Type of tactic (fork, pin, discovered, etc.)\n2. Why does this move win?\n3. What's the expected response?\n4. Final outcome\n\n4-6 clear lines."
-                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.3)
-              }
-              // NEW: Review a full game
-              static func reviewGame(movesUCI: [String], accuracy: Double, blunders: Int, mistakes: Int, isArabic: Bool) async throws -> String {
-                  let sys = isArabic ? "أنت مدرب شطرنج محترف. راجع اللعبة بأسلوب مشجع لكن صادق." : "You are a professional chess coach. Review the game encouragingly but honestly."
-                  let movesStr = movesUCI.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: " ")
-                  let usr = isArabic ? "اللعبة:\n\(movesStr)\n\nالدقة: \(Int(accuracy))%\nأخطاء فادحة: \(blunders)\nأخطاء: \(mistakes)\n\nاعطني:\n1. ملخص أداء اللاعب\n2. أهم نقاط القوة\n3. أهم نقاط الضعف\n4. نصيحة للتحسن\n\n5-8 أسطر." : "Game:\n\(movesStr)\n\nAccuracy: \(Int(accuracy))%\nBlunders: \(blunders)\nMistakes: \(mistakes)\n\nGive me:\n1. Performance summary\n2. Key strengths\n3. Key weaknesses\n4. Improvement tip\n\n5-8 lines."
-                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.5)
-              }
-          }
-          '''
+        import Foundation
+
+enum GroqService {
+    struct ChatMessage: Codable {
+        let role: String
+        let content: String
+    }
+    
+    enum GroqError: Error, LocalizedError {
+        case noKey
+        case invalidKey
+        case networkError(String)
+        case rateLimited
+        case parseError
+        case timeout
+        
+        var errorDescription: String? {
+            switch self {
+            case .noKey:
+                return "No Groq API key. Add it in Settings."
+            case .invalidKey:
+                return "Invalid API key."
+            case .networkError(let m):
+                return "Network: \(m)"
+            case .rateLimited:
+                return "Too many requests. Try again later."
+            case .parseError:
+                return "Bad AI response"
+            case .timeout:
+                return "Request timeout. Check your connection."
+            }
+        }
+    }
+    
+    // ✅ MAIN CHAT with timeout + retry
+    static func chat(messages: [ChatMessage], temperature: Double = 0.3) async throws -> String {
+        guard let apiKey = KeychainStore.load(account: KeychainStore.groqKeyAccount), !apiKey.isEmpty else {
+            throw GroqError.noKey
+        }
+        
+        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
+            throw GroqError.networkError("Bad URL")
+        }
+        
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 12  // ✅ قصير جداً
+        
+        let body: [String: Any] = [
+            "model": "llama-3.3-70b-versatile",
+            "messages": messages.map { ["role": $0.role, "content": $0.content] },
+            "temperature": temperature,
+            "max_tokens": 500,
+            "top_p": 0.9
+        ]
+        
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        
+        // ✅ Retry logic with exponential backoff
+        var lastError: Error?
+        for attempt in 0..<2 {
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                
+                guard let http = resp as? HTTPURLResponse else {
+                    throw GroqError.networkError("No response")
+                }
+                
+                if http.statusCode == 401 {
+                    throw GroqError.invalidKey
+                }
+                
+                if http.statusCode == 429 {
+                    throw GroqError.rateLimited
+                }
+                
+                guard (200..<300).contains(http.statusCode) else {
+                    throw GroqError.networkError("HTTP \(http.statusCode)")
+                }
+                
+                guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let choices = json["choices"] as? [[String: Any]],
+                      let first = choices.first,
+                      let message = first["message"] as? [String: Any],
+                      let content = message["content"] as? String else {
+                    throw GroqError.parseError
+                }
+                
+                return content.trimmingCharacters(in: .whitespacesAndNewlines)
+                
+            } catch let error as URLError where error.code == .timedOut {
+                lastError = GroqError.timeout
+                if attempt < 1 {
+                    // ✅ exponential backoff: wait 2^attempt seconds
+                    try? await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempt)) * 1_000_000_000))
+                    continue
+                }
+            } catch {
+                lastError = error
+                if attempt < 1 && shouldRetry(error) {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    continue
+                }
+            }
+            
+            break
+        }
+        
+        throw lastError ?? GroqError.networkError("Unknown error")
+    }
+    
+    // ✅ Determine if we should retry
+    private static func shouldRetry(_ error: Error) -> Bool {
+        if let urlError = error as? URLError {
+            return urlError.code == .timedOut ||
+                   urlError.code == .networkConnectionLost ||
+                   urlError.code == .notConnectedToInternet
+        }
+        if let groqError = error as? GroqError {
+            switch groqError {
+            case .timeout, .networkError:
+                return true
+            case .rateLimited:
+                return false // Don't retry rate limit
+            default:
+                return false
+            }
+        }
+        return false
+    }
+    
+    // ✅ Explain move with timeout
+    static func explainMove(fen: String, uci: String, san: String, eval: String, isArabic: Bool, ranking: Int, totalMoves: Int) async throws -> String {
+        let sys = isArabic ?
+            "أنت مدرب شطرنج محترف. اشرح النقلات بالعربية بشكل مفصل ومفيد." :
+            "You are a GM-level chess coach. Explain moves clearly."
+        
+        let usr = isArabic ?
+            "الموقف: \(fen)\nالنقلة #\(ranking): \(san) (\(uci))\nالتقييم: \(eval)\n\nاشرحلي:\n1. لماذا هذه النقلة جيدة؟\n2. الخطة الاستراتيجية\n3. تهديدات الخصم\n4. نصائح تكتيكية\n\n4-6 أسطر." :
+            "Position: \(fen)\nMove #\(ranking): \(san) (\(uci))\nEval: \(eval)\n\nExplain:\n1. Why is this good?\n2. Strategic plan\n3. Opponent threats\n4. Tactical tips\n\n4-6 lines."
+        
+        return try await chat(messages: [
+            ChatMessage(role: "system", content: sys),
+            ChatMessage(role: "user", content: usr)
+        ], temperature: 0.4)
+    }
+    
+    // ✅ Ask about position with timeout
+    static func askAboutPosition(fen: String, question: String, isArabic: Bool, history: [ChatMessage] = []) async throws -> String {
+        let sys = isArabic ?
+            "أنت مدرب شطرنج. الموقف: \(fen). أجب بالعربية بشكل مفصل." :
+            "You are a chess coach. Position: \(fen). Answer clearly."
+        
+        var msgs: [ChatMessage] = [ChatMessage(role: "system", content: sys)]
+        msgs.append(contentsOf: history)
+        msgs.append(ChatMessage(role: "user", content: question))
+        
+        return try await chat(messages: msgs, temperature: 0.7)
+    }
+    
+    // ✅ Analyze threats with timeout
+    static func analyzeThreats(fen: String, isArabic: Bool) async throws -> String {
+        let sys = isArabic ?
+            "أنت مدرب شطرنج. حلل التهديدات بإيجاز." :
+            "Chess coach. Analyze threats concisely."
+        
+        let usr = isArabic ?
+            "الموقف: \(fen)\n\nحدد:\n1. كل تهديدات الخصم\n2. القطع المعرضة للخطر\n3. أي فخاخ\n\nمختصر 3-5 أسطر." :
+            "Position: \(fen)\n\nIdentify:\n1. All threats\n2. Pieces in danger\n3. Traps\n\nConcise 3-5 lines."
+        
+        return try await chat(messages: [
+            ChatMessage(role: "system", content: sys),
+            ChatMessage(role: "user", content: usr)
+        ], temperature: 0.3)
+    }
+    
+    // ✅ Explain puzzle with timeout
+    static func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) async throws -> String {
+        let sys = isArabic ?
+            "أنت مدرب شطرنج تكتيكي محترف." :
+            "You are a tactical chess coach."
+        
+        let usr = isArabic ?
+            "الموقف: \(fen)\nأفضل نقلة: \(bestMove)\n\nهذه فرصة تكتيكية! اشرح:\n1. نوع التكتيك (شوكة، سيخ، اكتشاف، إلخ)\n2. لماذا هذه النقلة تفوز؟\n3. ما هو الرد المتوقع؟\n4. النتيجة النهائية\n\n4-6 أسطر واضحة." :
+            "Position: \(fen)\nBest move: \(bestMove)\n\nThis is a tactical opportunity! Explain:\n1. Type of tactic (fork, pin, discovered, etc.)\n2. Why does this move win?\n3. What's the expected response?\n4. Final outcome\n\n4-6 clear lines."
+        
+        return try await chat(messages: [
+            ChatMessage(role: "system", content: sys),
+            ChatMessage(role: "user", content: usr)
+        ], temperature: 0.3)
+    }
+    
+    // ✅ Review game with timeout
+    static func reviewGame(movesUCI: [String], accuracy: Double, blunders: Int, mistakes: Int, isArabic: Bool) async throws -> String {
+        let sys = isArabic ?
+            "أنت مدرب شطرنج محترف. راجع اللعبة بأسلوب مشجع لكن صادق." :
+            "You are a professional chess coach. Review the game encouragingly but honestly."
+        
+        let movesStr = movesUCI.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: " ")
+        
+        let usr = isArabic ?
+            "اللعبة:\n\(movesStr)\n\nالدقة: \(Int(accuracy))%\nأخطاء فادحة: \(blunders)\nأخطاء: \(mistakes)\n\nاعطني:\n1. ملخص أداء اللاعب\n2. أهم نقاط القوة\n3. أهم نقاط الضعف\n4. نصيحة للتحسن\n\n5-8 أسطر." :
+            "Game:\n\(movesStr)\n\nAccuracy: \(Int(accuracy))%\nBlunders: \(blunders)\nMistakes: \(mistakes)\n\nGive me:\n1. Performance summary\n2. Key strengths\n3. Key weaknesses\n4. Improvement tip\n\n5-8 lines."
+        
+        return try await chat(messages: [
+            ChatMessage(role: "system", content: sys),
+            ChatMessage(role: "user", content: usr)
+        ], temperature: 0.5)
+    }
+}
 
           # ========== AIAssistantViewModel with puzzle explanation ==========
           files["Sources/AIAssistantViewModel.swift"] = r'''
