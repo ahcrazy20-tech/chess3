@@ -189,15 +189,9 @@ jobs:
           }
           '''
 
-          # ========== NEW: Move Validator (KEY FIX for accuracy) ==========
           files["Sources/MoveValidator.swift"] = r'''
           import Foundation
-
-          /// Validates that a UCI move is actually legal in the given position.
-          /// This fixes the "wrong moves" bug where engines return moves that don't exist on board.
           enum MoveValidator {
-
-              /// Parse FEN board into 8x8 grid. grid[0] = rank 8, grid[7] = rank 1
               static func parseFen(_ fen: String) -> [[Character]]? {
                   let parts = fen.split(separator: " ").map(String.init)
                   guard let boardPart = parts.first else { return nil }
@@ -217,8 +211,6 @@ jobs:
                   }
                   return grid
               }
-
-              /// Convert square name like "e4" to (row, col). row 0 = rank 8, col 0 = file a
               static func squareToCoord(_ square: String) -> (row: Int, col: Int)? {
                   guard square.count >= 2 else { return nil }
                   let chars = Array(square)
@@ -229,42 +221,26 @@ jobs:
                   let row = 8 - rankDigit
                   return (row, col)
               }
-
-              /// Validate that a UCI move (like "e2e4") is possible in this position.
-              /// Returns true if valid, false if not.
-              /// This does BASIC validation - checks that:
-              /// 1. From square has a piece
-              /// 2. Piece belongs to side to move
-              /// 3. Move is not into own piece
               static func isPlausibleMove(uci: String, fen: String) -> Bool {
                   guard uci.count >= 4 else { return false }
                   guard let grid = parseFen(fen) else { return false }
                   let parts = fen.split(separator: " ").map(String.init)
                   guard parts.count >= 2 else { return false }
                   let sideToMove = parts[1]
-
                   let fromStr = String(uci.prefix(2))
                   let toStr = String(uci.dropFirst(2).prefix(2))
-
                   guard let from = squareToCoord(fromStr) else { return false }
                   guard let to = squareToCoord(toStr) else { return false }
-
-                  // Check from square has a piece
                   let fromPiece = grid[from.row][from.col]
                   guard fromPiece != "." else { return false }
-
-                  // Check piece belongs to side to move
                   let isWhitePiece = fromPiece.isUppercase
                   let isWhiteTurn = sideToMove == "w"
                   if isWhitePiece != isWhiteTurn { return false }
-
-                  // Check destination is not own piece
                   let toPiece = grid[to.row][to.col]
                   if toPiece != "." {
                       let toIsWhite = toPiece.isUppercase
                       if toIsWhite == isWhitePiece { return false }
                   }
-
                   return true
               }
           }
@@ -280,13 +256,11 @@ jobs:
               private var hmc: Int = 0
               private var lastGrid: [[Character]]? = nil
               private var lastPly: Int = -1
-
               func reset() {
                   wKm = false; bKm = false
                   wRA1m = false; wRH1m = false; bRA8m = false; bRH8m = false
                   lastEP = nil; hmc = 0; lastGrid = nil; lastPly = -1
               }
-
               func build(grid: [[Character]], sideToMove: String, plyCount: Int) -> String {
                   if isSP(grid) { reset(); lastGrid = grid; lastPly = plyCount }
                   else {
@@ -299,7 +273,6 @@ jobs:
                   let ep = lastEP ?? "-"; let fm = max(1, (plyCount / 2) + 1)
                   return "\(b) \(sideToMove) \(c) \(ep) \(hmc) \(fm)"
               }
-
               private func detect(old: [[Character]], new: [[Character]]) {
                   var ch: [(r: Int, c: Int, b: Character, a: Character)] = []
                   for r in 0..<8 { for c in 0..<8 {
@@ -338,13 +311,11 @@ jobs:
                       hmc = (isPawn || isCap) ? 0 : (hmc + 1)
                   }
               }
-
               private func isSP(_ g: [[Character]]) -> Bool {
                   guard g.count == 8 else { return false }
                   return String(g[0]) == "rnbqkbnr" && String(g[1]) == "pppppppp"
                       && String(g[6]) == "PPPPPPPP" && String(g[7]) == "RNBQKBNR"
               }
-
               private func boardFen(_ g: [[Character]]) -> String {
                   var rows: [String] = []
                   for r in 0..<8 {
@@ -359,7 +330,6 @@ jobs:
                   }
                   return rows.joined(separator: "/")
               }
-
               private func castling(_ g: [[Character]]) -> String {
                   var s = ""
                   if !wKm && !wRH1m && g[7][4] == "K" && g[7][7] == "R" { s += "K" }
@@ -436,36 +406,24 @@ jobs:
           }
           '''
 
-          # ========== NEW: Haptic Manager ==========
           files["Sources/HapticManager.swift"] = r'''
           import UIKit
-
-          /// Manages haptic feedback (vibrations) for chess events.
-          /// All haptics are LIGHT as per user preference.
           enum HapticManager {
-
-              /// Light tap - move ready notification
               static func moveReady() {
                   let g = UIImpactFeedbackGenerator(style: .light)
                   g.prepare()
                   g.impactOccurred(intensity: 0.5)
               }
-
-              /// Slightly stronger - blunder warning
               static func blunderWarning() {
                   let g = UINotificationFeedbackGenerator()
                   g.prepare()
                   g.notificationOccurred(.warning)
               }
-
-              /// Success - great move played
               static func success() {
                   let g = UINotificationFeedbackGenerator()
                   g.prepare()
                   g.notificationOccurred(.success)
               }
-
-              /// Selection - tap on button
               static func selection() {
                   let g = UISelectionFeedbackGenerator()
                   g.prepare()
@@ -474,23 +432,17 @@ jobs:
           }
           '''
 
-          # ========== NEW: Voice Manager ==========
           files["Sources/VoiceManager.swift"] = r'''
           import Foundation
           import AVFoundation
-
-          /// Text-to-speech for announcing moves.
-          /// Uses system TTS (free, works with AirPods/Bluetooth).
           @MainActor
           final class VoiceManager: ObservableObject {
               static let shared = VoiceManager()
               private let synth = AVSpeechSynthesizer()
-              @Published var isEnabled: Bool = false  // must be manually triggered
-
+              @Published var isEnabled: Bool = false
               private init() {
                   configureAudio()
               }
-
               private func configureAudio() {
                   do {
                       try AVAudioSession.sharedInstance().setCategory(.playback, mode: .voicePrompt, options: [.mixWithOthers, .duckOthers])
@@ -499,10 +451,7 @@ jobs:
                       print("Audio session error: \(error)")
                   }
               }
-
-              /// Speak a move in the given language
               func speakMove(uci: String, san: String, isArabic: Bool) {
-                  // Convert UCI to readable form
                   let text: String
                   if isArabic {
                       text = describeInArabic(uci: uci, san: san)
@@ -511,8 +460,6 @@ jobs:
                   }
                   speak(text: text, isArabic: isArabic)
               }
-
-              /// Speak arbitrary text
               func speak(text: String, isArabic: Bool) {
                   synth.stopSpeaking(at: .immediate)
                   let utterance = AVSpeechUtterance(string: text)
@@ -522,27 +469,20 @@ jobs:
                   utterance.volume = 1.0
                   synth.speak(utterance)
               }
-
               func stop() {
                   synth.stopSpeaking(at: .immediate)
               }
-
-              // MARK: - Move description
-
               private func describeInArabic(uci: String, san: String) -> String {
-                  // Try to extract piece and square from SAN
                   let piece = detectPiece(san: san, isArabic: true)
                   let toSquare = extractSquare(uci: uci)
                   let squareArabic = arabicSquare(toSquare)
                   return "\(piece) إلى \(squareArabic)"
               }
-
               private func describeInEnglish(uci: String, san: String) -> String {
                   let piece = detectPiece(san: san, isArabic: false)
                   let toSquare = extractSquare(uci: uci)
                   return "\(piece) to \(toSquare)"
               }
-
               private func detectPiece(san: String, isArabic: Bool) -> String {
                   let first = san.first ?? "P"
                   switch first {
@@ -558,15 +498,11 @@ jobs:
                       return isArabic ? "الجندي" : "Pawn"
                   }
               }
-
               private func extractSquare(uci: String) -> String {
-                  // UCI like "e2e4" - take last 2 chars
                   guard uci.count >= 4 else { return uci }
                   return String(uci.dropFirst(2).prefix(2))
               }
-
               private func arabicSquare(_ sq: String) -> String {
-                  // Convert file letter to Arabic
                   guard let file = sq.first, let rank = sq.last else { return sq }
                   let fileAr: String
                   switch file {
@@ -585,12 +521,9 @@ jobs:
           }
           '''
 
-          # ========== NEW: Game Recording ==========
           files["Sources/GameRecorder.swift"] = r'''
           import Foundation
           import SwiftUI
-
-          /// Records all moves played in a game for review
           @MainActor
           final class GameRecorder: ObservableObject {
               struct MoveRecord: Identifiable, Codable {
@@ -600,15 +533,14 @@ jobs:
                   let san: String
                   let fenBefore: String
                   let fenAfter: String
-                  let evalBefore: Int?  // in centipawns from white POV
+                  let evalBefore: Int?
                   let evalAfter: Int?
                   let wasMyMove: Bool
-                  let quality: String  // "brilliant", "best", "good", "inaccuracy", "mistake", "blunder"
-                  let bestAlternative: String?  // UCI of best move if this wasn't best
-                  let cpLoss: Int  // centipawn loss
+                  let quality: String
+                  let bestAlternative: String?
+                  let cpLoss: Int
                   let timestamp: Date
               }
-
               @Published var moves: [MoveRecord] = []
               @Published var gameId: UUID = UUID()
               @Published var currentAccuracy: Double = 100.0
@@ -619,24 +551,15 @@ jobs:
               @Published var inaccuracyCount: Int = 0
               @Published var mistakeCount: Int = 0
               @Published var blunderCount: Int = 0
-
               private var lastFenBefore: String = ""
               private var lastEvalBefore: Int? = nil
-
-              /// Called when we detect a NEW position after opponent/self move
-              func recordMove(previousFen: String, previousEval: Int?,
-                              currentFen: String, currentEval: Int?,
-                              lastMoveUCI: String, wasMyMove: Bool,
-                              bestMoveUCI: String?, plyCount: Int) {
+              func recordMove(previousFen: String, previousEval: Int?, currentFen: String, currentEval: Int?, lastMoveUCI: String, wasMyMove: Bool, bestMoveUCI: String?, plyCount: Int) {
                   guard !lastMoveUCI.isEmpty else { return }
-                  // Compute centipawn loss (positive = loss)
                   var cpLoss = 0
                   if let prev = previousEval, let curr = currentEval {
-                      // From perspective of the side that just moved
-                      let sideMul = wasMyMove ? 1 : -1  // simplified
+                      let sideMul = wasMyMove ? 1 : -1
                       cpLoss = max(0, (prev - curr) * sideMul)
                   }
-                  // Determine quality
                   let quality: String
                   switch cpLoss {
                   case ..<(-30): quality = "brilliant"
@@ -646,7 +569,6 @@ jobs:
                   case 100...299: quality = "mistake"
                   default: quality = "blunder"
                   }
-                  // Was it best move?
                   let isBest = (bestMoveUCI == lastMoveUCI)
                   let finalQuality = isBest ? "best" : quality
                   let record = MoveRecord(
@@ -658,7 +580,6 @@ jobs:
                       cpLoss: cpLoss, timestamp: Date()
                   )
                   moves.append(record)
-                  // Update stats only for MY moves
                   if wasMyMove {
                       myMoveCount += 1
                       switch finalQuality {
@@ -673,7 +594,6 @@ jobs:
                       recomputeAccuracy()
                   }
               }
-
               func startNewGame() {
                   moves = []
                   gameId = UUID()
@@ -682,30 +602,23 @@ jobs:
                   brilliantCount = 0; bestCount = 0; goodCount = 0
                   inaccuracyCount = 0; mistakeCount = 0; blunderCount = 0
               }
-
               private func recomputeAccuracy() {
                   guard myMoveCount > 0 else { currentAccuracy = 100.0; return }
-                  // Weight moves: brilliant=100, best=100, good=90, inaccuracy=70, mistake=40, blunder=10
                   let total = brilliantCount * 100 + bestCount * 100 + goodCount * 90
                              + inaccuracyCount * 70 + mistakeCount * 40 + blunderCount * 10
                   currentAccuracy = Double(total) / Double(myMoveCount)
               }
-
-              // MARK: - Persistence
               private let storeKey = "chess_helper_game_history"
-
               func saveCurrentGame() {
                   guard !moves.isEmpty else { return }
                   var history = loadHistory()
                   let entry = GameHistoryEntry(id: gameId, date: Date(), moves: moves, accuracy: currentAccuracy)
                   history.insert(entry, at: 0)
-                  // Keep last 20 games
                   if history.count > 20 { history = Array(history.prefix(20)) }
                   if let data = try? JSONEncoder().encode(history) {
                       UserDefaults.standard.set(data, forKey: storeKey)
                   }
               }
-
               func loadHistory() -> [GameHistoryEntry] {
                   guard let data = UserDefaults.standard.data(forKey: storeKey),
                         let history = try? JSONDecoder().decode([GameHistoryEntry].self, from: data) else {
@@ -713,12 +626,10 @@ jobs:
                   }
                   return history
               }
-
               func clearHistory() {
                   UserDefaults.standard.removeObject(forKey: storeKey)
               }
           }
-
           struct GameHistoryEntry: Identifiable, Codable {
               let id: UUID
               let date: Date
@@ -727,587 +638,346 @@ jobs:
           }
           '''
 
-          # ========== EngineService (unchanged from v5.1) ==========
+          # ========== GroqService with TIMEOUT + RETRY ==========
+          files["Sources/GroqService.swift"] = r'''
+          import Foundation
+          enum GroqService {
+              struct ChatMessage: Codable {
+                  let role: String
+                  let content: String
+              }
+              enum GroqError: Error, LocalizedError {
+                  case noKey
+                  case invalidKey
+                  case networkError(String)
+                  case rateLimited
+                  case parseError
+                  case timeout
+                  var errorDescription: String? {
+                      switch self {
+                      case .noKey:
+                          return "No Groq API key. Add it in Settings."
+                      case .invalidKey:
+                          return "Invalid API key."
+                      case .networkError(let m):
+                          return "Network: \(m)"
+                      case .rateLimited:
+                          return "Too many requests. Try again later."
+                      case .parseError:
+                          return "Bad AI response"
+                      case .timeout:
+                          return "Request timeout. Check your connection."
+                      }
+                  }
+              }
+              static func chat(messages: [ChatMessage], temperature: Double = 0.3) async throws -> String {
+                  guard let apiKey = KeychainStore.load(account: KeychainStore.groqKeyAccount), !apiKey.isEmpty else {
+                      throw GroqError.noKey
+                  }
+                  guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
+                      throw GroqError.networkError("Bad URL")
+                  }
+                  var req = URLRequest(url: url)
+                  req.httpMethod = "POST"
+                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                  req.timeoutInterval = 12
+                  let body: [String: Any] = [
+                      "model": "llama-3.3-70b-versatile",
+                      "messages": messages.map { ["role": $0.role, "content": $0.content] },
+                      "temperature": temperature,
+                      "max_tokens": 500,
+                      "top_p": 0.9
+                  ]
+                  req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                  var lastError: Error?
+                  for attempt in 0..<2 {
+                      do {
+                          let (data, resp) = try await URLSession.shared.data(for: req)
+                          guard let http = resp as? HTTPURLResponse else {
+                              throw GroqError.networkError("No response")
+                          }
+                          if http.statusCode == 401 {
+                              throw GroqError.invalidKey
+                          }
+                          if http.statusCode == 429 {
+                              throw GroqError.rateLimited
+                          }
+                          guard (200..<300).contains(http.statusCode) else {
+                              throw GroqError.networkError("HTTP \(http.statusCode)")
+                          }
+                          guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                                let choices = json["choices"] as? [[String: Any]],
+                                let first = choices.first,
+                                let message = first["message"] as? [String: Any],
+                                let content = message["content"] as? String else {
+                              throw GroqError.parseError
+                          }
+                          return content.trimmingCharacters(in: .whitespacesAndNewlines)
+                      } catch let error as URLError where error.code == .timedOut {
+                          lastError = GroqError.timeout
+                          if attempt < 1 {
+                              try? await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempt)) * 1_000_000_000))
+                              continue
+                          }
+                      } catch {
+                          lastError = error
+                          if attempt < 1 && shouldRetry(error) {
+                              try? await Task.sleep(nanoseconds: 1_000_000_000)
+                              continue
+                          }
+                      }
+                      break
+                  }
+                  throw lastError ?? GroqError.networkError("Unknown error")
+              }
+              private static func shouldRetry(_ error: Error) -> Bool {
+                  if let urlError = error as? URLError {
+                      return urlError.code == .timedOut ||
+                             urlError.code == .networkConnectionLost ||
+                             urlError.code == .notConnectedToInternet
+                  }
+                  if let groqError = error as? GroqError {
+                      switch groqError {
+                      case .timeout, .networkError:
+                          return true
+                      case .rateLimited:
+                          return false
+                      default:
+                          return false
+                      }
+                  }
+                  return false
+              }
+              static func explainMove(fen: String, uci: String, san: String, eval: String, isArabic: Bool, ranking: Int, totalMoves: Int) async throws -> String {
+                  let sys = isArabic ?
+                      "أنت مدرب شطرنج محترف. اشرح النقلات بالعربية بشكل مفصل ومفيد." :
+                      "You are a GM-level chess coach. Explain moves clearly."
+                  let usr = isArabic ?
+                      "الموقف: \(fen)\nالنقلة #\(ranking): \(san) (\(uci))\nالتقييم: \(eval)\n\nاشرحلي:\n1. لماذا هذه النقلة جيدة؟\n2. الخطة الاستراتيجية\n3. تهديدات الخصم\n4. نصائح تكتيكية\n\n4-6 أسطر." :
+                      "Position: \(fen)\nMove #\(ranking): \(san) (\(uci))\nEval: \(eval)\n\nExplain:\n1. Why is this good?\n2. Strategic plan\n3. Opponent threats\n4. Tactical tips\n\n4-6 lines."
+                  return try await chat(messages: [
+                      ChatMessage(role: "system", content: sys),
+                      ChatMessage(role: "user", content: usr)
+                  ], temperature: 0.4)
+              }
+              static func askAboutPosition(fen: String, question: String, isArabic: Bool, history: [ChatMessage] = []) async throws -> String {
+                  let sys = isArabic ?
+                      "أنت مدرب شطرنج. الموقف: \(fen). أجب بالعربية بشكل مفصل." :
+                      "You are a chess coach. Position: \(fen). Answer clearly."
+                  var msgs: [ChatMessage] = [ChatMessage(role: "system", content: sys)]
+                  msgs.append(contentsOf: history)
+                  msgs.append(ChatMessage(role: "user", content: question))
+                  return try await chat(messages: msgs, temperature: 0.7)
+              }
+              static func analyzeThreats(fen: String, isArabic: Bool) async throws -> String {
+                  let sys = isArabic ?
+                      "أنت مدرب شطرنج. حلل التهديدات بإيجاز." :
+                      "Chess coach. Analyze threats concisely."
+                  let usr = isArabic ?
+                      "الموقف: \(fen)\n\nحدد:\n1. كل تهديدات الخصم\n2. القطع المعرضة للخطر\n3. أي فخاخ\n\nمختصر 3-5 أسطر." :
+                      "Position: \(fen)\n\nIdentify:\n1. All threats\n2. Pieces in danger\n3. Traps\n\nConcise 3-5 lines."
+                  return try await chat(messages: [
+                      ChatMessage(role: "system", content: sys),
+                      ChatMessage(role: "user", content: usr)
+                  ], temperature: 0.3)
+              }
+              static func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) async throws -> String {
+                  let sys = isArabic ?
+                      "أنت مدرب شطرنج تكتيكي محترف." :
+                      "You are a tactical chess coach."
+                  let usr = isArabic ?
+                      "الموقف: \(fen)\nأفضل نقلة: \(bestMove)\n\nهذه فرصة تكتيكية! اشرح:\n1. نوع التكتيك (شوكة، سيخ، اكتشاف، إلخ)\n2. لماذا هذه النقلة تفوز؟\n3. ما هو الرد المتوقع؟\n4. النتيجة النهائية\n\n4-6 أسطر واضحة." :
+                      "Position: \(fen)\nBest move: \(bestMove)\n\nThis is a tactical opportunity! Explain:\n1. Type of tactic (fork, pin, discovered, etc.)\n2. Why does this move win?\n3. What's the expected response?\n4. Final outcome\n\n4-6 clear lines."
+                  return try await chat(messages: [
+                      ChatMessage(role: "system", content: sys),
+                      ChatMessage(role: "user", content: usr)
+                  ], temperature: 0.3)
+              }
+              static func reviewGame(movesUCI: [String], accuracy: Double, blunders: Int, mistakes: Int, isArabic: Bool) async throws -> String {
+                  let sys = isArabic ?
+                      "أنت مدرب شطرنج محترف. راجع اللعبة بأسلوب مشجع لكن صادق." :
+                      "You are a professional chess coach. Review the game encouragingly but honestly."
+                  let movesStr = movesUCI.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: " ")
+                  let usr = isArabic ?
+                      "اللعبة:\n\(movesStr)\n\nالدقة: \(Int(accuracy))%\nأخطاء فادحة: \(blunders)\nأخطاء: \(mistakes)\n\nاعطني:\n1. ملخص أداء اللاعب\n2. أهم نقاط القوة\n3. أهم نقاط الضعف\n4. نصيحة للتحسن\n\n5-8 أسطر." :
+                      "Game:\n\(movesStr)\n\nAccuracy: \(Int(accuracy))%\nBlunders: \(blunders)\nMistakes: \(mistakes)\n\nGive me:\n1. Performance summary\n2. Key strengths\n3. Key weaknesses\n4. Improvement tip\n\n5-8 lines."
+                  return try await chat(messages: [
+                      ChatMessage(role: "system", content: sys),
+                      ChatMessage(role: "user", content: usr)
+                  ], temperature: 0.5)
+              }
+          }
+          '''
+
+          # ========== EngineService with FAST RACE ==========
           files["Sources/EngineService.swift"] = r'''
           import Foundation
+          struct TopMove: Identifiable, Equatable {
+              let id = UUID()
+              let rank: Int; let uci: String; let san: String
+              let evaluationCp: Int?; let mateIn: Int?; let depth: Int
+              let source: String; let votes: Int
+              var evalString: String {
+                  if let m = mateIn, m != 0 { return "M\(abs(m))" }
+                  if let cp = evaluationCp { return String(format: "%+.2f", Double(cp)/100.0) }
+                  return "—"
+              }
+              var winChance: Double {
+                  if let m = mateIn, m != 0 { return m > 0 ? 99 : 1 }
+                  guard let cp = evaluationCp else { return 50 }
+                  return 50 + 50 * tanh(Double(cp)/400.0)
+              }
+              var rankScore: Double {
+                  if let m = mateIn, m != 0 { return m > 0 ? 100000 - Double(m) : -100000 - Double(m) }
+                  return Double(evaluationCp ?? 0)
+              }
+          }
+          struct EngineAnalysis {
+              let topMoves: [TopMove]; let bestMove: TopMove?
+              let depth: Int; let sourcesUsed: String
+              let confidence: Int; let debugFen: String
+          }
+          enum EngineError: Error, LocalizedError {
+              case badFen(String), networkOffline, allEnginesFailed, cancelled
+              var errorDescription: String? {
+                  switch self {
+                  case .badFen(let m): return "Bad FEN: \(m)"
+                  case .networkOffline: return "No internet"
+                  case .allEnginesFailed: return "All engines offline"
+                  case .cancelled: return "Cancelled"
+                  }
+              }
+          }
+          enum EngineService {
+              static func callLichessCloud(fen: String, multiPv: Int = 3) async -> [TopMove]? {
+                  var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
+                  comps.queryItems = [URLQueryItem(name: "fen", value: fen), URLQueryItem(name: "multiPv", value: "\(multiPv)")]
+                  guard let url = comps.url else { return nil }
+                  var req = URLRequest(url: url); req.timeoutInterval = 4
+                  req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                  do {
+                      let (data, resp) = try await URLSession.shared.data(for: req)
+                      guard let http = resp as? HTTPURLResponse else { return nil }
+                      if http.statusCode == 404 { return [] }
+                      guard http.statusCode == 200 else { return nil }
+                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                      let depth = (json["depth"] as? Int) ?? 20
+                      guard let pvs = json["pvs"] as? [[String: Any]] else { return [] }
+                      var moves: [TopMove] = []
+                      for (idx, pv) in pvs.prefix(multiPv).enumerated() {
+                          let ms = (pv["moves"] as? String) ?? ""
+                          let fm = String(ms.split(separator: " ").first ?? "")
+                          guard !fm.isEmpty else { continue }
+                          guard MoveValidator.isPlausibleMove(uci: fm, fen: fen) else { continue }
+                          let cp = pv["cp"] as? Int; let mate = pv["mate"] as? Int
+                          moves.append(TopMove(rank: idx + 1, uci: fm, san: fm, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: depth, source: "lc", votes: 1))
+                      }
+                      return moves
+                  } catch { return nil }
+              }
+              static func callChessApi(fen: String, deep: Bool = false) async -> TopMove? {
+                  guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
+                  var req = URLRequest(url: url); req.httpMethod = "POST"
+                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                  req.timeoutInterval = deep ? 12 : 5; req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                  let body: [String: Any] = ["fen": fen, "depth": deep ? 18 : 13, "maxThinkingTime": deep ? 800 : 200]
+                  guard let hb = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+                  req.httpBody = hb
+                  do {
+                      let (data, _) = try await URLSession.shared.data(for: req)
+                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                      let uci = (json["move"] as? String) ?? ""; guard !uci.isEmpty else { return nil }
+                      guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
+                      let san = (json["san"] as? String) ?? uci
+                      let eval = json["eval"] as? Double; let mate = json["mate"] as? Int
+                      let cp = eval.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? 13
+                      return TopMove(rank: 1, uci: uci, san: san, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "cA", votes: 1)
+                  } catch { return nil }
+              }
+              static func callStockfishOnline(fen: String, deep: Bool = false) async -> TopMove? {
+                  var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
+                  comps.queryItems = [URLQueryItem(name: "fen", value: fen), URLQueryItem(name: "depth", value: deep ? "15" : "13")]
+                  guard let url = comps.url else { return nil }
+                  var req = URLRequest(url: url); req.timeoutInterval = deep ? 12 : 5
+                  req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                  do {
+                      let (data, _) = try await URLSession.shared.data(for: req)
+                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                      if let s = json["success"] as? Bool, !s { return nil }
+                      let bf = (json["bestmove"] as? String) ?? ""
+                      let parts = bf.split(separator: " ").map(String.init)
+                      var uci = ""
+                      for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count { uci = parts[i+1]; break }
+                      if uci.isEmpty { uci = parts.first ?? "" }
+                      guard !uci.isEmpty else { return nil }
+                      guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
+                      let ev = json["evaluation"] as? Double; let mate = json["mate"] as? Int
+                      let cp: Int? = ev.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? 13
+                      return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "sf", votes: 1)
+                  } catch { return nil }
+              }
+              static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
+                                            onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
+                  if let issue = FenValidator.validate(fen) { throw EngineError.badFen(issue) }
+                  if !deep, let cached = await AnalysisCache.shared.get(fen: fen) {
+                      let cm = cached.moves.enumerated().map { (i, m) in
+                          TopMove(rank: i + 1, uci: m.uci, san: m.san, evaluationCp: m.evaluationCp, mateIn: m.mateIn, depth: m.depth, source: "cache", votes: m.votes)
+                      }
+                      let a = EngineAnalysis(topMoves: cm, bestMove: cm.first, depth: cached.depth, sourcesUsed: "cache", confidence: cached.confidence, debugFen: fen)
+                      await MainActor.run { onUpdate(a) }
+                      return a
+                  }
+                  async let lr = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
+                  async let cr = callChessApi(fen: fen, deep: deep)
+                  async let sr = callStockfishOnline(fen: fen, deep: deep)
+                  let lichess = await lr; try Task.checkCancellation()
+                  let cA = await cr; try Task.checkCancellation()
+                  let sf = await sr; try Task.checkCancellation()
+                  var mv: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
+                  if let lm = lichess { for m in lm {
+                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("lc"); mv[m.uci] = e }
+                      else { mv[m.uci] = (m, 1, ["lc"]) }
+                  }}
+                  if let m = cA {
+                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("cA"); mv[m.uci] = e }
+                      else { mv[m.uci] = (m, 1, ["cA"]) }
+                  }
+                  if let m = sf {
+                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("sf"); mv[m.uci] = e }
+                      else { mv[m.uci] = (m, 1, ["sf"]) }
+                  }
+                  guard !mv.isEmpty else {
+                      if lichess == nil && cA == nil && sf == nil { throw EngineError.networkOffline }
+                      throw EngineError.allEnginesFailed
+                  }
+                  let sorted = mv.values.sorted { a, b in
+                      if a.votes != b.votes { return a.votes > b.votes }
+                      return a.move.rankScore > b.move.rankScore
+                  }
+                  let limit = deep ? 5 : 3
+                  let final: [TopMove] = sorted.prefix(limit).enumerated().map { (idx, e) in
+                      TopMove(rank: idx + 1, uci: e.move.uci, san: e.move.san, evaluationCp: e.move.evaluationCp, mateIn: e.move.mateIn, depth: e.move.depth, source: e.sources.joined(separator: "+"), votes: e.votes)
+                  }
+                  let topV = final.first?.votes ?? 1
+                  let allS = Array(Set(mv.values.flatMap { $0.sources })).sorted().joined(separator: "+")
+                  let bestD = final.map { $0.depth }.max() ?? 13
+                  let identical = final.count >= 2 && final.allSatisfy { $0.evaluationCp == final.first?.evaluationCp }
+                  let analysis = EngineAnalysis(topMoves: final, bestMove: final.first, depth: bestD, sourcesUsed: allS, confidence: min(topV, 3), debugFen: fen)
+                  if !identical && !deep {
+                      await AnalysisCache.shared.set(fen: fen, moves: final, depth: bestD, sources: allS, confidence: min(topV, 3))
+                  }
+                  await MainActor.run { onUpdate(analysis) }
+                  return analysis
+              }
+          }
+          '''
 
-struct TopMove: Identifiable, Equatable {
-    let id = UUID()
-    let rank: Int
-    let uci: String
-    let san: String
-    let evaluationCp: Int?
-    let mateIn: Int?
-    let depth: Int
-    let source: String
-    let votes: Int
-    
-    var evalString: String {
-        if let m = mateIn, m != 0 { return "M\(abs(m))" }
-        if let cp = evaluationCp { return String(format: "%+.2f", Double(cp)/100.0) }
-        return "—"
-    }
-    
-    var winChance: Double {
-        if let m = mateIn, m != 0 { return m > 0 ? 99 : 1 }
-        guard let cp = evaluationCp else { return 50 }
-        return 50 + 50 * tanh(Double(cp)/400.0)
-    }
-    
-    var rankScore: Double {
-        if let m = mateIn, m != 0 { return m > 0 ? 100000 - Double(m) : -100000 - Double(m) }
-        return Double(evaluationCp ?? 0)
-    }
-}
-
-struct EngineAnalysis {
-    let topMoves: [TopMove]
-    let bestMove: TopMove?
-    let depth: Int
-    let sourcesUsed: String
-    let confidence: Int
-    let debugFen: String
-}
-
-enum EngineError: Error, LocalizedError {
-    case badFen(String)
-    case networkOffline
-    case allEnginesFailed
-    case cancelled
-    
-    var errorDescription: String? {
-        switch self {
-        case .badFen(let m):
-            return "Bad FEN: \(m)"
-        case .networkOffline:
-            return "No internet"
-        case .allEnginesFailed:
-            return "All engines offline"
-        case .cancelled:
-            return "Cancelled"
-        }
-    }
-}
-
-enum EngineService {
-    
-    // ✅ LICHESS CLOUD
-    static func callLichessCloud(fen: String, multiPv: Int = 3) async -> [TopMove]? {
-        var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
-        comps.queryItems = [
-            URLQueryItem(name: "fen", value: fen),
-            URLQueryItem(name: "multiPv", value: "\(multiPv)")
-        ]
-        guard let url = comps.url else { return nil }
-        
-        var req = URLRequest(url: url)
-        req.timeoutInterval = 4  // ✅ قصير
-        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-        
-        do {
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse else { return nil }
-            
-            if http.statusCode == 404 { return [] }
-            guard http.statusCode == 200 else { return nil }
-            
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-            
-            let depth = (json["depth"] as? Int) ?? 20
-            guard let pvs = json["pvs"] as? [[String: Any]] else { return [] }
-            
-            var moves: [TopMove] = []
-            for (idx, pv) in pvs.prefix(multiPv).enumerated() {
-                let ms = (pv["moves"] as? String) ?? ""
-                let fm = String(ms.split(separator: " ").first ?? "")
-                guard !fm.isEmpty else { continue }
-                
-                // ✅ VALIDATE MOVE
-                guard MoveValidator.isPlausibleMove(uci: fm, fen: fen) else { continue }
-                
-                let cp = pv["cp"] as? Int
-                let mate = pv["mate"] as? Int
-                
-                moves.append(TopMove(
-                    rank: idx + 1,
-                    uci: fm,
-                    san: fm,
-                    evaluationCp: cp,
-                    mateIn: (mate == 0 ? nil : mate),
-                    depth: depth,
-                    source: "lc",
-                    votes: 1
-                ))
-            }
-            return moves
-        } catch {
-            return nil
-        }
-    }
-    
-    // ✅ CHESS-API
-    static func callChessApi(fen: String, deep: Bool = false) async -> TopMove? {
-        guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
-        
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-        req.timeoutInterval = deep ? 12 : 5  // ✅ قصير
-        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        
-        let body: [String: Any] = [
-            "fen": fen,
-            "depth": deep ? 18 : 13,
-            "maxThinkingTime": deep ? 800 : 200
-        ]
-        
-        guard let hb = try? JSONSerialization.data(withJSONObject: body) else { return nil }
-        req.httpBody = hb
-        
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-            
-            let uci = (json["move"] as? String) ?? ""
-            guard !uci.isEmpty else { return nil }
-            
-            // ✅ VALIDATE MOVE
-            guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
-            
-            let san = (json["san"] as? String) ?? uci
-            let eval = json["eval"] as? Double
-            let mate = json["mate"] as? Int
-            let cp = eval.map { Int(($0 * 100).rounded()) }
-            let d = (json["depth"] as? Int) ?? 13
-            
-            return TopMove(
-                rank: 1,
-                uci: uci,
-                san: san,
-                evaluationCp: cp,
-                mateIn: (mate == 0 ? nil : mate),
-                depth: d,
-                source: "cA",
-                votes: 1
-            )
-        } catch {
-            return nil
-        }
-    }
-    
-    // ✅ STOCKFISH ONLINE
-    static func callStockfishOnline(fen: String, deep: Bool = false) async -> TopMove? {
-        var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
-        comps.queryItems = [
-            URLQueryItem(name: "fen", value: fen),
-            URLQueryItem(name: "depth", value: deep ? "15" : "13")
-        ]
-        guard let url = comps.url else { return nil }
-        
-        var req = URLRequest(url: url)
-        req.timeoutInterval = deep ? 12 : 5  // ✅ قصير
-        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-        
-        do {
-            let (data, _) = try await URLSession.shared.data(for: req)
-            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-            
-            if let s = json["success"] as? Bool, !s { return nil }
-            
-            let bf = (json["bestmove"] as? String) ?? ""
-            let parts = bf.split(separator: " ").map(String.init)
-            
-            var uci = ""
-            for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count {
-                uci = parts[i+1]
-                break
-            }
-            if uci.isEmpty { uci = parts.first ?? "" }
-            guard !uci.isEmpty else { return nil }
-            
-            // ✅ VALIDATE MOVE
-            guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
-            
-            let ev = json["evaluation"] as? Double
-            let mate = json["mate"] as? Int
-            let cp: Int? = ev.map { Int(($0 * 100).rounded()) }
-            let d = (json["depth"] as? Int) ?? 13
-            
-            return TopMove(
-                rank: 1,
-                uci: uci,
-                san: uci,
-                evaluationCp: cp,
-                mateIn: (mate == 0 ? nil : mate),
-                depth: d,
-                source: "sf",
-                votes: 1
-            )
-        } catch {
-            return nil
-        }
-    }
-    
-    // ✅ MAIN ANALYZER with FAST RACE
-    static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
-                                  onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
-        
-        if let issue = FenValidator.validate(fen) {
-            throw EngineError.badFen(issue)
-        }
-        
-        // Check cache first
-        if !deep, let cached = await AnalysisCache.shared.get(fen: fen) {
-            let cm = cached.moves.enumerated().map { (i, m) in
-                TopMove(
-                    rank: i + 1,
-                    uci: m.uci,
-                    san: m.san,
-                    evaluationCp: m.evaluationCp,
-                    mateIn: m.mateIn,
-                    depth: m.depth,
-                    source: "cache",
-                    votes: m.votes
-                )
-            }
-            let a = EngineAnalysis(
-                topMoves: cm,
-                bestMove: cm.first,
-                depth: cached.depth,
-                sourcesUsed: "cache",
-                confidence: cached.confidence,
-                debugFen: fen
-            )
-            await MainActor.run { onUpdate(a) }
-            return a
-        }
-        
-        // ✅ RACE STRATEGY: Get results in parallel
-        async let lichessTask = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
-        async let chessApiTask = callChessApi(fen: fen, deep: deep)
-        async let stockfishTask = callStockfishOnline(fen: fen, deep: deep)
-        
-        let lichess = await lichessTask
-        try Task.checkCancellation()
-        
-        let cA = await chessApiTask
-        try Task.checkCancellation()
-        
-        let sf = await stockfishTask
-        try Task.checkCancellation()
-        
-        // ✅ Collect all moves with voting
-        var mv: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
-        
-        if let lm = lichess {
-            for m in lm {
-                if var e = mv[m.uci] {
-                    e.votes += 1
-                    e.sources.append("lc")
-                    mv[m.uci] = e
-                } else {
-                    mv[m.uci] = (m, 1, ["lc"])
-                }
-            }
-        }
-        
-        if let m = cA {
-            if var e = mv[m.uci] {
-                e.votes += 1
-                e.sources.append("cA")
-                mv[m.uci] = e
-            } else {
-                mv[m.uci] = (m, 1, ["cA"])
-            }
-        }
-        
-        if let m = sf {
-            if var e = mv[m.uci] {
-                e.votes += 1
-                e.sources.append("sf")
-                mv[m.uci] = e
-            } else {
-                mv[m.uci] = (m, 1, ["sf"])
-            }
-        }
-        
-        // ✅ No results = error
-        guard !mv.isEmpty else {
-            if lichess == nil && cA == nil && sf == nil {
-                throw EngineError.networkOffline
-            }
-            throw EngineError.allEnginesFailed
-        }
-        
-        // Sort by votes + score
-        let sorted = mv.values.sorted { a, b in
-            if a.votes != b.votes { return a.votes > b.votes }
-            return a.move.rankScore > b.move.rankScore
-        }
-        
-        let limit = deep ? 5 : 3
-        let final: [TopMove] = sorted.prefix(limit).enumerated().map { (idx, e) in
-            TopMove(
-                rank: idx + 1,
-                uci: e.move.uci,
-                san: e.move.san,
-                evaluationCp: e.move.evaluationCp,
-                mateIn: e.move.mateIn,
-                depth: e.move.depth,
-                source: e.sources.joined(separator: "+"),
-                votes: e.votes
-            )
-        }
-        
-        let topV = final.first?.votes ?? 1
-        let allS = Array(Set(mv.values.flatMap { $0.sources })).sorted().joined(separator: "+")
-        let bestD = final.map { $0.depth }.max() ?? 13
-        let identical = final.count >= 2 && final.allSatisfy { $0.evaluationCp == final.first?.evaluationCp }
-        
-        let analysis = EngineAnalysis(
-            topMoves: final,
-            bestMove: final.first,
-            depth: bestD,
-            sourcesUsed: allS,
-            confidence: min(topV, 3),
-            debugFen: fen
-        )
-        
-        // Cache if not identical and not deep
-        if !identical && !deep {
-            await AnalysisCache.shared.set(
-                fen: fen,
-                moves: final,
-                depth: bestD,
-                sources: allS,
-                confidence: min(topV, 3)
-            )
-        }
-        
-        await MainActor.run { onUpdate(analysis) }
-        return analysis
-    }
-}
-          # ========== GroqService (with new puzzle explanation) ==========
-          files["Sources/GroqService.swift"] = r'''
-        import Foundation
-
-enum GroqService {
-    struct ChatMessage: Codable {
-        let role: String
-        let content: String
-    }
-    
-    enum GroqError: Error, LocalizedError {
-        case noKey
-        case invalidKey
-        case networkError(String)
-        case rateLimited
-        case parseError
-        case timeout
-        
-        var errorDescription: String? {
-            switch self {
-            case .noKey:
-                return "No Groq API key. Add it in Settings."
-            case .invalidKey:
-                return "Invalid API key."
-            case .networkError(let m):
-                return "Network: \(m)"
-            case .rateLimited:
-                return "Too many requests. Try again later."
-            case .parseError:
-                return "Bad AI response"
-            case .timeout:
-                return "Request timeout. Check your connection."
-            }
-        }
-    }
-    
-    // ✅ MAIN CHAT with timeout + retry
-    static func chat(messages: [ChatMessage], temperature: Double = 0.3) async throws -> String {
-        guard let apiKey = KeychainStore.load(account: KeychainStore.groqKeyAccount), !apiKey.isEmpty else {
-            throw GroqError.noKey
-        }
-        
-        guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
-            throw GroqError.networkError("Bad URL")
-        }
-        
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-        req.timeoutInterval = 12  // ✅ قصير جداً
-        
-        let body: [String: Any] = [
-            "model": "llama-3.3-70b-versatile",
-            "messages": messages.map { ["role": $0.role, "content": $0.content] },
-            "temperature": temperature,
-            "max_tokens": 500,
-            "top_p": 0.9
-        ]
-        
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-        
-        // ✅ Retry logic with exponential backoff
-        var lastError: Error?
-        for attempt in 0..<2 {
-            do {
-                let (data, resp) = try await URLSession.shared.data(for: req)
-                
-                guard let http = resp as? HTTPURLResponse else {
-                    throw GroqError.networkError("No response")
-                }
-                
-                if http.statusCode == 401 {
-                    throw GroqError.invalidKey
-                }
-                
-                if http.statusCode == 429 {
-                    throw GroqError.rateLimited
-                }
-                
-                guard (200..<300).contains(http.statusCode) else {
-                    throw GroqError.networkError("HTTP \(http.statusCode)")
-                }
-                
-                guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let choices = json["choices"] as? [[String: Any]],
-                      let first = choices.first,
-                      let message = first["message"] as? [String: Any],
-                      let content = message["content"] as? String else {
-                    throw GroqError.parseError
-                }
-                
-                return content.trimmingCharacters(in: .whitespacesAndNewlines)
-                
-            } catch let error as URLError where error.code == .timedOut {
-                lastError = GroqError.timeout
-                if attempt < 1 {
-                    // ✅ exponential backoff: wait 2^attempt seconds
-                    try? await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempt)) * 1_000_000_000))
-                    continue
-                }
-            } catch {
-                lastError = error
-                if attempt < 1 && shouldRetry(error) {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                    continue
-                }
-            }
-            
-            break
-        }
-        
-        throw lastError ?? GroqError.networkError("Unknown error")
-    }
-    
-    // ✅ Determine if we should retry
-    private static func shouldRetry(_ error: Error) -> Bool {
-        if let urlError = error as? URLError {
-            return urlError.code == .timedOut ||
-                   urlError.code == .networkConnectionLost ||
-                   urlError.code == .notConnectedToInternet
-        }
-        if let groqError = error as? GroqError {
-            switch groqError {
-            case .timeout, .networkError:
-                return true
-            case .rateLimited:
-                return false // Don't retry rate limit
-            default:
-                return false
-            }
-        }
-        return false
-    }
-    
-    // ✅ Explain move with timeout
-    static func explainMove(fen: String, uci: String, san: String, eval: String, isArabic: Bool, ranking: Int, totalMoves: Int) async throws -> String {
-        let sys = isArabic ?
-            "أنت مدرب شطرنج محترف. اشرح النقلات بالعربية بشكل مفصل ومفيد." :
-            "You are a GM-level chess coach. Explain moves clearly."
-        
-        let usr = isArabic ?
-            "الموقف: \(fen)\nالنقلة #\(ranking): \(san) (\(uci))\nالتقييم: \(eval)\n\nاشرحلي:\n1. لماذا هذه النقلة جيدة؟\n2. الخطة الاستراتيجية\n3. تهديدات الخصم\n4. نصائح تكتيكية\n\n4-6 أسطر." :
-            "Position: \(fen)\nMove #\(ranking): \(san) (\(uci))\nEval: \(eval)\n\nExplain:\n1. Why is this good?\n2. Strategic plan\n3. Opponent threats\n4. Tactical tips\n\n4-6 lines."
-        
-        return try await chat(messages: [
-            ChatMessage(role: "system", content: sys),
-            ChatMessage(role: "user", content: usr)
-        ], temperature: 0.4)
-    }
-    
-    // ✅ Ask about position with timeout
-    static func askAboutPosition(fen: String, question: String, isArabic: Bool, history: [ChatMessage] = []) async throws -> String {
-        let sys = isArabic ?
-            "أنت مدرب شطرنج. الموقف: \(fen). أجب بالعربية بشكل مفصل." :
-            "You are a chess coach. Position: \(fen). Answer clearly."
-        
-        var msgs: [ChatMessage] = [ChatMessage(role: "system", content: sys)]
-        msgs.append(contentsOf: history)
-        msgs.append(ChatMessage(role: "user", content: question))
-        
-        return try await chat(messages: msgs, temperature: 0.7)
-    }
-    
-    // ✅ Analyze threats with timeout
-    static func analyzeThreats(fen: String, isArabic: Bool) async throws -> String {
-        let sys = isArabic ?
-            "أنت مدرب شطرنج. حلل التهديدات بإيجاز." :
-            "Chess coach. Analyze threats concisely."
-        
-        let usr = isArabic ?
-            "الموقف: \(fen)\n\nحدد:\n1. كل تهديدات الخصم\n2. القطع المعرضة للخطر\n3. أي فخاخ\n\nمختصر 3-5 أسطر." :
-            "Position: \(fen)\n\nIdentify:\n1. All threats\n2. Pieces in danger\n3. Traps\n\nConcise 3-5 lines."
-        
-        return try await chat(messages: [
-            ChatMessage(role: "system", content: sys),
-            ChatMessage(role: "user", content: usr)
-        ], temperature: 0.3)
-    }
-    
-    // ✅ Explain puzzle with timeout
-    static func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) async throws -> String {
-        let sys = isArabic ?
-            "أنت مدرب شطرنج تكتيكي محترف." :
-            "You are a tactical chess coach."
-        
-        let usr = isArabic ?
-            "الموقف: \(fen)\nأفضل نقلة: \(bestMove)\n\nهذه فرصة تكتيكية! اشرح:\n1. نوع التكتيك (شوكة، سيخ، اكتشاف، إلخ)\n2. لماذا هذه النقلة تفوز؟\n3. ما هو الرد المتوقع؟\n4. النتيجة النهائية\n\n4-6 أسطر واضحة." :
-            "Position: \(fen)\nBest move: \(bestMove)\n\nThis is a tactical opportunity! Explain:\n1. Type of tactic (fork, pin, discovered, etc.)\n2. Why does this move win?\n3. What's the expected response?\n4. Final outcome\n\n4-6 clear lines."
-        
-        return try await chat(messages: [
-            ChatMessage(role: "system", content: sys),
-            ChatMessage(role: "user", content: usr)
-        ], temperature: 0.3)
-    }
-    
-    // ✅ Review game with timeout
-    static func reviewGame(movesUCI: [String], accuracy: Double, blunders: Int, mistakes: Int, isArabic: Bool) async throws -> String {
-        let sys = isArabic ?
-            "أنت مدرب شطرنج محترف. راجع اللعبة بأسلوب مشجع لكن صادق." :
-            "You are a professional chess coach. Review the game encouragingly but honestly."
-        
-        let movesStr = movesUCI.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: " ")
-        
-        let usr = isArabic ?
-            "اللعبة:\n\(movesStr)\n\nالدقة: \(Int(accuracy))%\nأخطاء فادحة: \(blunders)\nأخطاء: \(mistakes)\n\nاعطني:\n1. ملخص أداء اللاعب\n2. أهم نقاط القوة\n3. أهم نقاط الضعف\n4. نصيحة للتحسن\n\n5-8 أسطر." :
-            "Game:\n\(movesStr)\n\nAccuracy: \(Int(accuracy))%\nBlunders: \(blunders)\nMistakes: \(mistakes)\n\nGive me:\n1. Performance summary\n2. Key strengths\n3. Key weaknesses\n4. Improvement tip\n\n5-8 lines."
-        
-        return try await chat(messages: [
-            ChatMessage(role: "system", content: sys),
-            ChatMessage(role: "user", content: usr)
-        ], temperature: 0.5)
-    }
-}
-
-          # ========== AIAssistantViewModel with puzzle explanation ==========
+          # ========== AIAssistantViewModel ==========
           files["Sources/AIAssistantViewModel.swift"] = r'''
           import Foundation
           import SwiftUI
@@ -1324,16 +994,13 @@ enum GroqService {
               @Published var isLoadingThreats = false
               @Published var isPuzzleDetected = false
               @Published var puzzleHint: String = ""
-
               struct ChatEntry: Identifiable, Equatable {
                   let id = UUID()
                   let role: String
                   let text: String
               }
-
               private var explanationCache: [String: String] = [:]
               private var explanationTask: Task<Void, Never>?
-
               func explainMove(fen: String, uci: String, san: String, eval: String, ranking: Int, totalMoves: Int, isArabic: Bool) {
                   let cacheKey = "\(fen)|\(uci)|\(isArabic ? "ar" : "en")"
                   if let cached = explanationCache[cacheKey] {
@@ -1359,8 +1026,6 @@ enum GroqService {
                       }
                   }
               }
-
-              // NEW: Explain puzzle
               func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) {
                   currentExplanation = ""
                   currentExplainedMove = "🧩 " + (isArabic ? "فرصة تكتيكية" : "Tactical Opportunity")
@@ -1382,9 +1047,7 @@ enum GroqService {
                       }
                   }
               }
-
               func clearExplanation() { currentExplanation = ""; currentExplainedMove = ""; explanationError = "" }
-
               func sendChat(fen: String, isArabic: Bool) {
                   let q = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
                   guard !q.isEmpty else { return }
@@ -1404,9 +1067,7 @@ enum GroqService {
                       }
                   }
               }
-
               func clearChat() { chatMessages.removeAll() }
-
               func analyzeThreats(fen: String, isArabic: Bool) {
                   threatAnalysis = ""; isLoadingThreats = true
                   Task { [weak self] in
@@ -1419,7 +1080,6 @@ enum GroqService {
                       }
                   }
               }
-
               func checkForPuzzle(topMoves: [TopMove]) {
                   guard topMoves.count >= 2 else { isPuzzleDetected = false; puzzleHint = ""; return }
                   let best = topMoves[0]; let second = topMoves[1]
@@ -1435,7 +1095,225 @@ enum GroqService {
           }
           '''
 
-          # ========== StealthManager (unchanged) ==========
+          # ========== EngineViewModel with BLUNDER ALERT ==========
+          files["Sources/EngineViewModel.swift"] = r'''
+          import Foundation
+          import SwiftUI
+          enum MoveQuality: String {
+              case brilliant = "!! Brilliant", best = "! Best", good = "Good"
+              case inaccuracy = "?! Inaccuracy", mistake = "? Mistake", blunder = "?? Blunder", none = ""
+              var color: Color {
+                  switch self {
+                  case .brilliant: return .cyan; case .best: return .green; case .good: return .green.opacity(0.7)
+                  case .inaccuracy: return .yellow; case .mistake: return .orange; case .blunder: return .red; case .none: return .clear
+                  }
+              }
+          }
+          enum DetectionConfidence: String { case high, medium, low, unknown }
+          @MainActor
+          final class EngineViewModel: ObservableObject {
+              @Published var currentFEN = ""
+              @Published var topMoves: [TopMove] = []
+              @Published var evaluation = "—"
+              @Published var winChance: Double = 50
+              @Published var depth = 0
+              @Published var isThinking = false
+              @Published var isDeepAnalyzing = false
+              @Published var errorMessage = ""
+              @Published var isOffline = false
+              @Published var sourcesUsed = ""
+              @Published var engineConfidence: Int = 0
+              @Published var detectedPlayerColor = "w"
+              @Published var manualPlayerColor: String? = nil
+              @Published var sideToMove = "w"
+              @Published var lastMoveUCI = ""
+              @Published var plyCount = -1
+              @Published var confidence: DetectionConfidence = .unknown
+              @Published var lastMoveQuality: MoveQuality = .none
+              @Published var lastMoveCentipawnLoss = 0
+              @Published var lastMoveWasMine = false
+              @Published var enabled = true
+              @Published var showBlunderAlert = false
+              @Published var blunderAlertText = ""
+              var bestMove: TopMove? { topMoves.first }
+              var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
+              var isMyTurn: Bool { effectivePlayerColor == sideToMove }
+              private let fenBuilder = FenBuilder()
+              private var previousEvalWhitePOV: Double? = nil
+              private var previousFEN: String = ""
+              private var previousBestMove: String? = nil
+              private var lastSuccessfulFEN = ""
+              private var analysisTask: Task<Void, Never>?
+              private var debounceTask: Task<Void, Never>?
+              private var retryTask: Task<Void, Never>?
+              private var moveHistoryUCI: [String] = []
+              private var lastKnownPly: Int = -1
+              weak var recorder: GameRecorder?
+              func setManualColor(_ c: String?) {
+                  manualPlayerColor = c
+                  if !currentFEN.isEmpty { lastSuccessfulFEN = ""; queueAnalyze(fen: currentFEN, immediate: true) }
+              }
+              func flipColor() { setManualColor(effectivePlayerColor == "w" ? "b" : "w") }
+              func resetFenTracker() {
+                  fenBuilder.reset(); moveHistoryUCI = []; lastKnownPly = -1; lastSuccessfulFEN = ""
+                  previousEvalWhitePOV = nil; previousFEN = ""; previousBestMove = nil
+                  Task { await AnalysisCache.shared.clear() }
+                  recorder?.startNewGame()
+              }
+              func deepAnalyze() {
+                  guard !currentFEN.isEmpty else { return }
+                  lastSuccessfulFEN = ""; isDeepAnalyzing = true
+                  Task { await run(fen: currentFEN, deep: true) }
+              }
+              struct BoardPayload {
+                  let grid: String, sideToMove: String
+                  let flipped: Bool, flippedConfident: Bool
+                  let lastMoveUCI: String, plyCount: Int, detectionConfidence: String
+                  let bottomColor: String
+              }
+              func ingest(_ p: BoardPayload) {
+                  guard enabled else { return }
+                  sideToMove = p.sideToMove; lastMoveUCI = p.lastMoveUCI; plyCount = p.plyCount
+                  confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
+                  if p.bottomColor == "w" || p.bottomColor == "b" { detectedPlayerColor = p.bottomColor }
+                  if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
+                      moveHistoryUCI.append(p.lastMoveUCI); lastKnownPly = p.plyCount
+                  }
+                  if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 { resetFenTracker(); lastKnownPly = p.plyCount }
+                  let chars = Array(p.grid); guard chars.count == 64 else { return }
+                  var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
+                  for r in 0..<8 { for c in 0..<8 { grid[r][c] = chars[r * 8 + c] } }
+                  if p.flipped {
+                      var f: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
+                      for r in 0..<8 { for c in 0..<8 { f[r][c] = grid[7 - r][7 - c] } }
+                      grid = f
+                  }
+                  let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
+                  if let _ = FenValidator.validate(fen) { return }
+                  if fen != currentFEN {
+                      previousFEN = currentFEN
+                      currentFEN = fen; topMoves = []; evaluation = "—"; winChance = 50
+                      errorMessage = ""; sourcesUsed = ""; engineConfidence = 0
+                      queueAnalyze(fen: fen)
+                  }
+              }
+              private func queueAnalyze(fen: String, immediate: Bool = false) {
+                  debounceTask?.cancel(); retryTask?.cancel()
+                  debounceTask = Task { [weak self] in
+                      if !immediate { try? await Task.sleep(nanoseconds: 150_000_000) }
+                      if Task.isCancelled { return }
+                      await self?.run(fen: fen, deep: false)
+                  }
+              }
+              private func run(fen: String, deep: Bool) async {
+                  if !deep && fen == lastSuccessfulFEN { return }
+                  analysisTask?.cancel(); isThinking = true; errorMessage = ""
+                  analysisTask = Task { [weak self] in
+                      guard let self = self else { return }
+                      do {
+                          let a = try await EngineService.analyzeStreaming(fen: fen, moveHistory: self.moveHistoryUCI, deep: deep) { partial in
+                              guard fen == self.currentFEN else { return }
+                              self.topMoves = partial.topMoves
+                              if let best = partial.bestMove {
+                                  self.evaluation = best.evalString; self.winChance = best.winChance; self.depth = best.depth
+                              }
+                              self.sourcesUsed = partial.sourcesUsed; self.engineConfidence = partial.confidence
+                          }
+                          if Task.isCancelled { return }
+                          guard fen == self.currentFEN else { return }
+                          await MainActor.run {
+                              self.topMoves = a.topMoves
+                              self.evaluation = a.bestMove?.evalString ?? "—"
+                              self.winChance = a.bestMove?.winChance ?? 50; self.depth = a.depth
+                              self.sourcesUsed = a.sourcesUsed; self.engineConfidence = a.confidence
+                              self.isThinking = false; self.isDeepAnalyzing = false; self.isOffline = false
+                              self.errorMessage = ""; self.lastSuccessfulFEN = fen
+                              let wpov = self.evalWhitePOV(a.bestMove)
+                              self.computeQuality(cur: wpov)
+                              if !self.previousFEN.isEmpty && !self.lastMoveUCI.isEmpty {
+                                  let prevCP = self.previousEvalWhitePOV.map { Int(($0 * 100).rounded()) }
+                                  let currCP = a.bestMove?.evaluationCp
+                                  self.recorder?.recordMove(
+                                      previousFen: self.previousFEN, previousEval: prevCP,
+                                      currentFen: fen, currentEval: currCP,
+                                      lastMoveUCI: self.lastMoveUCI, wasMyMove: self.lastMoveWasMine,
+                                      bestMoveUCI: self.previousBestMove, plyCount: self.plyCount
+                                  )
+                                  if self.lastMoveWasMine && self.lastMoveCentipawnLoss >= 100 {
+                                      let qualityText = self.lastMoveQuality.rawValue
+                                      self.blunderAlertText = "\(qualityText) −\(self.lastMoveCentipawnLoss)cp"
+                                      self.showBlunderAlert = true
+                                      HapticManager.blunderWarning()
+                                      Task {
+                                          try? await Task.sleep(nanoseconds: 3_000_000_000)
+                                          await MainActor.run {
+                                              self.showBlunderAlert = false
+                                          }
+                                      }
+                                  }
+                              }
+                              self.previousBestMove = a.bestMove?.uci
+                              self.previousEvalWhitePOV = wpov
+                          }
+                      } catch {
+                          if Task.isCancelled { return }
+                          guard fen == self.currentFEN else { return }
+                          await MainActor.run {
+                              self.isThinking = false; self.isDeepAnalyzing = false
+                              self.topMoves = []; self.evaluation = "—"; self.sourcesUsed = ""; self.engineConfidence = 0
+                              if let e = error as? EngineError {
+                                  switch e {
+                                  case .networkOffline: self.isOffline = true; self.errorMessage = "Offline"; self.scheduleRetry(fen: fen)
+                                  case .allEnginesFailed: self.isOffline = true; self.errorMessage = "Engines down"; self.scheduleRetry(fen: fen)
+                                  case .badFen(let m): self.errorMessage = "Bad FEN: \(m)"
+                                  case .cancelled: break
+                                  }
+                              } else { self.isOffline = true; self.errorMessage = "Error"; self.scheduleRetry(fen: fen) }
+                          }
+                      }
+                  }
+              }
+              private func scheduleRetry(fen: String) {
+                  retryTask?.cancel()
+                  retryTask = Task { [weak self] in
+                      try? await Task.sleep(nanoseconds: 5_000_000_000)
+                      guard let self = self, !Task.isCancelled else { return }
+                      guard fen == self.currentFEN, self.topMoves.isEmpty else { return }
+                      await self.run(fen: fen, deep: false)
+                  }
+              }
+              private func evalWhitePOV(_ m: TopMove?) -> Double {
+                  guard let m = m else { return 0 }
+                  if let mate = m.mateIn, mate != 0 { return mate > 0 ? 30 : -30 }
+                  let cp = Double(m.evaluationCp ?? 0) / 100.0
+                  return sideToMove == "w" ? cp : -cp
+              }
+              private func computeQuality(cur: Double) {
+                  guard let prev = previousEvalWhitePOV, !lastMoveUCI.isEmpty else {
+                      lastMoveQuality = .none; lastMoveCentipawnLoss = 0; return
+                  }
+                  let mul: Double = (sideToMove == "w") ? -1 : 1
+                  let loss = (prev - cur) * mul
+                  let cp = Int((loss * 100).rounded())
+                  lastMoveCentipawnLoss = max(0, cp)
+                  let mover = (sideToMove == "w") ? "b" : "w"
+                  lastMoveWasMine = (mover == effectivePlayerColor)
+                  switch cp {
+                  case ..<(-30): lastMoveQuality = .brilliant
+                  case (-30)...15: lastMoveQuality = .best
+                  case 16...49: lastMoveQuality = .good
+                  case 50...99: lastMoveQuality = .inaccuracy
+                  case 100...299: lastMoveQuality = .mistake
+                  default: lastMoveQuality = .blunder
+                  }
+                  if lastMoveWasMine && cp >= 100 {
+                      HapticManager.blunderWarning()
+                  }
+              }
+          }
+          '''
+
+          # ========== StealthManager ==========
           files["Sources/StealthManager.swift"] = r'''
           import SwiftUI
           import UIKit
@@ -1476,244 +1354,9 @@ enum GroqService {
           extension Notification.Name { static let stealthPanic = Notification.Name("StealthPanicGesture") }
           '''
 
-          # ========== EngineViewModel with recording + blunder detection ==========
-          files["Sources/EngineViewModel.swift"] = r'''
-          import Foundation
-          import SwiftUI
-
-          enum MoveQuality: String {
-              case brilliant = "!! Brilliant", best = "! Best", good = "Good"
-              case inaccuracy = "?! Inaccuracy", mistake = "? Mistake", blunder = "?? Blunder", none = ""
-              var color: Color {
-                  switch self {
-                  case .brilliant: return .cyan; case .best: return .green; case .good: return .green.opacity(0.7)
-                  case .inaccuracy: return .yellow; case .mistake: return .orange; case .blunder: return .red; case .none: return .clear
-                  }
-              }
-          }
-
-          enum DetectionConfidence: String { case high, medium, low, unknown }
-
-          @MainActor
-          final class EngineViewModel: ObservableObject {
-              @Published var currentFEN = ""
-              @Published var topMoves: [TopMove] = []
-              @Published var evaluation = "—"
-              @Published var winChance: Double = 50
-              @Published var depth = 0
-              @Published var isThinking = false
-              @Published var isDeepAnalyzing = false
-              @Published var errorMessage = ""
-              @Published var isOffline = false
-              @Published var sourcesUsed = ""
-              @Published var engineConfidence: Int = 0
-              @Published var detectedPlayerColor = "w"
-              @Published var manualPlayerColor: String? = nil
-              @Published var sideToMove = "w"
-              @Published var lastMoveUCI = ""
-              @Published var plyCount = -1
-              @Published var confidence: DetectionConfidence = .unknown
-              @Published var lastMoveQuality: MoveQuality = .none
-              @Published var lastMoveCentipawnLoss = 0
-              @Published var lastMoveWasMine = false
-              @Published var enabled = true
-              // NEW: blunder alert
-              @Published var showBlunderAlert = false
-              @Published var blunderAlertText = ""
-
-              var bestMove: TopMove? { topMoves.first }
-              var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
-              var isMyTurn: Bool { effectivePlayerColor == sideToMove }
-
-              private let fenBuilder = FenBuilder()
-              private var previousEvalWhitePOV: Double? = nil
-              private var previousFEN: String = ""
-              private var previousBestMove: String? = nil
-              private var lastSuccessfulFEN = ""
-              private var analysisTask: Task<Void, Never>?
-              private var debounceTask: Task<Void, Never>?
-              private var retryTask: Task<Void, Never>?
-              private var moveHistoryUCI: [String] = []
-              private var lastKnownPly: Int = -1
-
-              // Recorder reference (set from ContentView)
-              weak var recorder: GameRecorder?
-
-              func setManualColor(_ c: String?) {
-                  manualPlayerColor = c
-                  if !currentFEN.isEmpty { lastSuccessfulFEN = ""; queueAnalyze(fen: currentFEN, immediate: true) }
-              }
-              func flipColor() { setManualColor(effectivePlayerColor == "w" ? "b" : "w") }
-              func resetFenTracker() {
-                  fenBuilder.reset(); moveHistoryUCI = []; lastKnownPly = -1; lastSuccessfulFEN = ""
-                  previousEvalWhitePOV = nil; previousFEN = ""; previousBestMove = nil
-                  Task { await AnalysisCache.shared.clear() }
-                  recorder?.startNewGame()
-              }
-              func deepAnalyze() {
-                  guard !currentFEN.isEmpty else { return }
-                  lastSuccessfulFEN = ""; isDeepAnalyzing = true
-                  Task { await run(fen: currentFEN, deep: true) }
-              }
-
-              struct BoardPayload {
-                  let grid: String, sideToMove: String
-                  let flipped: Bool, flippedConfident: Bool
-                  let lastMoveUCI: String, plyCount: Int, detectionConfidence: String
-                  let bottomColor: String
-              }
-
-              func ingest(_ p: BoardPayload) {
-                  guard enabled else { return }
-                  sideToMove = p.sideToMove; lastMoveUCI = p.lastMoveUCI; plyCount = p.plyCount
-                  confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  if p.bottomColor == "w" || p.bottomColor == "b" { detectedPlayerColor = p.bottomColor }
-                  if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
-                      moveHistoryUCI.append(p.lastMoveUCI); lastKnownPly = p.plyCount
-                  }
-                  if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 { resetFenTracker(); lastKnownPly = p.plyCount }
-                  let chars = Array(p.grid); guard chars.count == 64 else { return }
-                  var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
-                  for r in 0..<8 { for c in 0..<8 { grid[r][c] = chars[r * 8 + c] } }
-                  if p.flipped {
-                      var f: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
-                      for r in 0..<8 { for c in 0..<8 { f[r][c] = grid[7 - r][7 - c] } }
-                      grid = f
-                  }
-                  let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
-                  if let _ = FenValidator.validate(fen) { return }
-                  if fen != currentFEN {
-                      // Save previous state for recorder
-                      previousFEN = currentFEN
-                      currentFEN = fen; topMoves = []; evaluation = "—"; winChance = 50
-                      errorMessage = ""; sourcesUsed = ""; engineConfidence = 0
-                      queueAnalyze(fen: fen)
-                  }
-              }
-
-              private func queueAnalyze(fen: String, immediate: Bool = false) {
-                  debounceTask?.cancel(); retryTask?.cancel()
-                  debounceTask = Task { [weak self] in
-                      if !immediate { try? await Task.sleep(nanoseconds: 150_000_000) }
-                      if Task.isCancelled { return }
-                      await self?.run(fen: fen, deep: false)
-                  }
-              }
-
-              private func run(fen: String, deep: Bool) async {
-                  if !deep && fen == lastSuccessfulFEN { return }
-                  analysisTask?.cancel(); isThinking = true; errorMessage = ""
-                  analysisTask = Task { [weak self] in
-                      guard let self = self else { return }
-                      do {
-                          let a = try await EngineService.analyzeStreaming(fen: fen, moveHistory: self.moveHistoryUCI, deep: deep) { partial in
-                              guard fen == self.currentFEN else { return }
-                              self.topMoves = partial.topMoves
-                              if let best = partial.bestMove {
-                                  self.evaluation = best.evalString; self.winChance = best.winChance; self.depth = best.depth
-                              }
-                              self.sourcesUsed = partial.sourcesUsed; self.engineConfidence = partial.confidence
-                          }
-                          if Task.isCancelled { return }
-                          guard fen == self.currentFEN else { return }
-                          await MainActor.run {
-                              self.topMoves = a.topMoves; self.evaluation = a.bestMove?.evalString ?? "—"
-                              self.winChance = a.bestMove?.winChance ?? 50; self.depth = a.depth
-                              self.sourcesUsed = a.sourcesUsed; self.engineConfidence = a.confidence
-                              self.isThinking = false; self.isDeepAnalyzing = false; self.isOffline = false
-                              self.errorMessage = ""; self.lastSuccessfulFEN = fen
-                              let wpov = self.evalWhitePOV(a.bestMove)
-                              self.computeQuality(cur: wpov)
-
-                              // NEW: Record move + check blunder
-                              if !self.previousFEN.isEmpty && !self.lastMoveUCI.isEmpty {
-                                  let prevCP = self.previousEvalWhitePOV.map { Int(($0 * 100).rounded()) }
-                                  let currCP = a.bestMove?.evaluationCp
-                                  self.recorder?.recordMove(
-                                      previousFen: self.previousFEN, previousEval: prevCP,
-                                      currentFen: fen, currentEval: currCP,
-                                      lastMoveUCI: self.lastMoveUCI, wasMyMove: self.lastMoveWasMine,
-                                      bestMoveUCI: self.previousBestMove, plyCount: self.plyCount
-                                  )
-                                  // Blunder alert (for my moves only)
-                                  if self.lastMoveWasMine && self.lastMoveCentipawnLoss >= 100 {
-                                      let qualityText = self.lastMoveQuality.rawValue
-                                      self.blunderAlertText = "\(qualityText) −\(self.lastMoveCentipawnLoss)cp"
-                                      self.showBlunderAlert = true
-                                      HapticManager.blunderWarning()
-                                      // Auto-hide after 3 seconds
-                                      Task {
-                                          try? await Task.sleep(nanoseconds: 3_000_000_000)
-                                          await MainActor.run { self.showBlunderAlert = false }
-                                      }
-                                  }
-                              }
-
-                              self.previousBestMove = a.bestMove?.uci
-                              self.previousEvalWhitePOV = wpov
-                          }
-                      } catch {
-                          if Task.isCancelled { return }
-                          guard fen == self.currentFEN else { return }
-                          await MainActor.run {
-                              self.isThinking = false; self.isDeepAnalyzing = false
-                              self.topMoves = []; self.evaluation = "—"; self.sourcesUsed = ""; self.engineConfidence = 0
-                              if let e = error as? EngineError {
-                                  switch e {
-                                  case .networkOffline: self.isOffline = true; self.errorMessage = "Offline"; self.scheduleRetry(fen: fen)
-                                  case .allEnginesFailed: self.isOffline = true; self.errorMessage = "Engines down"; self.scheduleRetry(fen: fen)
-                                  case .badFen(let m): self.errorMessage = "Bad FEN: \(m)"
-                                  case .cancelled: break
-                                  }
-                              } else { self.isOffline = true; self.errorMessage = "Error"; self.scheduleRetry(fen: fen) }
-                          }
-                      }
-                  }
-              }
-
-              private func scheduleRetry(fen: String) {
-                  retryTask?.cancel()
-                  retryTask = Task { [weak self] in
-                      try? await Task.sleep(nanoseconds: 5_000_000_000)
-                      guard let self = self, !Task.isCancelled else { return }
-                      guard fen == self.currentFEN, self.topMoves.isEmpty else { return }
-                      await self.run(fen: fen, deep: false)
-                  }
-              }
-
-              private func evalWhitePOV(_ m: TopMove?) -> Double {
-                  guard let m = m else { return 0 }
-                  if let mate = m.mateIn, mate != 0 { return mate > 0 ? 30 : -30 }
-                  let cp = Double(m.evaluationCp ?? 0) / 100.0
-                  return sideToMove == "w" ? cp : -cp
-              }
-
-              private func computeQuality(cur: Double) {
-                  guard let prev = previousEvalWhitePOV, !lastMoveUCI.isEmpty else {
-                      lastMoveQuality = .none; lastMoveCentipawnLoss = 0; return
-                  }
-                  let mul: Double = (sideToMove == "w") ? -1 : 1
-                  let loss = (prev - cur) * mul
-                  let cp = Int((loss * 100).rounded())
-                  lastMoveCentipawnLoss = max(0, cp)
-                  let mover = (sideToMove == "w") ? "b" : "w"
-                  lastMoveWasMine = (mover == effectivePlayerColor)
-                  switch cp {
-                  case ..<(-30): lastMoveQuality = .brilliant
-                  case (-30)...15: lastMoveQuality = .best
-                  case 16...49: lastMoveQuality = .good
-                  case 50...99: lastMoveQuality = .inaccuracy
-                  case 100...299: lastMoveQuality = .mistake
-                  default: lastMoveQuality = .blunder
-                  }
-              }
-          }
-          '''
-
-          # ========== NEW: ReviewView (complete Review tab) ==========
+          # ========== Review View ==========
           files["Sources/ReviewView.swift"] = r'''
           import SwiftUI
-
           struct ReviewView: View {
               @ObservedObject var recorder: GameRecorder
               @ObservedObject var language: AppLanguage
@@ -1721,7 +1364,6 @@ enum GroqService {
               @State private var aiReviewText = ""
               @State private var isLoadingReview = false
               @State private var showHistory = false
-
               var body: some View {
                   NavigationStack {
                       ScrollView {
@@ -1749,7 +1391,6 @@ enum GroqService {
                       }
                   }
               }
-
               private var statsCard: some View {
                   VStack(alignment: .leading, spacing: 8) {
                       HStack {
@@ -1768,14 +1409,12 @@ enum GroqService {
                   .background(Color.gray.opacity(0.15))
                   .cornerRadius(12)
               }
-
               private func statItem(value: String, label: String, color: Color) -> some View {
                   VStack(alignment: .leading, spacing: 2) {
                       Text(value).font(.title2.bold()).foregroundColor(color)
                       Text(label).font(.caption).foregroundColor(.secondary)
                   }
               }
-
               private var accuracyBar: some View {
                   VStack(alignment: .leading, spacing: 6) {
                       HStack {
@@ -1798,14 +1437,12 @@ enum GroqService {
                   .background(Color.gray.opacity(0.15))
                   .cornerRadius(12)
               }
-
               private var accuracyColor: Color {
                   if recorder.currentAccuracy >= 90 { return .green }
                   if recorder.currentAccuracy >= 75 { return .yellow }
                   if recorder.currentAccuracy >= 60 { return .orange }
                   return .red
               }
-
               private var qualityBreakdown: some View {
                   VStack(alignment: .leading, spacing: 8) {
                       Text(language.isArabic ? "تفاصيل جودة النقلات" : "Move Quality").font(.subheadline.bold())
@@ -1820,7 +1457,6 @@ enum GroqService {
                   .background(Color.gray.opacity(0.15))
                   .cornerRadius(12)
               }
-
               private func qualityRow(icon: String, label: String, count: Int, color: Color) -> some View {
                   HStack {
                       Text(icon).frame(width: 30)
@@ -1830,11 +1466,8 @@ enum GroqService {
                   }
                   .padding(.vertical, 2)
               }
-
               private var aiReviewButton: some View {
-                  Button {
-                      requestAIReview()
-                  } label: {
+                  Button { requestAIReview() } label: {
                       HStack {
                           if isLoadingReview {
                               ProgressView().scaleEffect(0.7)
@@ -1852,7 +1485,6 @@ enum GroqService {
                   }
                   .disabled(isLoadingReview || recorder.moves.isEmpty)
               }
-
               private var aiReviewCard: some View {
                   VStack(alignment: .leading, spacing: 8) {
                       HStack {
@@ -1868,7 +1500,6 @@ enum GroqService {
                   .background(Color.purple.opacity(0.15))
                   .cornerRadius(12)
               }
-
               private var movesListCard: some View {
                   VStack(alignment: .leading, spacing: 6) {
                       Text(language.isArabic ? "قائمة النقلات" : "Move List").font(.subheadline.bold())
@@ -1876,16 +1507,13 @@ enum GroqService {
                           Text(language.isArabic ? "لا توجد نقلات بعد" : "No moves yet")
                               .font(.caption).foregroundColor(.secondary).padding()
                       } else {
-                          ForEach(recorder.moves) { move in
-                              moveRow(move)
-                          }
+                          ForEach(recorder.moves) { move in moveRow(move) }
                       }
                   }
                   .padding()
                   .background(Color.gray.opacity(0.15))
                   .cornerRadius(12)
               }
-
               private func moveRow(_ move: GameRecorder.MoveRecord) -> some View {
                   HStack {
                       Text("\(move.ply).").font(.caption.monospaced()).foregroundColor(.secondary).frame(width: 30)
@@ -1903,7 +1531,6 @@ enum GroqService {
                   }
                   .padding(.vertical, 2)
               }
-
               private func qualityBadge(_ q: String) -> some View {
                   let (label, color): (String, Color) = {
                       switch q {
@@ -1923,7 +1550,6 @@ enum GroqService {
                       .background(color.opacity(0.2))
                       .cornerRadius(4)
               }
-
               private var actionButtons: some View {
                   HStack(spacing: 8) {
                       Button {
@@ -1949,7 +1575,6 @@ enum GroqService {
                       }
                   }
               }
-
               private func requestAIReview() {
                   guard !recorder.moves.isEmpty else { return }
                   isLoadingReview = true
@@ -1977,13 +1602,11 @@ enum GroqService {
                   }
               }
           }
-
           struct HistoryView: View {
               @ObservedObject var recorder: GameRecorder
               @ObservedObject var language: AppLanguage
               @Environment(\.dismiss) var dismiss
               @State private var history: [GameHistoryEntry] = []
-
               var body: some View {
                   NavigationStack {
                       List {
@@ -2022,7 +1645,23 @@ enum GroqService {
           }
           '''
 
-          # ========== ContentView with recorder ==========
+          # Continue in next part...
+          for path, content in files.items():
+              content = textwrap.dedent(content).strip() + "\n"
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w") as f: f.write(content)
+              print(f"  ✅ {path}")
+          print(f"\nWrote {len(files)} Swift files (Part 1)")
+          PYEOF
+
+      - name: Generate remaining Swift files (Part 2)
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import os, textwrap
+          files = {}
+
+          # ========== ContentView ==========
           files["Sources/ContentView.swift"] = r'''
           import SwiftUI
           struct ContentView: View {
@@ -2032,7 +1671,6 @@ enum GroqService {
               @StateObject private var aiVM = AIAssistantViewModel()
               @StateObject private var language = AppLanguage()
               @StateObject private var recorder = GameRecorder()
-
               var body: some View {
                   TabView(selection: $router.selectedTab) {
                       PlayView(engine: engine, stealth: stealth, router: router, aiVM: aiVM, language: language, recorder: recorder)
@@ -2067,7 +1705,7 @@ enum GroqService {
           }
           '''
 
-          # ========== PlayView (with Puzzle tap + Blunder alert + Voice button) ==========
+          # ========== PlayView ==========
           files["Sources/PlayView.swift"] = r'''
           import SwiftUI
           struct PlayView: View {
@@ -2082,7 +1720,6 @@ enum GroqService {
               @State private var showDisclaimer = true
               @State private var dragOffset: CGSize = .zero
               @State private var isDragging = false
-
               var body: some View {
                   VStack(spacing: 0) {
                       nav
@@ -2099,9 +1736,7 @@ enum GroqService {
                           if stealth.overlayVisible { draggableOverlay }
                           if !stealth.overlayVisible { fixedRevealButton }
                           if aiPos.isVisible { draggableAIPanel }
-                          // Puzzle banner - now tappable!
                           if aiVM.isPuzzleDetected { puzzleBanner }
-                          // NEW: Blunder alert
                           if engine.showBlunderAlert { blunderAlertBanner }
                       }
                   }
@@ -2112,14 +1747,11 @@ enum GroqService {
                   }
                   .onChange(of: engine.topMoves.count) { _ in
                       aiVM.checkForPuzzle(topMoves: engine.topMoves)
-                      // Haptic when new moves arrive
                       if !engine.topMoves.isEmpty && engine.isMyTurn {
                           HapticManager.moveReady()
                       }
                   }
               }
-
-              // TAPPABLE puzzle banner
               private var puzzleBanner: some View {
                   VStack {
                       Button {
@@ -2147,8 +1779,6 @@ enum GroqService {
                       Spacer()
                   }
               }
-
-              // NEW: Blunder alert banner (auto-hides after 3s)
               private var blunderAlertBanner: some View {
                   VStack {
                       Spacer()
@@ -2170,7 +1800,6 @@ enum GroqService {
                   }
                   .animation(.spring(), value: engine.showBlunderAlert)
               }
-
               private var draggableOverlay: some View {
                   GeometryReader { geo in
                       HelperOverlay(engine: engine, stealth: stealth, overlayPos: overlayPos,
@@ -2190,14 +1819,12 @@ enum GroqService {
                           )
                   }
               }
-
               private var draggableAIPanel: some View {
                   GeometryReader { geo in
                       AIAssistantPanel(aiVM: aiVM, aiPos: aiPos, engine: engine, language: language)
                           .position(x: geo.size.width / 2 + aiPos.offset.width, y: geo.size.height / 2 + aiPos.offset.height)
                   }
               }
-
               private var fixedRevealButton: some View {
                   VStack {
                       Spacer()
@@ -2214,7 +1841,6 @@ enum GroqService {
                   }
                   .frame(maxWidth: .infinity)
               }
-
               private var nav: some View {
                   HStack(spacing: 8) {
                       btn("house.fill", language.isArabic ? "الرئيسية" : "Home") { router.openInPlay("https://www.chess.com/") }
@@ -2236,7 +1862,6 @@ enum GroqService {
                   }
               }
           }
-
           struct DisclaimerCard: View {
               @ObservedObject var language: AppLanguage
               var onDismiss: () -> Void
@@ -2245,23 +1870,23 @@ enum GroqService {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
                       Text("Chess Helper v5.2").font(.title2.bold())
                       Text(language.isArabic ? """
-                      إصدار احترافي - Phase 3!
+                      إصدار احترافي - Phase 4!
 
-                      ✅ Move Validator (نقلات دقيقة 100%)
-                      ✅ شرح الفرص التكتيكية (اضغط عليها)
-                      ✅ تحذير من النقلات السيئة
-                      ✅ صوت (اضغط 🔊 للسماع)
-                      ✅ اهتزاز خفيف
-                      ✅ Tab المراجعة الكامل + تحليل AI للعبة
+                      ✅ Timeout Protection (12s max)
+                      ✅ Fast Move Race (50% أسرع)
+                      ✅ تحذير فوري من النقلات السيئة
+                      ✅ شرح الفرص التكتيكية
+                      ✅ صوت + اهتزاز محسن
+                      ✅ Tab المراجعة الكامل
                       """ : """
-                      Professional v5.2!
+                      Professional v5.2 - Phase 4!
 
-                      ✅ Move Validator (100% accurate moves)
-                      ✅ Tap puzzle banner for AI explanation
-                      ✅ Blunder warnings
-                      ✅ Voice announcements (tap 🔊)
-                      ✅ Light haptic feedback
-                      ✅ Full Review tab with AI game analysis
+                      ✅ Timeout Protection (12s max)
+                      ✅ Fast Move Race (50% faster)
+                      ✅ Immediate blunder warnings
+                      ✅ Puzzle explanations
+                      ✅ Enhanced voice + haptics
+                      ✅ Complete Review tab
                       """)
                       .font(.footnote).foregroundColor(.white.opacity(0.85)).multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -2274,7 +1899,7 @@ enum GroqService {
           }
           '''
 
-          # ========== EvalBar (unchanged) ==========
+          # ========== EvalBar ==========
           files["Sources/EvalBar.swift"] = r'''
           import SwiftUI
           struct EvalBar: View {
@@ -2306,7 +1931,7 @@ enum GroqService {
           }
           '''
 
-          # ========== HelperOverlay with Voice button ==========
+          # ========== HelperOverlay ==========
           files["Sources/HelperOverlay.swift"] = r'''
           import SwiftUI
           struct HelperOverlay: View {
@@ -2390,7 +2015,6 @@ enum GroqService {
                           VStack(alignment: .trailing, spacing: 1) {
                               Text(best.evalString).font(.callout.bold().monospaced()).foregroundColor(cc)
                               Text("d\(best.depth)").font(.caption2.monospaced()).foregroundColor(.secondary)
-                              // NEW: Voice button
                               Button {
                                   VoiceManager.shared.speakMove(uci: best.uci, san: best.san, isArabic: language.isArabic)
                                   HapticManager.selection()
@@ -2505,7 +2129,7 @@ enum GroqService {
           }
           '''
 
-          # ========== AI Panel (with fixed scroll from v5.1) ==========
+          # ========== AIAssistantPanel ==========
           files["Sources/AIAssistantPanel.swift"] = r'''
           import SwiftUI
           struct AIAssistantPanel: View {
@@ -2541,7 +2165,6 @@ enum GroqService {
                       Image(systemName: "sparkles").font(.caption).foregroundColor(.purple)
                       Text("AI").font(.caption.bold()).foregroundColor(.purple)
                       Spacer()
-                      // Speak explanation button
                       if !aiVM.currentExplanation.isEmpty && !aiPos.isChatMode {
                           Button {
                               VoiceManager.shared.speak(text: aiVM.currentExplanation, isArabic: language.isArabic)
@@ -2759,8 +2382,8 @@ enum GroqService {
                               Button(language.isArabic ? "إخفاء" : "Hide", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "5.2.0 (52)")
-                              LabeledContent("Features", value: "Voice+Haptic+Review")
+                              LabeledContent("Version", value: "5.2.0 Phase 4")
+                              LabeledContent("Features", value: "Timeout+Race+Voice+Review")
                           }
                       }
                       .navigationTitle(language.isArabic ? "الإعدادات" : "Settings")
@@ -2773,7 +2396,7 @@ enum GroqService {
           }
           '''
 
-          # ========== ChessWebView (unchanged) ==========
+          # ========== ChessWebView ==========
           files["Sources/ChessWebView.swift"] = r'''
           import SwiftUI
           import WebKit
@@ -2857,7 +2480,7 @@ enum GroqService {
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, "w") as f: f.write(content)
               print(f"  ✅ {path}")
-          print(f"\nWrote {len(files)} Swift files")
+          print(f"\nWrote {len(files)} Swift files (Part 2)")
           PYEOF
 
       - name: Write Info.plist
@@ -2893,24 +2516,7 @@ enum GroqService {
       - name: Write reader.js
         run: |
           cat > Resources/reader.js <<'EOF'
-          (function(){
-            if (window['__READER_FLAG__']) return;
-            Object.defineProperty(window, '__READER_FLAG__', { value: true, enumerable: false, writable: false, configurable: false });
-            var PM={wp:'P',wn:'N',wb:'B',wr:'R',wq:'Q',wk:'K',bp:'p',bn:'n',bb:'b',br:'r',bq:'q',bk:'k'};
-            var PN={king:'K',queen:'Q',rook:'R',bishop:'B',knight:'N',pawn:'P'};
-            function fb(){return document.querySelector('wc-chess-board,chess-board,cg-board,.board-layout-chessboard');}
-            function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++) g[i]=['.','.','.','.','.','.','.','.'];var ns=b.querySelectorAll('.piece,piece,[data-piece]');if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||'').toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++) if(PM[parts[i]]) p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute('data-piece');if(dp&&PM[dp]) p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==='white'||lp[i]==='black')co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==='white'?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute('data-square');if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute('style'))||'';var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro>=0&&ro<=7){f=co2+1;r=8-ro;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8) g[8-r][f-1]=p;}return g;}
-            function dbc(grid){if(!grid)return'';var w=0,b=0;for(var r=6;r<=7;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p==='.')continue;if(p===p.toUpperCase())w++;else b++;}if(w>b)return'w';if(b>w)return'b';return'';}
-            function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==='K')wkR=r;if(grid[r][c]==='k')bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0)return{flipped:wkR<4,confident:true};if(bkR>=0)return{flipped:bkR>=4,confident:true};return{flipped:false,confident:false};}
-            function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p==='.')continue;t++;if(p==='K')wk++;if(p==='k')bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}
-            function dp(){var pn=document.querySelectorAll('[data-ply]');if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute('data-ply'),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}
-            var prevGrid=null,lastPayload='',lastSide='w',tickTimer=null;
-            function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=='.'&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=='.'&&ch[i].after==='.')f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?'w':'b';return{uci:fr+to,movedColor:mc};}
-            function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf='low';var p=dp();if(p>=0){side=(p%2===0)?'w':'b';cf='high';}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==='w')?'b':'w';cf='low';}if(!side)side=lastSide;lastSide=side;var fi=dfl(g);var bc=dbc(g);var gs='';for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:fi.flipped,flippedConfident:fi.confident,lastMoveUCI:m?m.uci:'',plyCount:p,detectionConfidence:cf,bottomColor:bc};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers['__BRIDGE_NAME__'].postMessage(py);}catch(e){}}prevGrid=g;}
-            Object.defineProperty(window,'__START_FUNC__',{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});
-            var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}
-            setTimeout(function(){try{window['__START_FUNC__']();}catch(e){}},400);
-          })();
+          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro>=0&&ro<=7){f=co2+1;r=8-ro;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dbc(grid){if(!grid)return"";var w=0,b=0;for(var r=6;r<=7;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;if(p===p.toUpperCase())w++;else b++;}if(w>b)return"w";if(b>w)return"b";return"";}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0)return{flipped:wkR<4,confident:true};if(bkR>=0)return{flipped:bkR>=4,confident:true};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var fi=dfl(g);var bc=dbc(g);var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:fi.flipped,flippedConfident:fi.confident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:bc};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
           EOF
 
       - name: Write adblock_css.css
@@ -2950,19 +2556,19 @@ enum GroqService {
           [ -n "$APP" ] || { echo "Not found"; exit 1; }
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          zip -qr ChessHelper-unsigned.ipa Payload
-          ls -lh ChessHelper-unsigned.ipa
+          zip -qr ChessHelper-v5.2-Phase4.ipa Payload
+          ls -lh ChessHelper-v5.2-Phase4.ipa
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ChessHelper-unsigned-ipa
-          path: ChessHelper-unsigned.ipa
+          name: ChessHelper-v5.2-Phase4
+          path: ChessHelper-v5.2-Phase4.ipa
           retention-days: 90
 
       - name: Attach to Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ChessHelper-unsigned.ipa
+          files: ChessHelper-v5.2-Phase4.ipa
           generate_release_notes: true
