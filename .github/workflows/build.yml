@@ -596,7 +596,11 @@ jobs:
                   .environment(\.layoutDirection, language.isArabic ? .rightToLeft : .leftToRight)
                   .onAppear {
                       engine.recorder = recorder
+                      engine.enabled = stealth.helperEnabled
                       UCIEngine.shared.start()
+                  }
+                  .onChange(of: stealth.helperEnabled) { enabled in
+                      engine.enabled = enabled
                   }
               }
           }
@@ -2191,7 +2195,7 @@ jobs:
                       nav
                       ZStack {
                           HStack(spacing: 0) {
-                              if stealth.overlayVisible && !engine.topMoves.isEmpty {
+                              if stealth.helperEnabled && stealth.overlayVisible && !engine.topMoves.isEmpty {
                                   EvalBar(
                                       winChance: engine.effectivePlayerColor == engine.sideToMove ? engine.winChance : (100 - engine.winChance),
                                       evaluation: engine.evaluation, isMyTurn: engine.isMyTurn
@@ -2199,11 +2203,11 @@ jobs:
                               }
                               ChessWebView(engine: engine, router: router)
                           }
-                          if stealth.overlayVisible { draggableOverlay }
-                          if !stealth.overlayVisible { fixedRevealButton }
-                          if aiPos.isVisible { draggableAIPanel }
-                          if aiVM.isPuzzleDetected { puzzleBanner }
-                          if engine.showBlunderAlert { blunderAlertBanner }
+                          if stealth.helperEnabled && stealth.overlayVisible { draggableOverlay }
+                          if stealth.helperEnabled && !stealth.overlayVisible { fixedRevealButton }
+                          if stealth.helperEnabled && aiPos.isVisible { draggableAIPanel }
+                          if stealth.helperEnabled && aiVM.isPuzzleDetected { puzzleBanner }
+                          if stealth.helperEnabled && engine.showBlunderAlert { blunderAlertBanner }
                       }
                   }
                   .overlay(alignment: .center) {
@@ -2775,6 +2779,14 @@ jobs:
                               }
                           }
                           Section(language.isArabic ? "المساعد" : "Overlay") {
+                              Toggle(isOn: $stealth.helperEnabled) {
+                                  VStack(alignment: .leading, spacing: 2) {
+                                      Text(language.isArabic ? "إزالة المساعد بالكامل" : "Remove helper entirely")
+                                      Text(language.isArabic ? "يخفي كل الأدوات والمحرك والتنبيهات" : "Hides all tools, engine and alerts")
+                                          .font(.caption2).foregroundColor(.secondary)
+                                  }
+                              }
+                              .tint(.red)
                               Toggle(language.isArabic ? "وضع مضغوط" : "Compact", isOn: $overlayPos.isCompact)
                                   .onChange(of: overlayPos.isCompact) { _ in overlayPos.save() }
                               VStack(alignment: .leading) {
@@ -2856,8 +2868,13 @@ jobs:
               @Published var minimalMode = false
               @Published var isBeingRecorded = false
               @Published var lastHideReason = ""
+              @Published var helperEnabled: Bool {
+                  didSet { UserDefaults.standard.set(helperEnabled, forKey: "helper_enabled") }
+              }
               private var cancellables = Set<AnyCancellable>()
               init() {
+                  let saved = UserDefaults.standard.object(forKey: "helper_enabled") as? Bool
+                  self.helperEnabled = saved ?? true
                   NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)
                       .sink { [weak self] _ in
                           guard let self = self else { return }
@@ -2923,7 +2940,11 @@ jobs:
               private var analysisCompletion: (([AnalysisLine]) -> Void)?
               private var readyContinuation: CheckedContinuation<Void, Never>?
 
-              private let engineMain: @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer? = chess_helper_engine_main
+              // The bridge header declares `void* chess_helper_engine_main(void*)`,
+              // which Swift imports as a non-optional parameter. pthread_create
+              // expects an optional-parameter C function pointer; the ABIs are
+              // identical so we cast between the two signatures.
+              private let engineMain: @convention(c) (UnsafeMutableRawPointer) -> UnsafeMutableRawPointer? = chess_helper_engine_main
 
               var isAvailable: Bool {
                   switch state { case .ready: return true; default: return false }
@@ -2940,7 +2961,9 @@ jobs:
                   toEngine = fds1; fromEngine = fds2
                   dup2(toEngine[0], 0)
                   dup2(fromEngine[1], 1)
-                  let res = pthread_create(&thread, nil, engineMain, nil)
+                  typealias PthreadEntry = @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer?
+                  let entry = unsafeBitCast(engineMain, to: PthreadEntry.self)
+                  let res = pthread_create(&thread, nil, entry, nil)
                   guard res == 0 else { state = .failed("thread"); return }
                   started = true
                   DispatchQueue.global(qos: .userInitiated).async { self.readLoop() }
