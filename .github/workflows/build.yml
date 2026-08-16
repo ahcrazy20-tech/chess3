@@ -545,6 +545,88 @@ jobs:
           }
           '''
 
+          files["Sources/EngineDownloadManager.swift"] = r'''
+          import Foundation
+          import SwiftUI
+
+          /// Downloads the Stockfish WASM/JS engine into the app's Documents so it can
+          /// run 100% offline. Shows progress + status. Mirrors the file to the
+          /// Documents dir; LocalEngine checks for it and loads locally when present,
+          /// otherwise falls back to the CDN.
+          @MainActor
+          final class EngineDownloadManager: ObservableObject {
+              static let shared = EngineDownloadManager()
+
+              // Public download mirrors for the engine.
+              static let engineURLs: [(name: String, url: String)] = [
+                  ("stockfish.js (single-file, CDN)",
+                   "https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js"),
+                  ("stockfish.wasm + .js (emscripten full)",
+                   "https://cdn.jsdelivr.net/npm/stockfish.js@10.0.2/stockfish.js")
+              ]
+
+              @Published var progress: Double = 0            // 0...1
+              @Published var status: String = ""
+              @Published var isDownloading = false
+              @Published var localFileExists = false
+
+              private var fileURL: URL {
+                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+                  return docs.appendingPathComponent("stockfish.js")
+              }
+
+              private init() {
+                  localFileExists = FileManager.default.fileExists(atPath: fileURL.path)
+              }
+
+              var fileSizeKB: Int {
+                  guard let a = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
+                        let sz = a[.size] as? NSNumber else { return 0 }
+                  return sz.intValue / 1024
+              }
+
+              func download() {
+                  guard !isDownloading else { return }
+                  guard let url = URL(string: EngineDownloadManager.engineURLs[0].url) else {
+                      status = "Bad URL"; return
+                  }
+                  isDownloading = true
+                  progress = 0
+                  status = "جاري التحميل..."
+                  Task {
+                      var received = 0
+                      var expected: Int64 = 0
+                      var buffer = Data()
+                      do {
+                          let (bytes, resp) = try await URLSession.shared.bytes(for: URLRequest(url: url))
+                          expected = resp.expectedContentLength
+                          for try await chunk in bytes {
+                              buffer.append(chunk)
+                              received = buffer.count
+                              if expected > 0 {
+                                  self.progress = min(1.0, Double(received) / Double(expected))
+                                  self.status = String(format: "%.0f%%  (%d KB)", self.progress * 100, received / 1024)
+                              }
+                          }
+                          try buffer.write(to: self.fileURL, options: .atomic)
+                          self.localFileExists = true
+                          self.progress = 1
+                          self.status = "تم التحميل (\(received / 1024) KB) ✓"
+                      } catch {
+                          self.status = "فشل: \(error.localizedDescription)"
+                      }
+                      self.isDownloading = false
+                  }
+              }
+
+              func deleteLocal() {
+                  try? FileManager.default.removeItem(at: fileURL)
+                  localFileExists = false
+                  status = ""
+              }
+          }
+          '''
+
           files["Sources/EngineService.swift"] = r'''
           import Foundation
           struct TopMove: Identifiable, Equatable {
@@ -558,9 +640,9 @@ jobs:
                   return "—"
               }
               var winChance: Double {
-                  if let m = mateIn, m != 0 { return m > 0 ? 99 : 1 }
+                  if let m = mateIn, m != 0 { return m > 0 ? 99.9 : 0.1 }
                   guard let cp = evaluationCp else { return 50 }
-                  return 50 + 50 * tanh(Double(cp)/400.0)
+                  return WinModel.winPercent(cp: cp)
               }
               var rankScore: Double {
                   if let m = mateIn, m != 0 { return m > 0 ? 100000 - Double(m) : -100000 - Double(m) }
@@ -789,6 +871,29 @@ jobs:
               var bestMove: TopMove? { topMoves.first }
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
               var isMyTurn: Bool { effectivePlayerColor == sideToMove }
+
+              // ---- Win indicator from the PLAYER's perspective ----
+              // evalString/winChance on bestMove are from the side-to-move POV, so we
+              // flip them when it isn't the player's turn.
+              var playerWinPercent: Double {
+                  guard let best = bestMove else { return 50 }
+                  if sideToMove == effectivePlayerColor { return best.winChance }
+                  return 100 - best.winChance
+              }
+              var playerEvalString: String {
+                  guard let best = bestMove else { return "—" }
+                  if sideToMove == effectivePlayerColor { return best.evalString }
+                  // Flip the sign so it's always "from my point of view".
+                  if let m = best.mateIn, m != 0 { return "M\(abs(m))" }
+                  if let cp = best.evaluationCp { return String(format: "%+.2f", Double(-cp)/100.0) }
+                  return best.evalString
+              }
+              var playerWinColor: Color {
+                  let p = playerWinPercent
+                  if p >= 60 { return .green }
+                  if p >= 40 { return .gray }
+                  return .red
+              }
               private let fenBuilder = FenBuilder()
               private var previousEvalWhitePOV: Double? = nil
               private var previousFEN: String = ""
@@ -1574,10 +1679,23 @@ jobs:
                                   .font(.system(size: overlayPos.isCompact ? 22 : 28, weight: .black, design: .rounded))
                                   .foregroundColor(cc).minimumScaleFactor(0.7).lineLimit(1)
                               Text(best.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
+                              // Win indicator (player perspective)
+                              HStack(spacing: 4) {
+                                  Text(language.isArabic ? "فوزك" : "Win").font(.caption2.bold()).foregroundColor(engine.playerWinColor)
+                                  Text(String(format: "%.0f%%", engine.playerWinPercent))
+                                      .font(.caption2.bold().monospaced()).foregroundColor(engine.playerWinColor)
+                              }
+                              GeometryReader { geo in
+                                  ZStack(alignment: .leading) {
+                                      RoundedRectangle(cornerRadius: 2).fill(Color.gray.opacity(0.3))
+                                      RoundedRectangle(cornerRadius: 2).fill(engine.playerWinColor)
+                                          .frame(width: geo.size.width * CGFloat(engine.playerWinPercent / 100))
+                                  }
+                              }.frame(width: 90, height: 5)
                           }
                           Spacer()
                           VStack(alignment: .trailing, spacing: 1) {
-                              Text(best.evalString).font(.callout.bold().monospaced()).foregroundColor(cc)
+                              Text(engine.playerEvalString).font(.callout.bold().monospaced()).foregroundColor(engine.playerWinColor)
                               Text("d\(best.depth)").font(.caption2.monospaced()).foregroundColor(.secondary)
                               Button {
                                   VoiceManager.shared.speakMove(uci: best.uci, san: best.san, isArabic: language.isArabic)
@@ -1768,7 +1886,16 @@ jobs:
                   // (a detached webview gets throttled and the engine never responds).
                   attachToWindow(wv)
 
-                  let html = createEngineHTML()
+                  // Prefer a locally-downloaded engine for 100% offline; else CDN.
+                  var localEngineJS: String? = nil
+                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                  if let docs = docs {
+                      let f = docs.appendingPathComponent("stockfish.js")
+                      if FileManager.default.fileExists(atPath: f.path) {
+                          localEngineJS = try? String(contentsOf: f, encoding: .utf8)
+                      }
+                  }
+                  let html = createEngineHTML(localJS: localEngineJS)
                   wv.loadHTMLString(html, baseURL: nil)
                   webView = wv
 
@@ -1802,9 +1929,21 @@ jobs:
                   isAnalyzing = false
               }
 
-              private func createEngineHTML() -> String {
-                  // Load stockfish.js from a CDN. After the first successful load the
-                  // browser caches it, so subsequent launches work offline.
+              private func createEngineHTML(localJS: String?) -> String {
+                  // If a local engine file exists (downloaded via Settings), inline it as
+                  // a Blob worker for full offline support; otherwise load from CDN.
+                  let engineSource: String
+                  if let localJS = localJS, !localJS.isEmpty {
+                      // Embed the raw JS safely (JSON-escape) then build a Blob worker.
+                      let esc = localJS
+                          .replacingOccurrences(of: "\\", with: "\\\\")
+                          .replacingOccurrences(of: "\"", with: "\\\"")
+                          .replacingOccurrences(of: "\n", with: "\\n")
+                          .replacingOccurrences(of: "\r", with: "")
+                      engineSource = "var src=\"\(esc)\";var blob=new Blob([src],{type:'text/javascript'});var u=URL.createObjectURL(blob);new Worker(u);"
+                  } else {
+                      engineSource = "new Worker('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js');"
+                  }
                   return """
                   <!DOCTYPE html>
                   <html><head>
@@ -1813,7 +1952,7 @@ jobs:
                   var engine = null, analyzing = false, lastInfo = {};
                   function initEngine(){
                     try {
-                      engine = new Worker('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js');
+                      engine = \(engineSource);
                       engine.onmessage = function(e){ processEngineLine(e.data); };
                       engine.postMessage('uci');
                       engine.postMessage('setoption name Threads value 1');
@@ -2629,6 +2768,7 @@ jobs:
               @State private var apiKeyInput = ""
               @State private var apiKeySaved = false
               @State private var showKeyInput = false
+              @StateObject private var engineDL = EngineDownloadManager.shared
               var body: some View {
                   NavigationStack {
                       Form {
@@ -2686,6 +2826,44 @@ jobs:
                               }
                               Button(language.isArabic ? "إعادة الموضع" : "Reset position") { overlayPos.reset() }
                               Toggle(language.isArabic ? "نقطة صغيرة" : "Tiny dot", isOn: $stealth.minimalMode)
+                          }
+                          Section(header: HStack {
+                              Image(systemName: "brain.head.profile").foregroundColor(.green)
+                              Text(language.isArabic ? "المحرك المحلي (Stockfish)" : "Local Engine (Stockfish)")
+                          }) {
+                              if engineDL.localFileExists {
+                                  Label(language.isArabic ? "الملف محفوظ ✓" : "File saved ✓", systemImage: "checkmark.seal.fill")
+                                      .foregroundColor(.green)
+                                  Text(String(format: language.isArabic ? "الحجم: %d KB" : "Size: %d KB", engineDL.fileSizeKB))
+                                      .font(.caption).foregroundColor(.secondary)
+                                  Button(language.isArabic ? "حذف الملف" : "Delete file", role: .destructive) {
+                                      engineDL.deleteLocal()
+                                  }
+                              } else {
+                                  Text(language.isArabic
+                                       ? "حمّل المحرك للعمل بدون إنترنت 100% (عمق أعلى)."
+                                       : "Download the engine to work 100% offline (deeper analysis).")
+                                      .font(.caption).foregroundColor(.secondary)
+                              }
+                              if !engineDL.isDownloading {
+                                  Button { engineDL.download() } label: {
+                                      Label(language.isArabic ? "بدء التحميل" : "Start download", systemImage: "arrow.down.circle.fill")
+                                  }
+                              } else {
+                                  VStack(alignment: .leading, spacing: 6) {
+                                      ProgressView(value: engineDL.progress).progressViewStyle(.linear)
+                                      Text(engineDL.status).font(.caption2).foregroundColor(.secondary)
+                                  }
+                              }
+                              if !engineDL.status.isEmpty && !engineDL.isDownloading {
+                                  Text(engineDL.status).font(.caption2).foregroundColor(.secondary)
+                              }
+                              Text(language.isArabic ? "روابط التحميل:" : "Download mirrors:").font(.caption.bold()).padding(.top, 4)
+                              ForEach(Array(EngineDownloadManager.engineURLs.enumerated()), id: \.offset) { idx, m in
+                                  Link(destination: URL(string: m.url)!) {
+                                      Label(m.name, systemImage: "arrow.up.right.square")
+                                  }.font(.caption)
+                              }
                           }
                           Section("Debug") {
                               Text(engine.currentFEN.isEmpty ? "(none)" : engine.currentFEN).font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(3)
@@ -2860,6 +3038,49 @@ jobs:
                   default: fileAr = String(file)
                   }
                   return "\(fileAr)\(rank)"
+              }
+          }
+          '''
+
+          files["Sources/WinModel.swift"] = r'''
+          import Foundation
+
+          /// Calibrated win-probability model: converts a centipawn evaluation
+          /// (side-to-move POV) into a win percentage for that side.
+          /// Uses piecewise-linear interpolation over well-known anchor points instead
+          /// of the naive tanh, so readings stay accurate at high/low evals.
+          enum WinModel {
+              // (cp, whiteWin%) anchor points (from player-of-side-to-move perspective)
+              private static let anchors: [(cp: Double, pct: Double)] = [
+                  (-2000, 0.5), (-1500, 1.0), (-1000, 2.0), (-700, 4.0), (-500, 8.0),
+                  (-300, 16.0), (-200, 24.0), (-100, 36.0), (-50, 47.0), (0, 50.0),
+                  (50, 53.0), (100, 64.0), (200, 76.0), (300, 84.0), (500, 92.0),
+                  (700, 96.0), (1000, 98.0), (1500, 99.0), (2000, 99.5)
+              ]
+
+              /// Returns win% (0...100) for the side to move, given a centipawn eval.
+              static func winPercent(cp: Int) -> Double {
+                  if let m = mateScore(cp: cp) { return m }
+                  let x = Double(cp)
+                  let list = anchors
+                  // clamp
+                  if x <= list.first!.cp { return list.first!.pct }
+                  if x >= list.last!.cp { return list.last!.pct }
+                  for i in 0..<(list.count - 1) {
+                      let a = list[i], b = list[i + 1]
+                      if x >= a.cp && x <= b.cp {
+                          let t = (x - a.cp) / (b.cp - a.cp)
+                          return a.pct + t * (b.pct - a.pct)
+                      }
+                  }
+                  return 50
+              }
+
+              private static func mateScore(cp: Int) -> Double? {
+                  // We encode mate separately in TopMove; here handle large sentinel.
+                  if cp >= 30000 { return 99.9 }
+                  if cp <= -30000 { return 0.1 }
+                  return nil
               }
           }
           '''
