@@ -1276,7 +1276,6 @@ jobs:
                         let grid = MoveValidator.parseFen(fen) else { return uci }
                   let parts = fen.split(separator: " ").map(String.init)
                   guard parts.count >= 2 else { return uci }
-                  let side = parts[1]
                   guard let from = MoveValidator.squareToCoord(String(uci.prefix(2))),
                         let to = MoveValidator.squareToCoord(String(uci.dropFirst(2).prefix(2))) else { return uci }
                   let piece = grid[from.row][from.col]
@@ -1348,7 +1347,7 @@ jobs:
               }
 
               private static func checkSuffix(grid: [[Character]], from: (row: Int, col: Int), to: (row: Int, col: Int), piece: Character, promoteChar: String, isWhite: Bool) -> String {
-                  guard var ng = applyMove(grid: grid, from: from, to: to, piece: piece, promoteChar: promoteChar) else { return "" }
+                  guard let ng = applyMove(grid: grid, from: from, to: to, piece: piece, promoteChar: promoteChar) else { return "" }
                   let enemyKing: Character = isWhite ? "k" : "K"
                   guard let kp = findPiece(ng, enemyKing) else { return "" }
                   if !isAttacked(grid: ng, r: kp.row, c: kp.col, byWhite: !isWhite) { return "" }
@@ -1376,7 +1375,7 @@ jobs:
               }
 
               private static func isAttacked(grid: [[Character]], r: Int, c: Int, byWhite: Bool) -> Bool {
-                  let target = byWhite ? "K" : "k"
+                  let target: Character = byWhite ? "K" : "k"
                   for rr in 0..<8 { for cc in 0..<8 {
                       let p = grid[rr][cc]
                       if p == "." { continue }
@@ -1901,7 +1900,7 @@ jobs:
                   plyCount = p.plyCount
                   
                   // Color detection using improved orientation logic
-                  updateDetectedColor(bottomColor: p.bottomColor, flipped: p.flipped, flippedConfident: p.flippedConfident)
+                    updateDetectedColor(p.bottomColor, flipped: p.flipped, flippedConfident: p.flippedConfident)
                   
                   // Track move history
                   if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
