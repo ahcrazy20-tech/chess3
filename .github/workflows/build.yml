@@ -512,8 +512,12 @@ jobs:
               @Published var gameId: UUID = UUID()
               @Published var currentAccuracy: Double = 100.0
               @Published var myMoveCount = 0
-              @Published var brilliantCount = 0, bestCount = 0, goodCount = 0
-              @Published var inaccuracyCount = 0, mistakeCount = 0, blunderCount = 0
+              @Published var brilliantCount = 0
+              @Published var bestCount = 0
+              @Published var goodCount = 0
+              @Published var inaccuracyCount = 0
+              @Published var mistakeCount = 0
+              @Published var blunderCount = 0
               
               func recordMove(previousFen: String, previousEval: Int?, currentFen: String, currentEval: Int?, lastMoveUCI: String, wasMyMove: Bool, bestMoveUCI: String?, plyCount: Int) {
                   guard !lastMoveUCI.isEmpty else { return }
@@ -1180,48 +1184,47 @@ jobs:
           }
 
           extension LocalEngine: WKScriptMessageHandler {
-              nonisolated func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+              func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
                   guard let dict = message.body as? [String: Any] else { return }
                   let type = dict["type"] as? String ?? ""
                   
-                  Task { @MainActor in
-                      switch type {
-                      case "ready":
-                          self.isReady = true
-                          
-                      case "info":
-                          self.currentDepth = dict["depth"] as? Int ?? 0
-                          
-                      case "bestmove":
-                          let bestMove = dict["bestMove"] as? String ?? ""
-                          let ponder = dict["ponder"] as? String
-                          let depth = dict["depth"] as? Int ?? 0
-                          let eval = dict["eval"] as? Int ?? 0
-                          let mate = dict["mate"] as? Int
-                          let pv = dict["pv"] as? [String] ?? []
-                          let nodes = dict["nodes"] as? Int ?? 0
-                          let time = dict["time"] as? Int ?? 0
-                          
-                          let result = LocalEngineResult(
-                              bestMove: bestMove, ponder: ponder, evaluation: eval,
-                              mateIn: mate, depth: depth, pv: pv, nodes: nodes, time: time
-                          )
-                          
-                          self.lastResult = result
-                          self.isAnalyzing = false
-                          
-                          self.analysisCallback?(result)
-                          self.bestMoveCallback?(bestMove)
-                          
-                          self.analysisCallback = nil
-                          self.bestMoveCallback = nil
-                          
-                      case "error":
-                          print("Engine error: \(dict["message"] ?? "unknown")")
-                          
-                      default:
-                          break
-                      }
+                  switch type {
+                  case "ready":
+                      self.isReady = true
+                      
+                  case "info":
+                      self.currentDepth = dict["depth"] as? Int ?? 0
+                      
+                  case "bestmove":
+                      let bestMove = dict["bestMove"] as? String ?? ""
+                      let ponder = dict["ponder"] as? String
+                      let depth = dict["depth"] as? Int ?? 0
+                      let evalVal = dict["eval"] as? Int ?? 0
+                      let mate = dict["mate"] as? Int
+                      let pv = dict["pv"] as? [String] ?? []
+                      let nodes = dict["nodes"] as? Int ?? 0
+                      let time = dict["time"] as? Int ?? 0
+                      
+                      let result = LocalEngineResult(
+                          bestMove: bestMove, ponder: ponder, evaluation: evalVal,
+                          mateIn: mate, depth: depth, pv: pv, nodes: nodes, time: time
+                      )
+                      
+                      self.lastResult = result
+                      self.isAnalyzing = false
+                      
+                      self.analysisCallback?(result)
+                      self.bestMoveCallback?(bestMove)
+                      
+                      self.analysisCallback = nil
+                      self.bestMoveCallback = nil
+                      
+                  case "error":
+                      let msg = dict["message"] as? String ?? "unknown"
+                      print("Engine error: \(msg)")
+                      
+                  default:
+                      break
                   }
               }
           }
