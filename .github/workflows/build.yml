@@ -527,6 +527,7 @@ jobs:
                   .environment(\.layoutDirection, language.isArabic ? .rightToLeft : .leftToRight)
                   .onAppear {
                       engine.recorder = recorder
+                      LocalEngine.shared.initialize()
                   }
               }
           }
@@ -653,6 +654,24 @@ jobs:
                       return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "sf", votes: 1)
                   } catch { return nil }
               }
+              // On-device Stockfish via hidden WKWebView (source "🧠"). Much deeper than
+              // cloud APIs, no API key, no rate limits, works offline after first load.
+              static func callLocalEngine(fen: String, deep: Bool = false) async -> TopMove? {
+                  await withCheckedContinuation { cont in
+                      Task { @MainActor in
+                          guard LocalEngine.shared.isReady else { cont.resume(returning: nil); return }
+                          LocalEngine.shared.analyze(fen: fen, depth: deep ? 22 : 16, multiPV: 1) { r in
+                              let best = r.bestMove
+                              guard !best.isEmpty, MoveValidator.isPlausibleMove(uci: best, fen: fen) else {
+                                  cont.resume(returning: nil); return
+                              }
+                              cont.resume(returning: TopMove(rank: 1, uci: best, san: best,
+                                                             evaluationCp: r.evaluation, mateIn: r.mateIn,
+                                                             depth: r.depth, source: "🧠", votes: 1))
+                          }
+                      }
+                  }
+              }
               static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
                                             onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
                   if let issue = FenValidator.validate(fen) { throw EngineError.badFen(issue) }
@@ -680,7 +699,9 @@ jobs:
                   async let lr = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
                   async let cr = callChessApi(fen: fen, deep: deep)
                   async let sr = callStockfishOnline(fen: fen, deep: deep)
+                  async let lc = callLocalEngine(fen: fen, deep: deep)
                   let lichess = await lr; try Task.checkCancellation()
+                  let local = await lc; try Task.checkCancellation()
                   let cA = await cr; try Task.checkCancellation()
                   let sf = await sr; try Task.checkCancellation()
                   var mv: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
@@ -696,8 +717,12 @@ jobs:
                       if var e = mv[m.uci] { e.votes += 1; e.sources.append("sf"); mv[m.uci] = e }
                       else { mv[m.uci] = (m, 1, ["sf"]) }
                   }
+                  if let m = local {
+                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("🧠"); mv[m.uci] = e }
+                      else { mv[m.uci] = (m, 1, ["🧠"]) }
+                  }
                   guard !mv.isEmpty else {
-                      if lichess == nil && cA == nil && sf == nil { throw EngineError.networkOffline }
+                      if lichess == nil && cA == nil && sf == nil && local == nil { throw EngineError.networkOffline }
                       throw EngineError.allEnginesFailed
                   }
                   let sorted = mv.values.sorted { a, b in
@@ -1695,6 +1720,182 @@ jobs:
           }
           '''
 
+          files["Sources/LocalEngine.swift"] = r'''
+          import Foundation
+          import WebKit
+          import UIKit
+
+          /// Local Stockfish engine running inside a hidden WKWebView.
+          /// Loads stockfish.js from CDN on first use, then stays warm & cached, giving
+          /// much deeper/faster analysis than the cloud APIs — and works offline after
+          /// the first load. Runs entirely on-device (no API key, no rate limits).
+          struct LocalEngineResult {
+              let bestMove: String
+              let ponder: String?
+              let evaluation: Int      // centipawns (side to move POV)
+              let mateIn: Int?
+              let depth: Int
+              let pv: [String]
+          }
+
+          @MainActor
+          final class LocalEngine: NSObject, ObservableObject {
+              static let shared = LocalEngine()
+
+              @Published var isReady = false
+              @Published var isAnalyzing = false
+              @Published var currentDepth = 0
+              @Published var lastResult: LocalEngineResult?
+
+              private var webView: WKWebView?
+              private var analysisCallback: ((LocalEngineResult) -> Void)?
+              private var bestMoveCallback: ((String) -> Void)?
+
+              override private init() { super.init() }
+
+              func initialize() {
+                  guard webView == nil else { return }
+                  let config = WKWebViewConfiguration()
+                  let cc = WKUserContentController()
+                  cc.add(self, name: StealthConfig.engineBridge)
+                  config.userContentController = cc
+                  config.websiteDataStore = .default()
+                  config.defaultWebpagePreferences.allowsContentJavaScript = true
+
+                  let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 200), configuration: config)
+                  wv.isHidden = true
+                  // Attach to the app window so its JS timers/Worker keep running
+                  // (a detached webview gets throttled and the engine never responds).
+                  attachToWindow(wv)
+
+                  let html = createEngineHTML()
+                  wv.loadHTMLString(html, baseURL: nil)
+                  webView = wv
+
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                      self?.isReady = true
+                  }
+              }
+
+              private func attachToWindow(_ wv: WKWebView) {
+                  guard let scene = UIApplication.shared.connectedScenes
+                          .compactMap({ $0 as? UIWindowScene })
+                          .first(where: { $0.activationState == .foregroundActive }),
+                        let window = scene.windows.first else { return }
+                  window.addSubview(wv)
+                  wv.frame = CGRect(x: -400, y: -400, width: 320, height: 200)
+                  wv.layer.zPosition = -999
+              }
+
+              func analyze(fen: String, depth: Int = 20, multiPV: Int = 3, onResult: @escaping (LocalEngineResult) -> Void) {
+                  guard isReady, let wv = webView else { return }
+                  isAnalyzing = true
+                  currentDepth = 0
+                  analysisCallback = onResult
+                  let js = "analyzePosition('\(fen)', \(depth), \(multiPV));"
+                  wv.evaluateJavaScript(js, completionHandler: nil)
+              }
+
+              func stop() {
+                  guard let wv = webView else { return }
+                  wv.evaluateJavaScript("stopAnalysis();", completionHandler: nil)
+                  isAnalyzing = false
+              }
+
+              private func createEngineHTML() -> String {
+                  // Load stockfish.js from a CDN. After the first successful load the
+                  // browser caches it, so subsequent launches work offline.
+                  return """
+                  <!DOCTYPE html>
+                  <html><head>
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
+                  <script>
+                  var engine = null, analyzing = false, lastInfo = {};
+                  function initEngine(){
+                    try {
+                      engine = new Worker('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js');
+                      engine.onmessage = function(e){ processEngineLine(e.data); };
+                      engine.postMessage('uci');
+                      engine.postMessage('setoption name Threads value 1');
+                      engine.postMessage('setoption name Hash value 64');
+                      engine.postMessage('setoption name MultiPV value 3');
+                      engine.postMessage('isready');
+                      setTimeout(function(){ sendToSwift({type:'ready'}); }, 1500);
+                    } catch(e){ sendToSwift({type:'error', message:e.toString()}); }
+                  }
+                  function processEngineLine(line){
+                    if(typeof line !== 'string'){ try{ line = line.data || ''; }catch(e){} }
+                    if(typeof line !== 'string') return;
+                    if(line.indexOf('bestmove') === 0){
+                      var parts = line.split(' ');
+                      sendToSwift({ type:'bestmove', bestMove: parts[1]||'', ponder: parts[3]||null,
+                        depth: lastInfo.depth||0, eval: lastInfo.cp||0, mate: lastInfo.mate||null, pv: lastInfo.pv||[] });
+                      analyzing = false;
+                    } else if(line.indexOf('info depth') !== -1){
+                      lastInfo = parseInfo(line);
+                      sendToSwift({ type:'info', depth: lastInfo.depth, eval: lastInfo.cp, mate: lastInfo.mate, pv: lastInfo.pv });
+                    }
+                  }
+                  function parseInfo(line){
+                    var info = {};
+                    var m;
+                    if((m=line.match(/depth (\\d+)/))) info.depth=parseInt(m[1]);
+                    if((m=line.match(/score cp (-?\\d+)/))) info.cp=parseInt(m[1]);
+                    if((m=line.match(/score mate (-?\\d+)/))) info.mate=parseInt(m[1]);
+                    if((m=line.match(/pv (.+)/))) info.pv=m[1].split(' ');
+                    return info;
+                  }
+                  function analyzePosition(fen, depth, multiPV){
+                    if(!engine) return;
+                    analyzing = true; lastInfo = {};
+                    engine.postMessage('stop');
+                    engine.postMessage('setoption name MultiPV value ' + multiPV);
+                    engine.postMessage('position fen ' + fen);
+                    engine.postMessage('go depth ' + depth);
+                  }
+                  function stopAnalysis(){ if(engine) engine.postMessage('stop'); analyzing=false; }
+                  function sendToSwift(obj){ try { window.webkit.messageHandlers.\(StealthConfig.engineBridge).postMessage(obj); } catch(e){} }
+                  window.onload = initEngine;
+                  </script>
+                  </head><body></body></html>
+                  """
+              }
+          }
+
+          extension LocalEngine: WKScriptMessageHandler {
+              func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+                  guard let dict = message.body as? [String: Any] else { return }
+                  let type = dict["type"] as? String ?? ""
+                  switch type {
+                  case "ready":
+                      self.isReady = true
+                  case "info":
+                      self.currentDepth = dict["depth"] as? Int ?? 0
+                  case "bestmove":
+                      let bestMove = dict["bestMove"] as? String ?? ""
+                      let ponder = dict["ponder"] as? String
+                      let depth = dict["depth"] as? Int ?? 0
+                      let evalVal = dict["eval"] as? Int ?? 0
+                      let mate = dict["mate"] as? Int
+                      let pv = dict["pv"] as? [String] ?? []
+                      let result = LocalEngineResult(bestMove: bestMove, ponder: ponder,
+                                                     evaluation: evalVal, mateIn: mate,
+                                                     depth: depth, pv: pv)
+                      self.lastResult = result
+                      self.isAnalyzing = false
+                      self.analysisCallback?(result)
+                      self.bestMoveCallback?(bestMove)
+                      self.analysisCallback = nil
+                      self.bestMoveCallback = nil
+                  case "error":
+                      print("LocalEngine error: \(dict["message"] ?? "unknown")")
+                  default:
+                      break
+                  }
+              }
+          }
+          '''
+
           files["Sources/MoveValidator.swift"] = r'''
           import Foundation
           enum MoveValidator {
@@ -2520,6 +2721,7 @@ jobs:
               static let bridgeName: String = randomName(prefix: "_", length: 6)
               static let readerFlag: String = randomName(prefix: "_", length: 8)
               static let startFuncName: String = randomName(prefix: "_", length: 8)
+              static let engineBridge: String = randomName(prefix: "_e_", length: 5)
               private static let userAgents = [
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
