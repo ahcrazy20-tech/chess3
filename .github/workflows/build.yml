@@ -477,8 +477,7 @@ jobs:
                           grid: (d["grid"] as? String) ?? "", sideToMove: (d["sideToMove"] as? String) ?? "w",
                           flipped: (d["flipped"] as? Bool) ?? false, flippedConfident: (d["flippedConfident"] as? Bool) ?? false,
                           lastMoveUCI: (d["lastMoveUCI"] as? String) ?? "", plyCount: (d["plyCount"] as? Int) ?? -1,
-                          detectionConfidence: (d["detectionConfidence"] as? String) ?? "unknown",
-                          bottomColor: (d["bottomColor"] as? String) ?? ""
+                          detectionConfidence: (d["detectionConfidence"] as? String) ?? "unknown"
                       )
                       Task { @MainActor [weak engine] in engine?.ingest(p) }
                   }
@@ -527,7 +526,6 @@ jobs:
                   .environment(\.layoutDirection, language.isArabic ? .rightToLeft : .leftToRight)
                   .onAppear {
                       engine.recorder = recorder
-                      LocalEngine.shared.initialize()
                   }
               }
           }
@@ -545,88 +543,6 @@ jobs:
           }
           '''
 
-          files["Sources/EngineDownloadManager.swift"] = r'''
-          import Foundation
-          import SwiftUI
-
-          /// Downloads the Stockfish WASM/JS engine into the app's Documents so it can
-          /// run 100% offline. Shows progress + status. Mirrors the file to the
-          /// Documents dir; LocalEngine checks for it and loads locally when present,
-          /// otherwise falls back to the CDN.
-          @MainActor
-          final class EngineDownloadManager: ObservableObject {
-              static let shared = EngineDownloadManager()
-
-              // Public download mirrors for the engine.
-              static let engineURLs: [(name: String, url: String)] = [
-                  ("stockfish.js (single-file, CDN)",
-                   "https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js"),
-                  ("stockfish.wasm + .js (emscripten full)",
-                   "https://cdn.jsdelivr.net/npm/stockfish.js@10.0.2/stockfish.js")
-              ]
-
-              @Published var progress: Double = 0            // 0...1
-              @Published var status: String = ""
-              @Published var isDownloading = false
-              @Published var localFileExists = false
-
-              private var fileURL: URL {
-                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-                  return docs.appendingPathComponent("stockfish.js")
-              }
-
-              private init() {
-                  localFileExists = FileManager.default.fileExists(atPath: fileURL.path)
-              }
-
-              var fileSizeKB: Int {
-                  guard let a = try? FileManager.default.attributesOfItem(atPath: fileURL.path),
-                        let sz = a[.size] as? NSNumber else { return 0 }
-                  return sz.intValue / 1024
-              }
-
-              func download() {
-                  guard !isDownloading else { return }
-                  guard let url = URL(string: EngineDownloadManager.engineURLs[0].url) else {
-                      status = "Bad URL"; return
-                  }
-                  isDownloading = true
-                  progress = 0
-                  status = "جاري التحميل..."
-                  Task {
-                      var received = 0
-                      var expected: Int64 = 0
-                      var buffer = Data()
-                      do {
-                          let (bytes, resp) = try await URLSession.shared.bytes(for: URLRequest(url: url))
-                          expected = resp.expectedContentLength
-                          for try await chunk in bytes {
-                              buffer.append(chunk)
-                              received = buffer.count
-                              if expected > 0 {
-                                  self.progress = min(1.0, Double(received) / Double(expected))
-                                  self.status = String(format: "%.0f%%  (%d KB)", self.progress * 100, received / 1024)
-                              }
-                          }
-                          try buffer.write(to: self.fileURL, options: .atomic)
-                          self.localFileExists = true
-                          self.progress = 1
-                          self.status = "تم التحميل (\(received / 1024) KB) ✓"
-                      } catch {
-                          self.status = "فشل: \(error.localizedDescription)"
-                      }
-                      self.isDownloading = false
-                  }
-              }
-
-              func deleteLocal() {
-                  try? FileManager.default.removeItem(at: fileURL)
-                  localFileExists = false
-                  status = ""
-              }
-          }
-          '''
-
           files["Sources/EngineService.swift"] = r'''
           import Foundation
           struct TopMove: Identifiable, Equatable {
@@ -640,9 +556,9 @@ jobs:
                   return "—"
               }
               var winChance: Double {
-                  if let m = mateIn, m != 0 { return m > 0 ? 99.9 : 0.1 }
+                  if let m = mateIn, m != 0 { return m > 0 ? 99 : 1 }
                   guard let cp = evaluationCp else { return 50 }
-                  return WinModel.winPercent(cp: cp)
+                  return 50 + 50 * tanh(Double(cp)/400.0)
               }
               var rankScore: Double {
                   if let m = mateIn, m != 0 { return m > 0 ? 100000 - Double(m) : -100000 - Double(m) }
@@ -736,24 +652,6 @@ jobs:
                       return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "sf", votes: 1)
                   } catch { return nil }
               }
-              // On-device Stockfish via hidden WKWebView (source "🧠"). Much deeper than
-              // cloud APIs, no API key, no rate limits, works offline after first load.
-              static func callLocalEngine(fen: String, deep: Bool = false) async -> TopMove? {
-                  await withCheckedContinuation { cont in
-                      Task { @MainActor in
-                          guard LocalEngine.shared.isReady else { cont.resume(returning: nil); return }
-                          LocalEngine.shared.analyze(fen: fen, depth: deep ? 22 : 16, multiPV: 1) { r in
-                              let best = r.bestMove
-                              guard !best.isEmpty, MoveValidator.isPlausibleMove(uci: best, fen: fen) else {
-                                  cont.resume(returning: nil); return
-                              }
-                              cont.resume(returning: TopMove(rank: 1, uci: best, san: best,
-                                                             evaluationCp: r.evaluation, mateIn: r.mateIn,
-                                                             depth: r.depth, source: "🧠", votes: 1))
-                          }
-                      }
-                  }
-              }
               static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
                                             onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
                   if let issue = FenValidator.validate(fen) { throw EngineError.badFen(issue) }
@@ -781,9 +679,7 @@ jobs:
                   async let lr = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
                   async let cr = callChessApi(fen: fen, deep: deep)
                   async let sr = callStockfishOnline(fen: fen, deep: deep)
-                  async let lc = callLocalEngine(fen: fen, deep: deep)
                   let lichess = await lr; try Task.checkCancellation()
-                  let local = await lc; try Task.checkCancellation()
                   let cA = await cr; try Task.checkCancellation()
                   let sf = await sr; try Task.checkCancellation()
                   var mv: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
@@ -799,12 +695,8 @@ jobs:
                       if var e = mv[m.uci] { e.votes += 1; e.sources.append("sf"); mv[m.uci] = e }
                       else { mv[m.uci] = (m, 1, ["sf"]) }
                   }
-                  if let m = local {
-                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("🧠"); mv[m.uci] = e }
-                      else { mv[m.uci] = (m, 1, ["🧠"]) }
-                  }
                   guard !mv.isEmpty else {
-                      if lichess == nil && cA == nil && sf == nil && local == nil { throw EngineError.networkOffline }
+                      if lichess == nil && cA == nil && sf == nil { throw EngineError.networkOffline }
                       throw EngineError.allEnginesFailed
                   }
                   let sorted = mv.values.sorted { a, b in
@@ -871,29 +763,6 @@ jobs:
               var bestMove: TopMove? { topMoves.first }
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
               var isMyTurn: Bool { effectivePlayerColor == sideToMove }
-
-              // ---- Win indicator from the PLAYER's perspective ----
-              // evalString/winChance on bestMove are from the side-to-move POV, so we
-              // flip them when it isn't the player's turn.
-              var playerWinPercent: Double {
-                  guard let best = bestMove else { return 50 }
-                  if sideToMove == effectivePlayerColor { return best.winChance }
-                  return 100 - best.winChance
-              }
-              var playerEvalString: String {
-                  guard let best = bestMove else { return "—" }
-                  if sideToMove == effectivePlayerColor { return best.evalString }
-                  // Flip the sign so it's always "from my point of view".
-                  if let m = best.mateIn, m != 0 { return "M\(abs(m))" }
-                  if let cp = best.evaluationCp { return String(format: "%+.2f", Double(-cp)/100.0) }
-                  return best.evalString
-              }
-              var playerWinColor: Color {
-                  let p = playerWinPercent
-                  if p >= 60 { return .green }
-                  if p >= 40 { return .gray }
-                  return .red
-              }
               private let fenBuilder = FenBuilder()
               private var previousEvalWhitePOV: Double? = nil
               private var previousFEN: String = ""
@@ -929,40 +798,29 @@ jobs:
                   let grid: String, sideToMove: String
                   let flipped: Bool, flippedConfident: Bool
                   let lastMoveUCI: String, plyCount: Int, detectionConfidence: String
-                  let bottomColor: String
               }
-              // Robust color detection: combines bottomColor (piece count at bottom)
-              // with the flipped/king heuristic, cross-checks them, and applies
-              // hysteresis so the detected color never flickers mid-game.
-              private func updateDetectedColor(bottomColor: String, flipped: Bool, flippedConfident: Bool, detConfidence: DetectionConfidence) {
+              // Color detection now relies on the board's authoritative "flipped"
+              // state, read from chess.com's own DOM (the "flipped" class on the
+              // board element). In live chess.com games your color is always at
+              // the bottom of the board, so:
+              //   flipped == true  -> you are Black
+              //   flipped == false -> you are White
+              // A king-row heuristic is the only fallback (lower confidence) and
+              // hysteresis prevents the color from flickering mid-game.
+              private func updateDetectedColor(flipped: Bool, flippedConfident: Bool) {
                   guard manualPlayerColor == nil else { return }
+                  guard flippedConfident else { return }
 
-                  // Candidate from piece-count signal (reader.js dbc) - strongest.
-                  var candidate: String? = nil
-                  var strong = false
-                  if bottomColor == "w" || bottomColor == "b" {
-                      candidate = bottomColor
-                      strong = true
-                  } else if flippedConfident {
-                      candidate = flipped ? "b" : "w"
-                  }
+                  let cand = flipped ? "b" : "w"
 
-                  // Agree check: king heuristic agrees with bottomColor => instant commit.
-                  var agree = false
-                  if flippedConfident, let cand = candidate {
-                      agree = ((flipped ? "b" : "w") == cand)
-                  }
-
-                  guard let cand = candidate else { return }
-
-                  // Hysteresis: require N consistent samples (or instant on strong+agree).
+                  // Hysteresis: require N consistent samples before committing.
                   if pendingColor == cand {
                       pendingColorCount += 1
                   } else {
                       pendingColor = cand
                       pendingColorCount = 1
                   }
-                  if pendingColorCount >= colorCommitThreshold || (strong && agree) {
+                  if pendingColorCount >= colorCommitThreshold {
                       if detectedPlayerColor != cand {
                           detectedPlayerColor = cand
                           // Color changed => previous eval/quality context no longer valid
@@ -979,8 +837,7 @@ jobs:
                   guard enabled else { return }
                   sideToMove = p.sideToMove; lastMoveUCI = p.lastMoveUCI; plyCount = p.plyCount
                   confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  updateDetectedColor(bottomColor: p.bottomColor, flipped: p.flipped,
-                                      flippedConfident: p.flippedConfident, detConfidence: confidence)
+                  updateDetectedColor(flipped: p.flipped, flippedConfident: p.flippedConfident)
                   if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
                       moveHistoryUCI.append(p.lastMoveUCI); lastKnownPly = p.plyCount
                   }
@@ -1679,23 +1536,10 @@ jobs:
                                   .font(.system(size: overlayPos.isCompact ? 22 : 28, weight: .black, design: .rounded))
                                   .foregroundColor(cc).minimumScaleFactor(0.7).lineLimit(1)
                               Text(best.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
-                              // Win indicator (player perspective)
-                              HStack(spacing: 4) {
-                                  Text(language.isArabic ? "فوزك" : "Win").font(.caption2.bold()).foregroundColor(engine.playerWinColor)
-                                  Text(String(format: "%.0f%%", engine.playerWinPercent))
-                                      .font(.caption2.bold().monospaced()).foregroundColor(engine.playerWinColor)
-                              }
-                              GeometryReader { geo in
-                                  ZStack(alignment: .leading) {
-                                      RoundedRectangle(cornerRadius: 2).fill(Color.gray.opacity(0.3))
-                                      RoundedRectangle(cornerRadius: 2).fill(engine.playerWinColor)
-                                          .frame(width: geo.size.width * CGFloat(engine.playerWinPercent / 100))
-                                  }
-                              }.frame(width: 90, height: 5)
                           }
                           Spacer()
                           VStack(alignment: .trailing, spacing: 1) {
-                              Text(engine.playerEvalString).font(.callout.bold().monospaced()).foregroundColor(engine.playerWinColor)
+                              Text(best.evalString).font(.callout.bold().monospaced()).foregroundColor(cc)
                               Text("d\(best.depth)").font(.caption2.monospaced()).foregroundColor(.secondary)
                               Button {
                                   VoiceManager.shared.speakMove(uci: best.uci, san: best.san, isArabic: language.isArabic)
@@ -1834,203 +1678,6 @@ jobs:
               static func delete(account: String) {
                   let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
                   SecItemDelete(query as CFDictionary)
-              }
-          }
-          '''
-
-          files["Sources/LocalEngine.swift"] = r'''
-          import Foundation
-          import WebKit
-          import UIKit
-
-          /// Local Stockfish engine running inside a hidden WKWebView.
-          /// Loads stockfish.js from CDN on first use, then stays warm & cached, giving
-          /// much deeper/faster analysis than the cloud APIs — and works offline after
-          /// the first load. Runs entirely on-device (no API key, no rate limits).
-          struct LocalEngineResult {
-              let bestMove: String
-              let ponder: String?
-              let evaluation: Int      // centipawns (side to move POV)
-              let mateIn: Int?
-              let depth: Int
-              let pv: [String]
-          }
-
-          @MainActor
-          final class LocalEngine: NSObject, ObservableObject {
-              static let shared = LocalEngine()
-
-              @Published var isReady = false
-              @Published var isAnalyzing = false
-              @Published var currentDepth = 0
-              @Published var lastResult: LocalEngineResult?
-
-              private var webView: WKWebView?
-              private var analysisCallback: ((LocalEngineResult) -> Void)?
-              private var bestMoveCallback: ((String) -> Void)?
-
-              override private init() { super.init() }
-
-              func initialize() {
-                  guard webView == nil else { return }
-                  let config = WKWebViewConfiguration()
-                  let cc = WKUserContentController()
-                  cc.add(self, name: StealthConfig.engineBridge)
-                  config.userContentController = cc
-                  config.websiteDataStore = .default()
-                  config.defaultWebpagePreferences.allowsContentJavaScript = true
-
-                  let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 200), configuration: config)
-                  wv.isHidden = true
-                  // Attach to the app window so its JS timers/Worker keep running
-                  // (a detached webview gets throttled and the engine never responds).
-                  attachToWindow(wv)
-
-                  // Prefer a locally-downloaded engine for 100% offline; else CDN.
-                  var localEngineJS: String? = nil
-                  let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-                  if let docs = docs {
-                      let f = docs.appendingPathComponent("stockfish.js")
-                      if FileManager.default.fileExists(atPath: f.path) {
-                          localEngineJS = try? String(contentsOf: f, encoding: .utf8)
-                      }
-                  }
-                  let html = createEngineHTML(localJS: localEngineJS)
-                  wv.loadHTMLString(html, baseURL: nil)
-                  webView = wv
-
-                  DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                      self?.isReady = true
-                  }
-              }
-
-              private func attachToWindow(_ wv: WKWebView) {
-                  guard let scene = UIApplication.shared.connectedScenes
-                          .compactMap({ $0 as? UIWindowScene })
-                          .first(where: { $0.activationState == .foregroundActive }),
-                        let window = scene.windows.first else { return }
-                  window.addSubview(wv)
-                  wv.frame = CGRect(x: -400, y: -400, width: 320, height: 200)
-                  wv.layer.zPosition = -999
-              }
-
-              func analyze(fen: String, depth: Int = 20, multiPV: Int = 3, onResult: @escaping (LocalEngineResult) -> Void) {
-                  guard isReady, let wv = webView else { return }
-                  isAnalyzing = true
-                  currentDepth = 0
-                  analysisCallback = onResult
-                  let js = "analyzePosition('\(fen)', \(depth), \(multiPV));"
-                  wv.evaluateJavaScript(js, completionHandler: nil)
-              }
-
-              func stop() {
-                  guard let wv = webView else { return }
-                  wv.evaluateJavaScript("stopAnalysis();", completionHandler: nil)
-                  isAnalyzing = false
-              }
-
-              private func createEngineHTML(localJS: String?) -> String {
-                  // If a local engine file exists (downloaded via Settings), inline it as
-                  // a Blob worker for full offline support; otherwise load from CDN.
-                  let engineSource: String
-                  if let localJS = localJS, !localJS.isEmpty {
-                      // Embed the raw JS safely (JSON-escape) then build a Blob worker.
-                      let esc = localJS
-                          .replacingOccurrences(of: "\\", with: "\\\\")
-                          .replacingOccurrences(of: "\"", with: "\\\"")
-                          .replacingOccurrences(of: "\n", with: "\\n")
-                          .replacingOccurrences(of: "\r", with: "")
-                      engineSource = "var src=\"\(esc)\";var blob=new Blob([src],{type:'text/javascript'});var u=URL.createObjectURL(blob);new Worker(u);"
-                  } else {
-                      engineSource = "new Worker('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js');"
-                  }
-                  return """
-                  <!DOCTYPE html>
-                  <html><head>
-                  <meta name="viewport" content="width=device-width, initial-scale=1">
-                  <script>
-                  var engine = null, analyzing = false, lastInfo = {};
-                  function initEngine(){
-                    try {
-                      engine = \(engineSource);
-                      engine.onmessage = function(e){ processEngineLine(e.data); };
-                      engine.postMessage('uci');
-                      engine.postMessage('setoption name Threads value 1');
-                      engine.postMessage('setoption name Hash value 64');
-                      engine.postMessage('setoption name MultiPV value 3');
-                      engine.postMessage('isready');
-                      setTimeout(function(){ sendToSwift({type:'ready'}); }, 1500);
-                    } catch(e){ sendToSwift({type:'error', message:e.toString()}); }
-                  }
-                  function processEngineLine(line){
-                    if(typeof line !== 'string'){ try{ line = line.data || ''; }catch(e){} }
-                    if(typeof line !== 'string') return;
-                    if(line.indexOf('bestmove') === 0){
-                      var parts = line.split(' ');
-                      sendToSwift({ type:'bestmove', bestMove: parts[1]||'', ponder: parts[3]||null,
-                        depth: lastInfo.depth||0, eval: lastInfo.cp||0, mate: lastInfo.mate||null, pv: lastInfo.pv||[] });
-                      analyzing = false;
-                    } else if(line.indexOf('info depth') !== -1){
-                      lastInfo = parseInfo(line);
-                      sendToSwift({ type:'info', depth: lastInfo.depth, eval: lastInfo.cp, mate: lastInfo.mate, pv: lastInfo.pv });
-                    }
-                  }
-                  function parseInfo(line){
-                    var info = {};
-                    var m;
-                    if((m=line.match(/depth (\\d+)/))) info.depth=parseInt(m[1]);
-                    if((m=line.match(/score cp (-?\\d+)/))) info.cp=parseInt(m[1]);
-                    if((m=line.match(/score mate (-?\\d+)/))) info.mate=parseInt(m[1]);
-                    if((m=line.match(/pv (.+)/))) info.pv=m[1].split(' ');
-                    return info;
-                  }
-                  function analyzePosition(fen, depth, multiPV){
-                    if(!engine) return;
-                    analyzing = true; lastInfo = {};
-                    engine.postMessage('stop');
-                    engine.postMessage('setoption name MultiPV value ' + multiPV);
-                    engine.postMessage('position fen ' + fen);
-                    engine.postMessage('go depth ' + depth);
-                  }
-                  function stopAnalysis(){ if(engine) engine.postMessage('stop'); analyzing=false; }
-                  function sendToSwift(obj){ try { window.webkit.messageHandlers.\(StealthConfig.engineBridge).postMessage(obj); } catch(e){} }
-                  window.onload = initEngine;
-                  </script>
-                  </head><body></body></html>
-                  """
-              }
-          }
-
-          extension LocalEngine: WKScriptMessageHandler {
-              func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-                  guard let dict = message.body as? [String: Any] else { return }
-                  let type = dict["type"] as? String ?? ""
-                  switch type {
-                  case "ready":
-                      self.isReady = true
-                  case "info":
-                      self.currentDepth = dict["depth"] as? Int ?? 0
-                  case "bestmove":
-                      let bestMove = dict["bestMove"] as? String ?? ""
-                      let ponder = dict["ponder"] as? String
-                      let depth = dict["depth"] as? Int ?? 0
-                      let evalVal = dict["eval"] as? Int ?? 0
-                      let mate = dict["mate"] as? Int
-                      let pv = dict["pv"] as? [String] ?? []
-                      let result = LocalEngineResult(bestMove: bestMove, ponder: ponder,
-                                                     evaluation: evalVal, mateIn: mate,
-                                                     depth: depth, pv: pv)
-                      self.lastResult = result
-                      self.isAnalyzing = false
-                      self.analysisCallback?(result)
-                      self.bestMoveCallback?(bestMove)
-                      self.analysisCallback = nil
-                      self.bestMoveCallback = nil
-                  case "error":
-                      print("LocalEngine error: \(dict["message"] ?? "unknown")")
-                  default:
-                      break
-                  }
               }
           }
           '''
@@ -2768,7 +2415,6 @@ jobs:
               @State private var apiKeyInput = ""
               @State private var apiKeySaved = false
               @State private var showKeyInput = false
-              @StateObject private var engineDL = EngineDownloadManager.shared
               var body: some View {
                   NavigationStack {
                       Form {
@@ -2827,44 +2473,6 @@ jobs:
                               Button(language.isArabic ? "إعادة الموضع" : "Reset position") { overlayPos.reset() }
                               Toggle(language.isArabic ? "نقطة صغيرة" : "Tiny dot", isOn: $stealth.minimalMode)
                           }
-                          Section(header: HStack {
-                              Image(systemName: "brain.head.profile").foregroundColor(.green)
-                              Text(language.isArabic ? "المحرك المحلي (Stockfish)" : "Local Engine (Stockfish)")
-                          }) {
-                              if engineDL.localFileExists {
-                                  Label(language.isArabic ? "الملف محفوظ ✓" : "File saved ✓", systemImage: "checkmark.seal.fill")
-                                      .foregroundColor(.green)
-                                  Text(String(format: language.isArabic ? "الحجم: %d KB" : "Size: %d KB", engineDL.fileSizeKB))
-                                      .font(.caption).foregroundColor(.secondary)
-                                  Button(language.isArabic ? "حذف الملف" : "Delete file", role: .destructive) {
-                                      engineDL.deleteLocal()
-                                  }
-                              } else {
-                                  Text(language.isArabic
-                                       ? "حمّل المحرك للعمل بدون إنترنت 100% (عمق أعلى)."
-                                       : "Download the engine to work 100% offline (deeper analysis).")
-                                      .font(.caption).foregroundColor(.secondary)
-                              }
-                              if !engineDL.isDownloading {
-                                  Button { engineDL.download() } label: {
-                                      Label(language.isArabic ? "بدء التحميل" : "Start download", systemImage: "arrow.down.circle.fill")
-                                  }
-                              } else {
-                                  VStack(alignment: .leading, spacing: 6) {
-                                      ProgressView(value: engineDL.progress).progressViewStyle(.linear)
-                                      Text(engineDL.status).font(.caption2).foregroundColor(.secondary)
-                                  }
-                              }
-                              if !engineDL.status.isEmpty && !engineDL.isDownloading {
-                                  Text(engineDL.status).font(.caption2).foregroundColor(.secondary)
-                              }
-                              Text(language.isArabic ? "روابط التحميل:" : "Download mirrors:").font(.caption.bold()).padding(.top, 4)
-                              ForEach(Array(EngineDownloadManager.engineURLs.enumerated()), id: \.offset) { idx, m in
-                                  Link(destination: URL(string: m.url)!) {
-                                      Label(m.name, systemImage: "arrow.up.right.square")
-                                  }.font(.caption)
-                              }
-                          }
                           Section("Debug") {
                               Text(engine.currentFEN.isEmpty ? "(none)" : engine.currentFEN).font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(3)
                               Text("Cache: \(cacheCount)").font(.caption)
@@ -2899,7 +2507,6 @@ jobs:
               static let bridgeName: String = randomName(prefix: "_", length: 6)
               static let readerFlag: String = randomName(prefix: "_", length: 8)
               static let startFuncName: String = randomName(prefix: "_", length: 8)
-              static let engineBridge: String = randomName(prefix: "_e_", length: 5)
               private static let userAgents = [
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
@@ -3042,49 +2649,6 @@ jobs:
           }
           '''
 
-          files["Sources/WinModel.swift"] = r'''
-          import Foundation
-
-          /// Calibrated win-probability model: converts a centipawn evaluation
-          /// (side-to-move POV) into a win percentage for that side.
-          /// Uses piecewise-linear interpolation over well-known anchor points instead
-          /// of the naive tanh, so readings stay accurate at high/low evals.
-          enum WinModel {
-              // (cp, whiteWin%) anchor points (from player-of-side-to-move perspective)
-              private static let anchors: [(cp: Double, pct: Double)] = [
-                  (-2000, 0.5), (-1500, 1.0), (-1000, 2.0), (-700, 4.0), (-500, 8.0),
-                  (-300, 16.0), (-200, 24.0), (-100, 36.0), (-50, 47.0), (0, 50.0),
-                  (50, 53.0), (100, 64.0), (200, 76.0), (300, 84.0), (500, 92.0),
-                  (700, 96.0), (1000, 98.0), (1500, 99.0), (2000, 99.5)
-              ]
-
-              /// Returns win% (0...100) for the side to move, given a centipawn eval.
-              static func winPercent(cp: Int) -> Double {
-                  if let m = mateScore(cp: cp) { return m }
-                  let x = Double(cp)
-                  let list = anchors
-                  // clamp
-                  if x <= list.first!.cp { return list.first!.pct }
-                  if x >= list.last!.cp { return list.last!.pct }
-                  for i in 0..<(list.count - 1) {
-                      let a = list[i], b = list[i + 1]
-                      if x >= a.cp && x <= b.cp {
-                          let t = (x - a.cp) / (b.cp - a.cp)
-                          return a.pct + t * (b.pct - a.pct)
-                      }
-                  }
-                  return 50
-              }
-
-              private static func mateScore(cp: Int) -> Double? {
-                  // We encode mate separately in TopMove; here handle large sentinel.
-                  if cp >= 30000 { return 99.9 }
-                  if cp <= -30000 { return 0.1 }
-                  return nil
-              }
-          }
-          '''
-
           for path, content in files.items():
               content = textwrap.dedent(content).strip() + "\n"
               os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -3126,7 +2690,7 @@ jobs:
       - name: Write reader.js
         run: |
           cat > Resources/reader.js <<'EOF'
-          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro2=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dbc(grid){if(!grid)return"";var w=0,b=0;for(var r=6;r<=7;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;if(p===p.toUpperCase())w++;else b++;}if(w>b)return"w";if(b>w)return"b";return"";}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0)return{flipped:wkR<4,confident:true};if(bkR>=0)return{flipped:bkR>=4,confident:true};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var fi=dfl(g);var bc=dbc(g);var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:fi.flipped,flippedConfident:fi.confident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:bc};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
+          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro2=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};return{flipped:false,confident:false};}function flippedByClass(b){if(!b)return null;var tag=(b.tagName||"").toLowerCase();var isWC=tag==="wc-chess-board";var e=b;while(e){if(e.classList&&e.classList.contains("flipped"))return true;e=e.parentElement;}return isWC?false:null;}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var fi=dfl(g);var cl=flippedByClass(b);var flipped,flippedConfident;if(cl===null){flipped=fi.flipped;flippedConfident=fi.confident;}else{flipped=cl;flippedConfident=true;}var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:flipped,flippedConfident:flippedConfident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
           EOF
 
       - name: Write adblock_css.css
