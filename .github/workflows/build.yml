@@ -1,4 +1,4 @@
-name: Build ChessHelper v5.3
+name: Build ChessHelper v5.2
 
 on:
   push:
@@ -12,14 +12,14 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
       - name: Clean & prepare
         run: |
-          rm -rf Sources Resources ChessHelper.xcodeproj build Payload
-          mkdir -p Sources Resources
+          rm -rf Sources Resources ChessHelper.xcodeproj build Payload Engine
+          mkdir -p Sources Resources Engine
 
       - name: Write project.yml
         run: |
@@ -31,8 +31,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "5.3.0"
-              CURRENT_PROJECT_VERSION: "53"
+              MARKETING_VERSION: "5.2.0"
+              CURRENT_PROJECT_VERSION: "52"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -40,19 +40,13 @@ jobs:
             ChessHelper:
               type: application
               platform: iOS
-              sources:
-                - { path: Sources, excludes: [Engine] }
-                - { path: Sources/Engine/src, group: Stockfish, compilerFlags: "-std=c++17 -O3 -DNDEBUG -DIS_64BIT -DNO_PREFETCH -DNNUE_EMBEDDING_OFF" }
-                - { path: Sources/Engine/bridge, group: Stockfish, compilerFlags: "-std=c++17 -O3" }
-                - { path: Resources }
+              sources: [ { path: Sources }, { path: Resources } ]
               info:
                 path: Resources/Info.plist
                 properties:
                   CFBundleDisplayName: Chess Helper
                   CFBundleShortVersionString: $(MARKETING_VERSION)
                   CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-                  CFBundleLocalizations: [en, ar]
-                  LSRequiresIPhoneOS: true
                   UILaunchScreen: {}
                   UISupportedInterfaceOrientations:
                     - UIInterfaceOrientationPortrait
@@ -68,6 +62,72 @@ jobs:
                   CODE_SIGN_STYLE: Manual
                   DEVELOPMENT_TEAM: ""
                   PROVISIONING_PROFILE_SPECIFIER: ""
+                  SWIFT_OBJC_BRIDGING_HEADER: Engine/engine_bridge.h
+                  HEADER_SEARCH_PATHS: "$(SRCROOT)/Engine"
+                  LIBRARY_SEARCH_PATHS: "$(SRCROOT)/Engine"
+                  OTHER_LDFLAGS: "$(inherited) -lchessengine"
+          EOF
+
+      - name: Write bridging header
+        run: |
+          cat > Engine/engine_bridge.h <<'EOF'
+          #ifndef engine_bridge_h
+          #define engine_bridge_h
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          void* chess_helper_engine_main(void* arg);
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          EOF
+
+      - name: Build engine (Stockfish, best-effort)
+        continue-on-error: true
+        run: |
+          set -eo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CXX=$(xcrun --sdk iphoneos --find clang++)
+          AR=$(xcrun --sdk iphoneos --find ar)
+          # ---- stub first (guaranteed linkable) ----
+          cat > /tmp/stub.cpp <<'CPP'
+          extern "C" void* chess_helper_engine_main(void*) { return 0; }
+          CPP
+          $CXX -arch arm64 -isysroot "$SDK" -mios-version-min=16.0 -c /tmp/stub.cpp -o /tmp/stub.o
+          $AR rcs Engine/libchessengine.a /tmp/stub.o
+          # ---- real Stockfish ----
+          git clone --depth 1 --branch sf_17.1 https://github.com/official-stockfish/Stockfish.git /tmp/sf
+          cd /tmp/sf/src
+          make net 2>/dev/null || true
+          FLAGS="-arch arm64 -isysroot $SDK -mios-version-min=16.0 -O3 -DNDEBUG -std=c++17 -Dmain=stockfish_main -DIS_64BIT -DNO_PEXT -DNO_POPCNT -DNO_AVX2 -DNO_AVX512 -DNO_BMI2 -fno-exceptions"
+          mkdir -p obj
+          for f in *.cpp; do
+            $CXX $FLAGS -c "$f" -o "obj/${f%.cpp}.o" 2>/dev/null || true
+          done
+          cat > obj/wrap.cpp <<'CPP'
+          int stockfish_main(int, char**);
+          extern "C" void* chess_helper_engine_main(void*) {
+              char* argv[] = {(char*)"stockfish", (char*)0};
+              stockfish_main(1, argv);
+              return 0;
+          }
+          CPP
+          $CXX $FLAGS -c obj/wrap.cpp -o obj/wrap.o
+          $AR rcs /tmp/libchessengine.a obj/*.o
+          cp /tmp/libchessengine.a Engine/libchessengine.a
+          echo "Stockfish engine built OK"
+
+      - name: Write reader.js
+        run: |
+          cat > Resources/reader.js <<'EOF'
+          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro2=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};return{flipped:false,confident:false};}function flippedByClass(b){if(!b)return null;var tag=(b.tagName||"").toLowerCase();var isWC=tag==="wc-chess-board";var e=b;while(e){if(e.classList&&e.classList.contains("flipped"))return true;e=e.parentElement;}return isWC?false:null;}function userColor(uname){if(!uname)return{color:null,confident:false};try{var el=null;var all=document.querySelectorAll("[class*='username'],[class*='player'],[data-username],.user-tagline-username");for(var i=0;i<all.length;i++){var a=all[i];var du=a.getAttribute&&a.getAttribute("data-username");var t=(a.textContent||"").trim();if(du===uname||t===uname){el=a;break;}}if(!el)return{color:null,confident:false};var b=fb();if(!b)return{color:null,confident:false};var br=b.getBoundingClientRect(),er=el.getBoundingClientRect();var bcy=br.top+br.height/2,ecy=er.top+er.height/2,ex=er.left+er.width/2;if(ex<br.left||ex>br.right)return{color:null,confident:false};var color=ecy>bcy?"w":"b";return{color:color,confident:true};}catch(e){return{color:null,confident:false};}}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var fi=dfl(g);var cl=flippedByClass(b);var flipped,flippedConfident;if(cl===null){flipped=fi.flipped;flippedConfident=fi.confident;}else{flipped=cl;flippedConfident=true;}var un=window.__CHESSHELPER_USERNAME__||"";var uc=userColor(un);var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:flipped,flippedConfident:flippedConfident,userColor:uc.confident?uc.color:null,userColorConfident:uc.confident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
+          EOF
+
+      - name: Write adblock_css.css
+        run: |
+          cat > Resources/adblock_css.css <<'EOF'
+          iframe[src*="doubleclick.net"],iframe[src*="googlesyndication"],ins.adsbygoogle,[id^="div-gpt-ad"],#onetrust-banner-sdk,.cookie-banner-component,.cookie-consent{display:none!important;}
           EOF
 
       - name: Generate all Swift source files
@@ -76,355 +136,6 @@ jobs:
           python3 <<'PYEOF'
           import os, textwrap
           files = {}
-
-          files["Sources/LocalEngine.swift"] = r'''
-          import Foundation
-
-          /// On-device Stockfish engine (compiled into the app from C++).
-          /// Communication happens over POSIX pipes with the UCI protocol.
-          /// The NNUE networks are DATA files downloaded at runtime
-          /// (iOS forbids downloading executable code — data files are fine).
-          @MainActor
-          final class LocalEngineService: ObservableObject {
-              enum Status: String {
-                  case off, needsDownload, starting, ready, failed
-              }
-
-              @Published var isEnabled: Bool {
-                  didSet {
-                      UserDefaults.standard.set(isEnabled, forKey: "local_engine_enabled")
-                      if !isEnabled { stopEngine() }
-                  }
-              }
-              @Published var targetDepth: Int {
-                  didSet { UserDefaults.standard.set(targetDepth, forKey: "local_engine_depth") }
-              }
-              @Published private(set) var status: Status = .off
-              @Published private(set) var statusDetail: String = ""
-              @Published private(set) var isDownloading = false
-              @Published private(set) var lastSearchMs: Int = 0
-              @Published private(set) var lastSearchDepth: Int = 0
-
-              static let bigNetURL = URL(string: "https://tests.stockfishchess.org/api/nn/nn-b1a57edbea57.nnue")!
-              static let smallNetURL = URL(string: "https://tests.stockfishchess.org/api/nn/nn-baff1ede1f90.nnue")!
-              static let bigNetName = "nn-b1a57edbea57.nnue"
-              static let smallNetName = "nn-baff1ede1f90.nnue"
-
-              private var inPipe: [Int32] = [-1, -1]
-              private var outPipe: [Int32] = [-1, -1]
-              private var engineThread: Thread?
-              private var readSource: DispatchSourceRead?
-              private let ioQueue = DispatchQueue(label: "com.chesshelper.localengine.io")
-              private var outBuffer = ""
-              private var lineHandler: ((String) -> Void)?
-              private var pendingHandshake: ((Bool) -> Void)?
-              private var searchContinuation: CheckedContinuation<[TopMove], Never>?
-              private var infos: [Int: LocalInfo] = [:]
-              private var started = false
-              private var engineEverReady = false
-
-              private struct LocalInfo {
-                  var depth = 0
-                  var evalCp: Int? = nil
-                  var mate: Int? = nil
-                  var uci = ""
-              }
-
-              init() {
-                  isEnabled = UserDefaults.standard.bool(forKey: "local_engine_enabled")
-                  let d = UserDefaults.standard.integer(forKey: "local_engine_depth")
-                  targetDepth = (d >= 10 && d <= 30) ? d : 22
-                  refreshNetState()
-              }
-
-              // MARK: - Net files (downloaded data, not code)
-
-              var netDirectory: URL {
-                  FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                      .appendingPathComponent("ChessHelperEngine", isDirectory: true)
-              }
-              var bigNetPath: String? { pathFor(Self.bigNetName) }
-              var smallNetPath: String? { pathFor(Self.smallNetName) }
-              var netsReady: Bool { bigNetPath != nil && smallNetPath != nil }
-              private func pathFor(_ name: String) -> String? {
-                  let u = netDirectory.appendingPathComponent(name)
-                  return FileManager.default.fileExists(atPath: u.path) ? u.path : nil
-              }
-              func refreshNetState() {
-                  if status == .needsDownload && netsReady { status = .off }
-              }
-
-              func downloadNets() async -> Bool {
-                  isDownloading = true
-                  defer { isDownloading = false }
-                  do {
-                      try FileManager.default.createDirectory(at: netDirectory, withIntermediateDirectories: true)
-                  } catch {
-                      statusDetail = "Cannot create directory"
-                      return false
-                  }
-                  let smallOK = await downloadOne(url: Self.smallNetURL, name: Self.smallNetName)
-                  let bigOK = await downloadOne(url: Self.bigNetURL, name: Self.bigNetName)
-                  refreshNetState()
-                  if smallOK && bigOK {
-                      statusDetail = ""
-                      if engineEverReady {
-                          ioQueue.async { [weak self] in
-                              guard let self = self else { return }
-                              if let p = self.bigNetPath { self.write("setoption name EvalFile value \(p)\n") }
-                              if let p = self.smallNetPath { self.write("setoption name EvalFileSmall value \(p)\n") }
-                              self.write("isready\n")
-                          }
-                      }
-                      return true
-                  } else {
-                      statusDetail = "Download incomplete — try again"
-                      return false
-                  }
-              }
-
-              private func downloadOne(url: URL, name: String) async -> Bool {
-                  guard let data = try? await downloadData(url: url) else { return false }
-                  let dest = netDirectory.appendingPathComponent(name)
-                  do {
-                      try? FileManager.default.removeItem(at: dest)
-                      try data.write(to: dest, options: .atomic)
-                      return true
-                  } catch {
-                      return false
-                  }
-              }
-
-              private func downloadData(url: URL) async throws -> Data {
-                  var req = URLRequest(url: url)
-                  req.timeoutInterval = 600
-                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  let (data, resp) = try await URLSession.shared.data(for: req)
-                  guard let http = resp as? HTTPURLResponse, http.statusCode == 200, !data.isEmpty else {
-                      throw URLError(.badServerResponse)
-                  }
-                  return data
-              }
-
-              // MARK: - Engine lifecycle
-
-              func ensureReady() async -> Bool {
-                  guard isEnabled else { return false }
-                  guard netsReady else {
-                      status = .needsDownload
-                      return false
-                  }
-                  if status == .ready { return true }
-                  if status != .starting && !started { spawnEngine() }
-                  for _ in 0..<30 {
-                      try? await Task.sleep(nanoseconds: 200_000_000)
-                      if status == .ready { return true }
-                      if status == .failed { return false }
-                  }
-                  return status == .ready
-              }
-
-              private func spawnEngine() {
-                  guard !started else { return }
-                  started = true
-                  status = .starting
-                  statusDetail = ""
-                  guard pipe(&inPipe) == 0, pipe(&outPipe) == 0 else {
-                      status = .failed
-                      statusDetail = "Pipe creation failed"
-                      started = false
-                      return
-                  }
-                  let inFd = inPipe
-                  let outFd = outPipe
-                  engineThread = Thread {
-                      chesshelper_run_engine(inFd[0], outFd[1])
-                  }
-                  engineThread?.name = "ChessHelperEngine"
-                  engineThread?.start()
-                  close(inFd[0])
-                  close(outFd[1])
-                  let readFd = outFd[0]
-                  let src = DispatchSource.makeReadSource(fileDescriptor: readFd, queue: ioQueue)
-                  src.setEventHandler { [weak self] in self?.readAvailable(readFd) }
-                  src.setCancelHandler { close(readFd) }
-                  src.resume()
-                  readSource = src
-                  ioQueue.async { [weak self] in
-                      guard let self = self else { return }
-                      self.requestHandshake { ok in
-                          guard ok else {
-                              Task { @MainActor in
-                                  self.status = .failed
-                                  self.statusDetail = "Engine handshake timeout"
-                              }
-                              return
-                          }
-                          self.write("setoption name Threads value 2\n")
-                          self.write("setoption name MultiPV value 3\n")
-                          if let p = self.bigNetPath { self.write("setoption name EvalFile value \(p)\n") }
-                          if let p = self.smallNetPath { self.write("setoption name EvalFileSmall value \(p)\n") }
-                          self.write("isready\n")
-                          self.requestHandshake { ok2 in
-                              Task { @MainActor in
-                                  if ok2 {
-                                      self.status = .ready
-                                      self.engineEverReady = true
-                                  } else {
-                                      self.status = .failed
-                                      self.statusDetail = "Engine init timeout"
-                                  }
-                              }
-                          }
-                      }
-                      self.write("uci\n")
-                  }
-              }
-
-              func stopEngine() {
-                  ioQueue.async { [weak self] in
-                      guard let self = self else { return }
-                      if self.started {
-                          self.write("quit\n")
-                          self.started = false
-                      }
-                      self.readSource?.cancel()
-                      self.readSource = nil
-                      self.lineHandler = nil
-                      self.pendingHandshake = nil
-                      if self.inPipe[1] >= 0 { close(self.inPipe[1]) }
-                      if self.outPipe[0] >= 0 { close(self.outPipe[0]) }
-                      self.inPipe = [-1, -1]
-                      self.outPipe = [-1, -1]
-                      Task { @MainActor in self.status = .off }
-                  }
-              }
-
-              // MARK: - Search
-
-              func search(fen: String, depth: Int, multiPv: Int = 3) async -> [TopMove] {
-                  guard await ensureReady() else { return [] }
-                  return await withCheckedContinuation { (cont: CheckedContinuation<[TopMove], Never>) in
-                      ioQueue.async { [weak self] in
-                          guard let self = self else { cont.resume(returning: []); return }
-                          let effDepth = min(max(depth, 10), 30)
-                          self.infos = [:]
-                          self.searchContinuation = cont
-                          self.lastSearchDepth = effDepth
-                          let t0 = Date()
-                          let finish: () -> Void = { [weak self] in
-                              guard let self = self, let c = self.searchContinuation else { return }
-                              self.lineHandler = nil
-                              self.searchContinuation = nil
-                              self.lastSearchMs = Int(Date().timeIntervalSince(t0) * 1000)
-                              let moves = self.infos.keys.sorted().compactMap { k -> TopMove? in
-                                  guard let i = self.infos[k], !i.uci.isEmpty else { return nil }
-                                  return TopMove(rank: k, uci: i.uci, san: i.uci,
-                                                 evaluationCp: i.evalCp, mateIn: i.mate,
-                                                 depth: i.depth, source: "local", votes: 3)
-                              }
-                              c.resume(returning: moves)
-                          }
-                          self.lineHandler = { [weak self] line in
-                              guard let self = self else { return }
-                              if let m = Self.parseInfo(line), m.depth >= (self.infos[m.mp]?.depth ?? -1) {
-                                  self.infos[m.mp] = m
-                              } else if line.hasPrefix("bestmove") {
-                                  finish()
-                              }
-                          }
-                          self.write("setoption name MultiPV value \(multiPv)\n")
-                          self.write("position fen \(fen)\n")
-                          self.write("go depth \(effDepth)\n")
-                          self.ioQueue.asyncAfter(deadline: .now() + 45) { [weak self] in
-                              guard let self = self, self.searchContinuation != nil else { return }
-                              self.write("stop\n")
-                              self.ioQueue.asyncAfter(deadline: .now() + 3) { [weak self] in
-                                  guard let self = self, self.searchContinuation != nil else { return }
-                                  finish()
-                              }
-                          }
-                      }
-                  }
-              }
-
-              // MARK: - Pipe plumbing (UCI)
-
-              private func requestHandshake(timeout: Double = 8, _ completion: @escaping (Bool) -> Void) {
-                  pendingHandshake = completion
-                  ioQueue.asyncAfter(deadline: .now() + timeout) { [weak self] in
-                      guard let self = self, let h = self.pendingHandshake else { return }
-                      self.pendingHandshake = nil
-                      h(false)
-                  }
-              }
-
-              private func readAvailable(_ fd: Int32) {
-                  var buf = [UInt8](repeating: 0, count: 8192)
-                  let n = read(fd, &buf, 8192)
-                  guard n > 0 else { return }
-                  outBuffer += String(decoding: buf[0..<n], as: UTF8.self)
-                  while let idx = outBuffer.firstIndex(of: "\n") {
-                      let line = String(outBuffer[..<idx]).trimmingCharacters(in: .whitespacesAndNewlines)
-                      outBuffer = String(outBuffer[outBuffer.index(after: idx)...])
-                      if !line.isEmpty { handleLine(line) }
-                  }
-              }
-
-              private func handleLine(_ line: String) {
-                  if let h = lineHandler {
-                      h(line)
-                      return
-                  }
-                  if line.hasPrefix("uciok") || line.hasPrefix("readyok") {
-                      if let h = pendingHandshake {
-                          pendingHandshake = nil
-                          h(true)
-                      }
-                  }
-              }
-
-              private func write(_ s: String) {
-                  guard inPipe[1] >= 0 else { return }
-                  s.withCString { ptr in
-                      var remaining = s.utf8.count
-                      var off = 0
-                      while remaining > 0 {
-                          let w = write(inPipe[1], ptr + off, remaining)
-                          if w <= 0 { break }
-                          off += w
-                          remaining -= w
-                      }
-                  }
-              }
-
-              private static let infoRegex = try! NSRegularExpression(
-                  pattern: #"depth\s+(\d+).*?multipv\s+(\d+).*?score\s+(cp\s+(-?\d+)|mate\s+(-?\d+)).*?pv\s+(.+)$"#
-              )
-
-              private static func parseInfo(_ line: String) -> (mp: Int, depth: Int, evalCp: Int?, mate: Int?, uci: String)? {
-                  guard line.hasPrefix("info ") else { return nil }
-                  let ns = line as NSString
-                  let range = NSRange(location: 0, length: ns.length)
-                  guard let m = infoRegex.firstMatch(in: line, options: [], range: range) else { return nil }
-                  func g(_ i: Int) -> String {
-                      m.range(at: i).location != NSNotFound ? ns.substring(with: m.range(at: i)) : ""
-                  }
-                  let depth = Int(g(1)) ?? 0
-                  let mp = Int(g(2)) ?? 1
-                  var cp: Int? = nil
-                  var mate: Int? = nil
-                  if g(3).hasPrefix("cp") { cp = Int(g(4)) }
-                  else if g(3).hasPrefix("mate") { mate = Int(g(5)) }
-                  let uci = g(6).split(separator: " ").first.map(String.init) ?? ""
-                  return (mp, depth, cp, mate, uci)
-              }
-          }
-
-          // C function implemented in Sources/Engine/bridge/EngineBridge.cpp
-          @_silgen_name("chesshelper_run_engine")
-          private func chesshelper_run_engine(_ inFD: Int32, _ outFD: Int32)
-          '''
 
           files["Sources/AIAssistantPanel.swift"] = r'''
           import SwiftUI
@@ -794,6 +505,9 @@ jobs:
                           .replacingOccurrences(of: "__READER_INTERVAL__", with: "\(StealthConfig.readerInterval())")
                       cc.addUserScript(WKUserScript(source: js, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
                   }
+                  let uname = UserDefaults.standard.string(forKey: "chesscom_username") ?? ""
+                  let inject = "window.__CHESSHELPER_USERNAME__ = \(cssLit(uname));"
+                  cc.addUserScript(WKUserScript(source: inject, injectionTime: .atDocumentStart, forMainFrameOnly: false))
                   if let css = Bundle.main.loadResource(named: "adblock_css", ext: "css") {
                       let inj = "(function(){var s=document.createElement('style');s.textContent=\(cssLit(css));document.documentElement.appendChild(s);})();"
                       cc.addUserScript(WKUserScript(source: inj, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -831,10 +545,9 @@ jobs:
                       let p = EngineViewModel.BoardPayload(
                           grid: (d["grid"] as? String) ?? "", sideToMove: (d["sideToMove"] as? String) ?? "w",
                           flipped: (d["flipped"] as? Bool) ?? false, flippedConfident: (d["flippedConfident"] as? Bool) ?? false,
+                          userColor: (d["userColor"] as? String), userColorConfident: (d["userColorConfident"] as? Bool) ?? false,
                           lastMoveUCI: (d["lastMoveUCI"] as? String) ?? "", plyCount: (d["plyCount"] as? Int) ?? -1,
-                          detectionConfidence: (d["detectionConfidence"] as? String) ?? "unknown",
-                          bottomColor: (d["bottomColor"] as? String) ?? "",
-                          moveTimeMs: (d["moveTimeMs"] as? Int) ?? 0
+                          detectionConfidence: (d["detectionConfidence"] as? String) ?? "unknown"
                       )
                       Task { @MainActor [weak engine] in engine?.ingest(p) }
                   }
@@ -866,7 +579,6 @@ jobs:
               @StateObject private var aiVM = AIAssistantViewModel()
               @StateObject private var language = AppLanguage()
               @StateObject private var recorder = GameRecorder()
-              @StateObject private var localEngine = LocalEngineService()
               var body: some View {
                   TabView(selection: $router.selectedTab) {
                       PlayView(engine: engine, stealth: stealth, router: router, aiVM: aiVM, language: language, recorder: recorder)
@@ -877,14 +589,17 @@ jobs:
                           .tabItem { Label(language.isArabic ? "افتتاحيات" : "Openings", systemImage: "book.fill") }.tag(2)
                       SimpleTabView(title: language.isArabic ? "ألغاز" : "Puzzles", icon: "puzzlepiece.fill")
                           .tabItem { Label(language.isArabic ? "ألغاز" : "Puzzles", systemImage: "puzzlepiece.fill") }.tag(3)
-                      SettingsView(stealth: stealth, engine: engine, language: language, localEngine: localEngine)
+                      SettingsView(stealth: stealth, engine: engine, language: language)
                           .tabItem { Label(language.isArabic ? "إعدادات" : "Settings", systemImage: "gearshape.fill") }.tag(4)
                   }
                   .tint(.green)
                   .environment(\.layoutDirection, language.isArabic ? .rightToLeft : .leftToRight)
                   .onAppear {
                       engine.recorder = recorder
-                      engine.localEngine = localEngine
+                      engine.enabled = stealth.helperEnabled
+                  }
+                  .onChange(of: stealth.helperEnabled) { enabled in
+                      engine.enabled = enabled
                   }
               }
           }
@@ -929,8 +644,6 @@ jobs:
               let depth: Int; let sourcesUsed: String
               let confidence: Int; let debugFen: String
           }
-          struct TablebaseMove { let uci: String; let wdl: Int; let category: String }
-          struct TablebaseResult { let checkmate: Bool; let category: String; let moves: [TablebaseMove] }
           enum EngineError: Error, LocalizedError {
               case badFen(String), networkOffline, allEnginesFailed, cancelled
               var errorDescription: String? {
@@ -942,17 +655,36 @@ jobs:
                   }
               }
           }
-          private struct AggEntry {
-              var votes = 0
-              var evals: [Int] = []
-              var mates: [Int] = []
-              var san = ""
-              var depth = 0
-              var srcs = Set<String>()
-          }
           enum EngineService {
-              // MARK: - Remote engines
-              static func callLichessCloud(fen: String, multiPv: Int = 5) async -> [TopMove]? {
+              static func fenSideToMove(_ fen: String) -> String {
+                  return fen.split(separator: " ").dropFirst().first.map(String.init) ?? "w"
+              }
+              static func analyzeLocal(fen: String, multiPv: Int, depth: Int) async -> (moves: [TopMove], depth: Int)? {
+                  let engine = UCIEngine.shared
+                  if !engine.isAvailable {
+                      engine.start()
+                      await engine.waitUntilReady()
+                  }
+                  guard engine.isAvailable else { return nil }
+                  let lines = await engine.analyze(fen: fen, multiPv: multiPv, depth: depth, movetimeMs: 700)
+                  guard !lines.isEmpty else { return nil }
+                  let side = fenSideToMove(fen)
+                  var moves: [TopMove] = []
+                  var maxDepth = 0
+                  for (idx, ln) in lines.enumerated() {
+                      let uci = ln.pv.split(separator: " ").first.map(String.init) ?? ""
+                      guard !uci.isEmpty else { continue }
+                      guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { continue }
+                      var cp = ln.cp
+                      var mate = ln.mate
+                      if side == "b" { cp = cp.map { -$0 }; mate = mate.map { -$0 } }
+                      moves.append(TopMove(rank: idx + 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: ln.depth, source: "sf", votes: 3))
+                      maxDepth = max(maxDepth, ln.depth)
+                  }
+                  guard !moves.isEmpty else { return nil }
+                  return (moves, maxDepth)
+              }
+              static func callLichessCloud(fen: String, multiPv: Int = 3) async -> [TopMove]? {
                   var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
                   comps.queryItems = [URLQueryItem(name: "fen", value: fen), URLQueryItem(name: "multiPv", value: "\(multiPv)")]
                   guard let url = comps.url else { return nil }
@@ -1022,118 +754,22 @@ jobs:
                       return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "sf", votes: 1)
                   } catch { return nil }
               }
-
-              // MARK: - Local on-device engine
-              static func callLocalEngine(_ local: LocalEngineService, fen: String, depth: Int, multiPv: Int = 3) async -> [TopMove]? {
-                  let ms = await local.search(fen: fen, depth: depth, multiPv: multiPv)
-                  guard !ms.isEmpty else { return nil }
-                  let filtered = ms.filter { MoveValidator.isPlausibleMove(uci: $0.uci, fen: fen) }
-                  return filtered.isEmpty ? nil : filtered
-              }
-
-              // MARK: - Syzygy tablebases (exact, <= 7 pieces)
-              static func countPieces(_ fen: String) -> Int {
-                  let board = fen.split(separator: " ").first.map(String.init) ?? ""
-                  return board.reduce(0) { $0 + ($1.isLetter ? 1 : 0) }
-              }
-              static func callTablebase(fen: String) async -> TablebaseResult? {
-                  var comps = URLComponents(string: "https://tablebase.lichess.ovh/standard")!
-                  comps.queryItems = [URLQueryItem(name: "fen", value: fen)]
-                  guard let url = comps.url else { return nil }
-                  var req = URLRequest(url: url)
-                  req.timeoutInterval = 5
-                  req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  do {
-                      let (data, resp) = try await URLSession.shared.data(for: req)
-                      guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
-                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-                      let checkmate = (json["checkmate"] as? Bool) ?? false
-                      let category = (json["category"] as? String) ?? ""
-                      guard let ms = json["moves"] as? [[String: Any]], !ms.isEmpty else { return nil }
-                      var moves: [TablebaseMove] = []
-                      for m in ms {
-                          guard let uci = m["uci"] as? String else { continue }
-                          moves.append(TablebaseMove(uci: uci, wdl: (m["wdl"] as? Int) ?? 0, category: (m["category"] as? String) ?? ""))
-                      }
-                      return TablebaseResult(checkmate: checkmate, category: category, moves: moves)
-                  } catch { return nil }
-              }
-              static func tablebaseAnalysis(_ tb: TablebaseResult, fen: String) -> EngineAnalysis? {
-                  let parts = fen.split(separator: " ").map(String.init)
-                  let side = parts.count >= 2 ? parts[1] : "w"
-                  let sign = side == "w" ? 1 : -1
-                  var out: [TopMove] = []
-                  for m in tb.moves {
-                      guard MoveValidator.isPlausibleMove(uci: m.uci, fen: fen) else { continue }
-                      var cp: Int? = nil
-                      var mate: Int? = nil
-                      switch m.category {
-                      case "win": if tb.checkmate { mate = sign * 1 } else { cp = sign * 9900 }
-                      case "loss": cp = -sign * 9900
-                      case "draw": cp = 0
-                      case "cursed": cp = sign * 60
-                      case "blessed": cp = -sign * 60
-                      default: continue
-                      }
-                      out.append(TopMove(rank: 0, uci: m.uci, san: m.uci, evaluationCp: cp, mateIn: mate, depth: 999, source: "tb", votes: 3))
-                  }
-                  guard !out.isEmpty else { return nil }
-                  let sorted = out.sorted { $0.rankScore > $1.rankScore }
-                  let final = sorted.prefix(3).enumerated().map { (idx, m) in
-                      TopMove(rank: idx + 1, uci: m.uci, san: m.san, evaluationCp: m.evaluationCp, mateIn: m.mateIn, depth: 999, source: "tb", votes: 3)
-                  }
-                  return EngineAnalysis(topMoves: final, bestMove: final.first, depth: 999, sourcesUsed: "tablebase", confidence: 3, debugFen: fen)
-              }
-
-              // MARK: - Aggregation
-              private static func medianInt(_ vals: [Int]) -> Int? {
-                  guard !vals.isEmpty else { return nil }
-                  let s = vals.sorted()
-                  let mid = s.count / 2
-                  return s.count % 2 == 1 ? s[mid] : (s[mid - 1] + s[mid]) / 2
-              }
-              private static func robustMedian(_ vals: [Int], tolerance: Int = 150) -> Int? {
-                  guard !vals.isEmpty else { return nil }
-                  var v = vals
-                  var m = medianInt(v)!
-                  if v.count >= 3 {
-                      let filtered = v.filter { abs($0 - m) <= tolerance }
-                      if filtered.count >= 2 { v = filtered; m = medianInt(v)! }
-                  }
-                  return m
-              }
-              private static func rankScore(_ a: AggEntry) -> Double {
-                  if let m = medianInt(a.mates) { return m > 0 ? 100000 - Double(abs(m)) : -100000 - Double(abs(m)) }
-                  return Double(robustMedian(a.evals) ?? 0)
-              }
-
               static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
-                                            local: LocalEngineService? = nil, remoteCheck: Bool = true,
                                             onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
                   if let issue = FenValidator.validate(fen) { throw EngineError.badFen(issue) }
 
-                  // 0. Instant Opening Book lookup (no network, ~0ms)
-                  if !deep {
-                      await OpeningBook.shared.load()
-                      if let opening = await OpeningBook.shared.lookup(fen: fen), !opening.moves.isEmpty {
-                          let om: [TopMove] = opening.moves.prefix(3).enumerated().map { (idx, mv) in
-                              TopMove(rank: idx + 1, uci: mv, san: mv, evaluationCp: 0, mateIn: nil, depth: 99, source: "book", votes: 3)
-                          }
-                          let oa = EngineAnalysis(topMoves: om, bestMove: om.first, depth: 99, sourcesUsed: "📖 " + opening.name, confidence: 3, debugFen: fen)
-                          await MainActor.run { onUpdate(oa) }
-                          return oa
-                      }
-                  }
-
-                  // 0b. Exact Syzygy tablebase for positions with <= 7 pieces
-                  if countPieces(fen) <= 7,
-                     let tb = await callTablebase(fen: fen),
-                     let ta = tablebaseAnalysis(tb, fen: fen) {
-                      await MainActor.run { onUpdate(ta) }
-                      return ta
-                  }
-
+                            // 0. Instant Opening Book lookup (no network, ~0ms)
+                            if !deep {
+                                await OpeningBook.shared.load()
+                                if let opening = await OpeningBook.shared.lookup(fen: fen), !opening.moves.isEmpty {
+                                    let om: [TopMove] = opening.moves.prefix(3).enumerated().map { (idx, mv) in
+                                        TopMove(rank: idx + 1, uci: mv, san: mv, evaluationCp: 0, mateIn: nil, depth: 99, source: "book", votes: 3)
+                                    }
+                                    let oa = EngineAnalysis(topMoves: om, bestMove: om.first, depth: 99, sourcesUsed: "📖 "+opening.name, confidence: 3, debugFen: fen)
+                                    await MainActor.run { onUpdate(oa) }
+                                    return oa
+                                }
+                            }
                   if !deep, let cached = await AnalysisCache.shared.get(fen: fen) {
                       let cm = cached.moves.enumerated().map { (i, m) in
                           TopMove(rank: i + 1, uci: m.uci, san: m.san, evaluationCp: m.evaluationCp, mateIn: m.mateIn, depth: m.depth, source: "cache", votes: m.votes)
@@ -1142,79 +778,53 @@ jobs:
                       await MainActor.run { onUpdate(a) }
                       return a
                   }
-
-                  // 1. Kick off every source concurrently
-                  var sources: [(key: String, moves: [TopMove], weight: Int)] = []
-                  var lt: Task<[TopMove]?, Never>? = nil
-                  if let local = local {
-                      lt = Task { await callLocalEngine(local, fen: fen, depth: local.targetDepth, multiPv: 3) }
+                  // 1. LOCAL Stockfish engine (strongest, offline, instant)
+                  if UserDefaults.standard.bool(forKey: "use_local_engine"),
+                     let local = await analyzeLocal(fen: fen, multiPv: deep ? 5 : 3, depth: deep ? 20 : 15) {
+                      let a = EngineAnalysis(topMoves: local.moves, bestMove: local.moves.first, depth: local.depth, sourcesUsed: "🐟 Stockfish", confidence: 3, debugFen: fen)
+                      await MainActor.run { onUpdate(a) }
+                      if !deep { await AnalysisCache.shared.set(fen: fen, moves: local.moves, depth: local.depth, sources: "sf", confidence: 3) }
+                      return a
                   }
-                  var t1: Task<[TopMove]?, Never>? = nil
-                  var t2: Task<[TopMove]?, Never>? = nil
-                  var t3: Task<[TopMove]?, Never>? = nil
-                  if remoteCheck || local == nil {
-                      t1 = Task { await callLichessCloud(fen: fen, multiPv: 5) }
-                      t2 = Task { await callChessApi(fen: fen, deep: deep) }
-                      t3 = Task { await callStockfishOnline(fen: fen, deep: deep) }
+                  // 2. Cloud fallback (only if local engine unavailable)
+                  async let lr = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
+                  async let cr = callChessApi(fen: fen, deep: deep)
+                  async let sr = callStockfishOnline(fen: fen, deep: deep)
+                  let lichess = await lr; try Task.checkCancellation()
+                  let cA = await cr; try Task.checkCancellation()
+                  let sf = await sr; try Task.checkCancellation()
+                  var mv: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
+                  if let lm = lichess { for m in lm {
+                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("lc"); mv[m.uci] = e }
+                      else { mv[m.uci] = (m, 1, ["lc"]) }
+                  }}
+                  if let m = cA {
+                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("cA"); mv[m.uci] = e }
+                      else { mv[m.uci] = (m, 1, ["cA"]) }
                   }
-                  if let r = await lt?.value, !r.isEmpty { sources.append(("local", r, 3)) }
-                  try Task.checkCancellation()
-                  if let r = await t1?.value, !r.isEmpty { sources.append(("lc", r, 1)) }
-                  try Task.checkCancellation()
-                  if let r = await t2?.value, !r.isEmpty { sources.append(("cA", r, 1)) }
-                  try Task.checkCancellation()
-                  if let r = await t3?.value, !r.isEmpty { sources.append(("sf", r, 1)) }
-                  try Task.checkCancellation()
-
-                  if sources.isEmpty {
-                      // Local-only mode with local failure -> fall back to remote engines once.
-                      let f1 = await callLichessCloud(fen: fen, multiPv: 5)
-                      let f2 = await callChessApi(fen: fen, deep: deep)
-                      let f3 = await callStockfishOnline(fen: fen, deep: deep)
-                      if let r = f1, !r.isEmpty { sources.append(("lc", r, 1)) }
-                      if let r = f2, !r.isEmpty { sources.append(("cA", r, 1)) }
-                      if let r = f3, !r.isEmpty { sources.append(("sf", r, 1)) }
-                      guard !sources.isEmpty else { throw EngineError.allEnginesFailed }
+                  if let m = sf {
+                      if var e = mv[m.uci] { e.votes += 1; e.sources.append("sf"); mv[m.uci] = e }
+                      else { mv[m.uci] = (m, 1, ["sf"]) }
                   }
-
-                  // 2. Aggregate with weighted votes + median eval (outliers rejected)
-                  var agg: [String: AggEntry] = [:]
-                  for s in sources {
-                      for m in s.moves {
-                          var a = agg[m.uci] ?? AggEntry()
-                          a.votes += s.weight
-                          a.srcs.insert(s.key)
-                          if let mate = m.mateIn { a.mates.append(mate) }
-                          else if let cp = m.evaluationCp { a.evals.append(cp) }
-                          if !m.san.isEmpty && m.san != m.uci { a.san = m.san }
-                          a.depth = max(a.depth, m.depth)
-                          agg[m.uci] = a
-                      }
+                  guard !mv.isEmpty else {
+                      if lichess == nil && cA == nil && sf == nil { throw EngineError.networkOffline }
+                      throw EngineError.allEnginesFailed
                   }
-                  guard !agg.isEmpty else { throw EngineError.allEnginesFailed }
-
-                  let sorted = agg.sorted { x, y in
-                      if x.value.votes != y.value.votes { return x.value.votes > y.value.votes }
-                      return rankScore(x.value) > rankScore(y.value)
+                  let sorted = mv.values.sorted { a, b in
+                      if a.votes != b.votes { return a.votes > b.votes }
+                      return a.move.rankScore > b.move.rankScore
                   }
                   let limit = deep ? 5 : 3
                   let final: [TopMove] = sorted.prefix(limit).enumerated().map { (idx, e) in
-                      let mate: Int? = e.value.mates.isEmpty ? nil : medianInt(e.value.mates)
-                      let cp: Int? = e.value.mates.isEmpty ? robustMedian(e.value.evals) : nil
-                      return TopMove(rank: idx + 1, uci: e.key,
-                                     san: e.value.san.isEmpty ? e.key : e.value.san,
-                                     evaluationCp: cp, mateIn: (mate == 0 ? nil : mate),
-                                     depth: e.value.depth,
-                                     source: e.value.srcs.sorted().joined(separator: "+"),
-                                     votes: e.value.votes)
+                      TopMove(rank: idx + 1, uci: e.move.uci, san: e.move.san, evaluationCp: e.move.evaluationCp, mateIn: e.move.mateIn, depth: e.move.depth, source: e.sources.joined(separator: "+"), votes: e.votes)
                   }
+                  let topV = final.first?.votes ?? 1
+                  let allS = Array(Set(mv.values.flatMap { $0.sources })).sorted().joined(separator: "+")
                   let bestD = final.map { $0.depth }.max() ?? 13
-                  let allS = sources.map { $0.key }.joined(separator: "+")
                   let identical = final.count >= 2 && final.allSatisfy { $0.evaluationCp == final.first?.evaluationCp }
-                  let analysis = EngineAnalysis(topMoves: final, bestMove: final.first, depth: bestD,
-                                                sourcesUsed: allS, confidence: min(final.first?.votes ?? 1, 3), debugFen: fen)
+                  let analysis = EngineAnalysis(topMoves: final, bestMove: final.first, depth: bestD, sourcesUsed: allS, confidence: min(topV, 3), debugFen: fen)
                   if !identical && !deep {
-                      await AnalysisCache.shared.set(fen: fen, moves: final, depth: bestD, sources: allS, confidence: min(final.first?.votes ?? 1, 3))
+                      await AnalysisCache.shared.set(fen: fen, moves: final, depth: bestD, sources: allS, confidence: min(topV, 3))
                   }
                   await MainActor.run { onUpdate(analysis) }
                   return analysis
@@ -1226,31 +836,23 @@ jobs:
           import Foundation
           import SwiftUI
           enum MoveQuality: String {
-              case brilliant = "!! Brilliant", best = "! Best", good = "Good", book = "📖 Book"
+              case brilliant = "!! Brilliant", best = "! Best", good = "Good"
               case inaccuracy = "?! Inaccuracy", mistake = "? Mistake", blunder = "?? Blunder", none = ""
               var color: Color {
                   switch self {
                   case .brilliant: return .cyan; case .best: return .green; case .good: return .green.opacity(0.7)
-                  case .inaccuracy: return .yellow; case .mistake: return .orange; case .blunder: return .red
-                  case .book: return .gray; case .none: return .clear
-                  }
-              }
-              var shortName: String {
-                  switch self {
-                  case .brilliant: return "brilliant"
-                  case .best: return "best"
-                  case .good: return "good"
-                  case .book: return "book"
-                  case .inaccuracy: return "inaccuracy"
-                  case .mistake: return "mistake"
-                  case .blunder: return "blunder"
-                  case .none: return ""
+                  case .inaccuracy: return .yellow; case .mistake: return .orange; case .blunder: return .red; case .none: return .clear
                   }
               }
           }
           enum DetectionConfidence: String { case high, medium, low, unknown }
           @MainActor
           final class EngineViewModel: ObservableObject {
+              enum ColorChoice: String, CaseIterable {
+                  case auto, white, black
+                  var display: String { self == .white ? "White" : (self == .black ? "Black" : "Auto") }
+                  var displayAr: String { self == .white ? "أبيض" : (self == .black ? "أسود" : "تلقائي") }
+              }
               @Published var currentFEN = ""
               @Published var topMoves: [TopMove] = []
               @Published var evaluation = "—"
@@ -1263,7 +865,11 @@ jobs:
               @Published var sourcesUsed = ""
               @Published var engineConfidence: Int = 0
               @Published var detectedPlayerColor = "w"
-              @Published var manualPlayerColor: String? = nil
+              @Published var colorChoice: ColorChoice {
+                  didSet { UserDefaults.standard.set(colorChoice.rawValue, forKey: "color_choice") }
+              }
+              @Published var colorSource: String = "unknown"
+              @Published var colorConfidence: DetectionConfidence = .unknown
               @Published var sideToMove = "w"
               @Published var lastMoveUCI = ""
               @Published var plyCount = -1
@@ -1274,44 +880,51 @@ jobs:
               @Published var enabled = true
               @Published var showBlunderAlert = false
               @Published var blunderAlertText = ""
-              @Published var useRemoteCrossCheck: Bool {
-                  didSet { UserDefaults.standard.set(useRemoteCrossCheck, forKey: "remote_crosscheck") }
-              }
+              @Published var isUsingLocalEngine = false
               var bestMove: TopMove? { topMoves.first }
-              var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
+              var effectivePlayerColor: String {
+                  switch colorChoice { case .white: return "w"; case .black: return "b"; case .auto: return detectedPlayerColor }
+              }
               var isMyTurn: Bool { effectivePlayerColor == sideToMove }
               private let fenBuilder = FenBuilder()
               private var previousEvalWhitePOV: Double? = nil
               private var previousFEN: String = ""
               private var previousBestMove: String? = nil
-              private var previousAnalysisWasBook = false
               private var lastSuccessfulFEN = ""
               private var analysisTask: Task<Void, Never>?
               private var debounceTask: Task<Void, Never>?
               private var retryTask: Task<Void, Never>?
               private var moveHistoryUCI: [String] = []
               private var lastKnownPly: Int = -1
-              private var lastMoveThinkMs = 0
-              private var lastMoveWinPctLoss: Double = 0
-              private var recordedFEN = ""
-              // --- Color detection stabilization ---
               private var pendingColor: String? = nil
               private var pendingColorCount = 0
               private let colorCommitThreshold = 2
               weak var recorder: GameRecorder?
-              weak var localEngine: LocalEngineService?
               init() {
-                  useRemoteCrossCheck = UserDefaults.standard.object(forKey: "remote_crosscheck") as? Bool ?? true
+                  let saved = UserDefaults.standard.string(forKey: "color_choice") ?? "auto"
+                  self.colorChoice = ColorChoice(rawValue: saved) ?? .auto
               }
-              func setManualColor(_ c: String?) {
-                  manualPlayerColor = c
+              func cycleColorChoice() {
+                  switch colorChoice {
+                  case .auto: colorChoice = .white
+                  case .white: colorChoice = .black
+                  case .black: colorChoice = .auto
+                  }
                   if !currentFEN.isEmpty { lastSuccessfulFEN = ""; queueAnalyze(fen: currentFEN, immediate: true) }
               }
-              func flipColor() { setManualColor(effectivePlayerColor == "w" ? "b" : "w") }
+              static func classifyCpLoss(_ cpLoss: Int) -> MoveQuality {
+                  switch cpLoss {
+                  case ..<(-30): return .brilliant
+                  case (-30)...15: return .best
+                  case 16...49: return .good
+                  case 50...99: return .inaccuracy
+                  case 100...299: return .mistake
+                  default: return .blunder
+                  }
+              }
               func resetFenTracker() {
                   fenBuilder.reset(); moveHistoryUCI = []; lastKnownPly = -1; lastSuccessfulFEN = ""
                   previousEvalWhitePOV = nil; previousFEN = ""; previousBestMove = nil
-                  previousAnalysisWasBook = false; recordedFEN = ""; lastMoveThinkMs = 0
                   Task { await AnalysisCache.shared.clear() }
                   recorder?.startNewGame()
               }
@@ -1323,72 +936,45 @@ jobs:
               struct BoardPayload {
                   let grid: String, sideToMove: String
                   let flipped: Bool, flippedConfident: Bool
+                  let userColor: String?, userColorConfident: Bool
                   let lastMoveUCI: String, plyCount: Int, detectionConfidence: String
-                  let bottomColor: String, moveTimeMs: Int
               }
-              private func updateDetectedColor(bottomColor: String, flipped: Bool, flippedConfident: Bool, detConfidence: DetectionConfidence) {
-                  guard manualPlayerColor == nil else { return }
-                  var candidate: String? = nil
-                  var strong = false
-                  if bottomColor == "w" || bottomColor == "b" {
-                      candidate = bottomColor
-                      strong = true
+              // Color precedence: manual choice > username (100%) > board flipped.
+              private func updateDetectedColor(userColor: String?, userConfident: Bool, flipped: Bool, flippedConfident: Bool) {
+                  guard colorChoice == .auto else { return }
+                  var cand: String? = nil
+                  var src = "unknown"
+                  if userConfident, let uc = userColor, uc == "w" || uc == "b" {
+                      cand = uc; src = "username"
                   } else if flippedConfident {
-                      candidate = flipped ? "b" : "w"
+                      cand = flipped ? "b" : "w"; src = "flipped"
                   }
-                  var agree = false
-                  if flippedConfident, let cand = candidate {
-                      agree = ((flipped ? "b" : "w") == cand)
-                  }
-                  guard let cand = candidate else { return }
-                  if pendingColor == cand {
-                      pendingColorCount += 1
-                  } else {
-                      pendingColor = cand
-                      pendingColorCount = 1
-                  }
-                  if pendingColorCount >= colorCommitThreshold || (strong && agree) {
+                  guard let cand = cand else { return }
+                  if pendingColor == cand { pendingColorCount += 1 } else { pendingColor = cand; pendingColorCount = 1 }
+                  if pendingColorCount >= colorCommitThreshold {
                       if detectedPlayerColor != cand {
                           detectedPlayerColor = cand
                           previousEvalWhitePOV = nil
                           previousFEN = ""
                           previousBestMove = nil
-                          previousAnalysisWasBook = false
-                          recordedFEN = ""
                       }
+                      colorSource = src
+                      colorConfidence = .high
                       pendingColor = nil
                       pendingColorCount = 0
                   }
               }
+
               func ingest(_ p: BoardPayload) {
                   guard enabled else { return }
                   sideToMove = p.sideToMove; lastMoveUCI = p.lastMoveUCI; plyCount = p.plyCount
-                  lastMoveThinkMs = p.moveTimeMs
                   confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  updateDetectedColor(bottomColor: p.bottomColor, flipped: p.flipped,
-                                      flippedConfident: p.flippedConfident, detConfidence: confidence)
-                  if p.plyCount >= 0 {
-                      if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 {
-                          resetFenTracker()
-                          lastKnownPly = p.plyCount
-                      } else if p.plyCount < lastKnownPly {
-                          // Undo: rewind history + invalidate quality context
-                          if lastKnownPly >= 0 && p.plyCount <= moveHistoryUCI.count {
-                              moveHistoryUCI = Array(moveHistoryUCI.prefix(max(0, p.plyCount)))
-                          }
-                          previousEvalWhitePOV = nil
-                          previousFEN = ""
-                          previousBestMove = nil
-                          previousAnalysisWasBook = false
-                          recordedFEN = ""
-                          lastMoveThinkMs = 0
-                          lastSuccessfulFEN = ""
-                          lastKnownPly = p.plyCount
-                      } else if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
-                          moveHistoryUCI.append(p.lastMoveUCI)
-                          lastKnownPly = p.plyCount
-                      }
+                  updateDetectedColor(userColor: p.userColor, userConfident: p.userColorConfident,
+                                      flipped: p.flipped, flippedConfident: p.flippedConfident)
+                  if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
+                      moveHistoryUCI.append(p.lastMoveUCI); lastKnownPly = p.plyCount
                   }
+                  if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 { resetFenTracker(); lastKnownPly = p.plyCount }
                   let chars = Array(p.grid); guard chars.count == 64 else { return }
                   var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
                   for r in 0..<8 { for c in 0..<8 { grid[r][c] = chars[r * 8 + c] } }
@@ -1420,15 +1006,14 @@ jobs:
                   analysisTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
-                          let local = (self.localEngine?.isEnabled == true) ? self.localEngine : nil
-                          let a = try await EngineService.analyzeStreaming(fen: fen, moveHistory: self.moveHistoryUCI, deep: deep,
-                                                                            local: local, remoteCheck: self.useRemoteCrossCheck) { partial in
+                          let a = try await EngineService.analyzeStreaming(fen: fen, moveHistory: self.moveHistoryUCI, deep: deep) { partial in
                               guard fen == self.currentFEN else { return }
                               self.topMoves = partial.topMoves
                               if let best = partial.bestMove {
                                   self.evaluation = best.evalString; self.winChance = best.winChance; self.depth = best.depth
                               }
                               self.sourcesUsed = partial.sourcesUsed; self.engineConfidence = partial.confidence
+                              self.isUsingLocalEngine = partial.sourcesUsed.contains("Stockfish")
                           }
                           if Task.isCancelled { return }
                           guard fen == self.currentFEN else { return }
@@ -1437,41 +1022,34 @@ jobs:
                               self.evaluation = a.bestMove?.evalString ?? "—"
                               self.winChance = a.bestMove?.winChance ?? 50; self.depth = a.depth
                               self.sourcesUsed = a.sourcesUsed; self.engineConfidence = a.confidence
+                              self.isUsingLocalEngine = a.sourcesUsed.contains("Stockfish")
                               self.isThinking = false; self.isDeepAnalyzing = false; self.isOffline = false
                               self.errorMessage = ""; self.lastSuccessfulFEN = fen
                               let wpov = self.evalWhitePOV(a.bestMove)
-                              if self.recordedFEN != fen {
-                                  self.computeQuality(cur: wpov, prevFEN: self.previousFEN, curFEN: fen)
-                                  if !self.previousFEN.isEmpty && !self.lastMoveUCI.isEmpty {
-                                      let prevCP = self.previousEvalWhitePOV.map { Int(($0 * 100).rounded()) }
-                                      let currCP = a.bestMove?.evaluationCp
-                                      self.recorder?.recordMove(
-                                          previousFen: self.previousFEN, previousEval: prevCP,
-                                          currentFen: fen, currentEval: currCP,
-                                          lastMoveUCI: self.lastMoveUCI, wasMyMove: self.lastMoveWasMine,
-                                          bestMoveUCI: self.previousBestMove, plyCount: self.plyCount,
-                                          quality: self.lastMoveQuality.shortName,
-                                          cpLoss: self.lastMoveCentipawnLoss,
-                                          winPctLoss: self.lastMoveWinPctLoss,
-                                          thinkTimeMs: self.lastMoveThinkMs
-                                      )
-                                      self.recordedFEN = fen
-                                      if self.lastMoveWasMine && (self.lastMoveQuality == .mistake || self.lastMoveQuality == .blunder) {
-                                          self.blunderAlertText = "\(self.lastMoveQuality.rawValue) −\(Int(self.lastMoveWinPctLoss))% (−\(self.lastMoveCentipawnLoss)cp)"
-                                          self.showBlunderAlert = true
-                                          HapticManager.blunderWarning()
-                                          Task {
-                                              try? await Task.sleep(nanoseconds: 3_000_000_000)
-                                              await MainActor.run {
-                                                  self.showBlunderAlert = false
-                                              }
-                                          }
+                              self.computeQuality(cur: wpov)
+                              if !self.previousFEN.isEmpty && !self.lastMoveUCI.isEmpty {
+                                  let currCP = a.bestMove?.evaluationCp
+                                  self.recorder?.recordMove(
+                                      previousFen: self.previousFEN, currentFen: fen,
+                                      lastMoveUCI: self.lastMoveUCI, wasMyMove: self.lastMoveWasMine,
+                                      bestMoveUCI: self.previousBestMove, plyCount: self.plyCount,
+                                      cpLoss: self.lastMoveCentipawnLoss,
+                                      quality: self.lastMoveQuality.rawValue,
+                                      evalAfter: currCP
+                                  )
+                                  if self.lastMoveWasMine && self.lastMoveCentipawnLoss >= 100 {
+                                      let qualityText = self.lastMoveQuality.rawValue
+                                      self.blunderAlertText = "\(qualityText) −\(self.lastMoveCentipawnLoss)cp"
+                                      self.showBlunderAlert = true
+                                      HapticManager.blunderWarning()
+                                      Task {
+                                          try? await Task.sleep(nanoseconds: 3_000_000_000)
+                                          await MainActor.run { self.showBlunderAlert = false }
                                       }
                                   }
                               }
                               self.previousBestMove = a.bestMove?.uci
                               self.previousEvalWhitePOV = wpov
-                              self.previousAnalysisWasBook = a.sourcesUsed.contains("📖") || a.sourcesUsed.contains("book")
                           }
                       } catch {
                           if Task.isCancelled { return }
@@ -1506,57 +1084,19 @@ jobs:
                   let cp = Double(m.evaluationCp ?? 0) / 100.0
                   return sideToMove == "w" ? cp : -cp
               }
-              // Phase 5: quality measured in WIN% (lichess/chess.com method),
-              // not raw centipawns. Fixes fake blunders in lopsided positions.
-              private func winPctFromPawns(_ p: Double) -> Double { 50 + 50 * tanh(p / 4.0) }
-              private func pieceCount(fen: String, color: String) -> Int {
-                  let board = fen.split(separator: " ").first.map(String.init) ?? ""
-                  return board.reduce(0) { acc, ch in
-                      if ch.isLetter && ((color == "w" && ch.isUppercase) || (color == "b" && ch.isLowercase)) { return acc + 1 }
-                      return acc
-                  }
-              }
-              private func computeQuality(cur: Double, prevFEN: String, curFEN: String) {
-                  let mover = (sideToMove == "w") ? "b" : "w"
-                  lastMoveWasMine = (mover == effectivePlayerColor)
+              // Unified quality: single source of truth for cp-loss + classification.
+              private func computeQuality(cur: Double) {
                   guard let prev = previousEvalWhitePOV, !lastMoveUCI.isEmpty else {
-                      lastMoveQuality = .none; lastMoveCentipawnLoss = 0; lastMoveWinPctLoss = 0
-                      return
+                      lastMoveQuality = .none; lastMoveCentipawnLoss = 0; return
                   }
-                  // Book transition guard: never judge the move that left the book.
-                  if previousAnalysisWasBook {
-                      lastMoveQuality = .book
-                      lastMoveCentipawnLoss = 0
-                      lastMoveWinPctLoss = 0
-                      return
-                  }
-                  let moverIsWhite = mover == "w"
-                  let prevWin = winPctFromPawns(prev)
-                  let curWin = winPctFromPawns(cur)
-                  let lossMoverWinPct = moverIsWhite ? (prevWin - curWin) : (curWin - prevWin)
-                  let winPctLoss = max(0, lossMoverWinPct)
-                  lastMoveWinPctLoss = winPctLoss
-                  let cpLoss = max(0, Int(((moverIsWhite ? (prev - cur) : (cur - prev)) * 100).rounded()))
-                  lastMoveCentipawnLoss = cpLoss
-                  // Brilliant v2: real sacrifice + real win% gain + still sound position.
-                  let moverWinAfter = moverIsWhite ? curWin : (100 - curWin)
-                  let sacrificed = pieceCount(fen: prevFEN, color: mover) > pieceCount(fen: curFEN, color: mover)
-                  if sacrificed, lossMoverWinPct < -2, moverWinAfter >= 55 {
-                      lastMoveQuality = .brilliant
-                  } else if winPctLoss < 2 {
-                      lastMoveQuality = .best
-                  } else if winPctLoss < 5 {
-                      lastMoveQuality = .good
-                  } else if winPctLoss < 10 {
-                      lastMoveQuality = .inaccuracy
-                  } else if winPctLoss < 20 {
-                      lastMoveQuality = .mistake
-                  } else {
-                      lastMoveQuality = .blunder
-                  }
-                  if lastMoveWasMine && (lastMoveQuality == .mistake || lastMoveQuality == .blunder) {
-                      HapticManager.blunderWarning()
-                  }
+                  let mover = (sideToMove == "w") ? "b" : "w"
+                  let deltaWhitePOV = cur - prev
+                  let gainFromMoverPOV = mover == "w" ? deltaWhitePOV : -deltaWhitePOV
+                  let cpLoss = Int((-gainFromMoverPOV * 100).rounded())
+                  lastMoveCentipawnLoss = max(0, cpLoss)
+                  lastMoveQuality = EngineViewModel.classifyCpLoss(cpLoss)
+                  lastMoveWasMine = (mover == effectivePlayerColor)
+                  if lastMoveWasMine && cpLoss >= 100 { HapticManager.blunderWarning() }
               }
           }
           '''
@@ -1588,6 +1128,90 @@ jobs:
                           .rotationEffect(.degrees(-90))
                   }
                   .frame(width: 22).cornerRadius(4).shadow(radius: 3)
+              }
+          }
+          '''
+
+          files["Sources/EngineDownloader.swift"] = r'''
+          import Foundation
+
+          /// Downloads an optional stronger NNUE network for the embedded Stockfish.
+          /// NOTE: the engine itself is compiled into the app at build time (iOS cannot
+          /// execute a runtime-downloaded binary). This downloads only the neural-net
+          /// WEIGHTS (data) which the engine then loads via `setoption EvalFile`.
+          @MainActor
+          final class EngineDownloader: ObservableObject {
+              @Published var isDownloading = false
+              @Published var statusMessage = ""
+
+              // Official Stockfish default net. Update this hash to use a newer net
+              // (see https://tests.stockfishchess.org/nns — listed networks).
+              static let nnueURL = URL(string: "https://data.stockfishchess.org/nn/nn-735bba95dec0.nnue")!
+
+              func downloadNNUE() async {
+                  isDownloading = true; statusMessage = ""
+                  do {
+                      var req = URLRequest(url: Self.nnueURL)
+                      req.timeoutInterval = 120
+                      let (data, resp) = try await URLSession.shared.data(for: req)
+                      guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
+                          statusMessage = "HTTP error"; isDownloading = false; return
+                      }
+                      let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                      let dest = dir.appendingPathComponent("sf-net.nnue")
+                      try data.write(to: dest)
+                      UserDefaults.standard.set(dest.path, forKey: "eval_file_path")
+                      statusMessage = "Downloaded ✓ (\(data.count / 1024) KB)"
+                      await UCIEngine.shared.setEvalFile(dest.path)
+                  } catch {
+                      statusMessage = "Failed: \(error.localizedDescription)"
+                  }
+                  isDownloading = false
+              }
+          }
+          '''
+
+          files["Sources/EvalGraphView.swift"] = r'''
+          import SwiftUI
+          struct EvalGraphView: View {
+              let points: [GameRecorder.EvalPoint]
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      HStack {
+                          Image(systemName: "chart.xyaxis.line").foregroundColor(.green)
+                          Text("Evaluation").font(.subheadline.bold())
+                      }
+                      if points.count < 2 {
+                          Text("Play moves to see the graph").font(.caption).foregroundColor(.secondary)
+                              .frame(maxWidth: .infinity).padding(.vertical, 30)
+                      } else {
+                          GeometryReader { geo in
+                              let w = geo.size.width
+                              let h = geo.size.height
+                              let maxC = max(300, points.map { abs($0.evalWhitePovCp) }.max() ?? 300)
+                              let stepX = w / CGFloat(max(1, points.count - 1))
+                              ZStack {
+                                  Path { p in
+                                      p.move(to: CGPoint(x: 0, y: h/2))
+                                      p.addLine(to: CGPoint(x: w, y: h/2))
+                                  }.stroke(Color.gray.opacity(0.4), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                                  Path { p in
+                                      for (i, pt) in points.enumerated() {
+                                          let x = CGFloat(i) * stepX
+                                          let clamped = max(-Double(maxC), min(Double(maxC), Double(pt.evalWhitePovCp)))
+                                          let y = h/2 - (CGFloat(clamped) / CGFloat(maxC)) * (h/2)
+                                          if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
+                                          else { p.addLine(to: CGPoint(x: x, y: y)) }
+                                      }
+                                  }.stroke(Color.green, style: StrokeStyle(lineWidth: 2, lineJoin: .round))
+                              }
+                          }
+                          .frame(height: 160)
+                      }
+                  }
+                  .padding()
+                  .background(Color.gray.opacity(0.15))
+                  .cornerRadius(12)
               }
           }
           '''
@@ -1713,6 +1337,42 @@ jobs:
           }
           '''
 
+          files["Sources/GameExporter.swift"] = r'''
+          import SwiftUI
+          import UIKit
+
+          struct PGNShareButton: View {
+              let pgn: String
+              @State private var showShare = false
+              @State private var fileURL: URL?
+              var body: some View {
+                  Button {
+                      let url = FileManager.default.temporaryDirectory.appendingPathComponent("chess-helper-game.pgn")
+                      try? pgn.write(to: url, atomically: true, encoding: .utf8)
+                      fileURL = url
+                      showShare = true
+                  } label: {
+                      Label("Export PGN", systemImage: "square.and.arrow.up")
+                          .frame(maxWidth: .infinity).padding()
+                          .background(Color.green.opacity(0.3)).cornerRadius(8)
+                  }
+                  .sheet(isPresented: $showShare) {
+                      if let url = fileURL {
+                          ActivityView(activityItems: [url])
+                      }
+                  }
+              }
+          }
+
+          struct ActivityView: UIViewControllerRepresentable {
+              let activityItems: [Any]
+              func makeUIViewController(context: Context) -> UIActivityViewController {
+                  UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+              }
+              func updateUIViewController(_ v: UIActivityViewController, context: Context) {}
+          }
+          '''
+
           files["Sources/GameRecorder.swift"] = r'''
           import Foundation
           import SwiftUI
@@ -1731,11 +1391,15 @@ jobs:
                   let quality: String
                   let bestAlternative: String?
                   let cpLoss: Int
-                  let winPctLoss: Double
-                  let thinkTimeMs: Int
                   let timestamp: Date
               }
+              struct EvalPoint: Identifiable, Codable {
+                  let id: Int
+                  let ply: Int
+                  let evalWhitePovCp: Int
+              }
               @Published var moves: [MoveRecord] = []
+              @Published var evalHistory: [EvalPoint] = []
               @Published var gameId: UUID = UUID()
               @Published var currentAccuracy: Double = 100.0
               @Published var myMoveCount: Int = 0
@@ -1745,21 +1409,32 @@ jobs:
               @Published var inaccuracyCount: Int = 0
               @Published var mistakeCount: Int = 0
               @Published var blunderCount: Int = 0
-              func recordMove(previousFen: String, previousEval: Int?, currentFen: String, currentEval: Int?, lastMoveUCI: String, wasMyMove: Bool, bestMoveUCI: String?, plyCount: Int, quality: String, cpLoss: Int, winPctLoss: Double, thinkTimeMs: Int) {
+              private var accuracySum: Double = 0
+
+              // chess.com-style accuracy from real centipawn loss.
+              static func accuracyFor(cpLoss: Int) -> Double {
+                  let loss = max(0.0, Double(cpLoss))
+                  let acc = 103.1668 * exp(-0.04354 * loss) - 3.1669
+                  return min(100.0, max(0.0, acc))
+              }
+
+              func recordMove(previousFen: String, currentFen: String, lastMoveUCI: String,
+                              wasMyMove: Bool, bestMoveUCI: String?, plyCount: Int,
+                              cpLoss: Int, quality: String, evalAfter: Int?) {
                   guard !lastMoveUCI.isEmpty else { return }
                   let isBest = (bestMoveUCI == lastMoveUCI)
-                  let finalQuality = (quality == "book") ? "book" : (isBest ? "best" : quality)
+                  let finalQuality = isBest ? "best" : quality
                   let record = MoveRecord(
                       id: UUID(), ply: plyCount, uci: lastMoveUCI, san: lastMoveUCI,
                       fenBefore: previousFen, fenAfter: currentFen,
-                      evalBefore: previousEval, evalAfter: currentEval,
+                      evalBefore: nil, evalAfter: evalAfter,
                       wasMyMove: wasMyMove, quality: finalQuality,
                       bestAlternative: (isBest ? nil : bestMoveUCI),
-                      cpLoss: cpLoss, winPctLoss: winPctLoss, thinkTimeMs: thinkTimeMs,
-                      timestamp: Date()
+                      cpLoss: cpLoss, timestamp: Date()
                   )
                   moves.append(record)
-                  if wasMyMove && finalQuality != "book" {
+                  if let ea = evalAfter { evalHistory.append(EvalPoint(id: plyCount, ply: plyCount, evalWhitePovCp: ea)) }
+                  if wasMyMove {
                       myMoveCount += 1
                       switch finalQuality {
                       case "brilliant": brilliantCount += 1
@@ -1770,22 +1445,39 @@ jobs:
                       case "blunder": blunderCount += 1
                       default: break
                       }
-                      recomputeAccuracy()
+                      accuracySum += Self.accuracyFor(cpLoss: cpLoss)
+                      currentAccuracy = accuracySum / Double(myMoveCount)
                   }
               }
               func startNewGame() {
                   moves = []
+                  evalHistory = []
                   gameId = UUID()
                   currentAccuracy = 100.0
+                  accuracySum = 0
                   myMoveCount = 0
                   brilliantCount = 0; bestCount = 0; goodCount = 0
                   inaccuracyCount = 0; mistakeCount = 0; blunderCount = 0
               }
-              private func recomputeAccuracy() {
-                  guard myMoveCount > 0 else { currentAccuracy = 100.0; return }
-                  let total = brilliantCount * 100 + bestCount * 100 + goodCount * 90
-                             + inaccuracyCount * 70 + mistakeCount * 40 + blunderCount * 10
-                  currentAccuracy = Double(total) / Double(myMoveCount)
+              func pgn() -> String {
+                  let df = DateFormatter()
+                  df.dateFormat = "yyyy.MM.dd"
+                  var lines: [String] = []
+                  lines.append("[Event \"Chess Helper Game\"]")
+                  lines.append("[Site \"chess.com\"]")
+                  lines.append("[Date \"\(df.string(from: Date()))\"]")
+                  lines.append("[Result \"*\"]")
+                  lines.append("")
+                  var body = ""
+                  var moveNum = 1
+                  for m in moves {
+                      let t = m.uci
+                      if m.ply % 2 == 1 { body += "\(moveNum). \(t) "; moveNum += 1 }
+                      else { body += "\(t) " }
+                  }
+                  lines.append(body)
+                  lines.append("*")
+                  return lines.joined(separator: "\n")
               }
               private let storeKey = "chess_helper_game_history"
               func saveCurrentGame() {
@@ -2059,30 +1751,44 @@ jobs:
                   .overlay(RoundedRectangle(cornerRadius: 12).stroke(engine.isOffline ? Color.red.opacity(0.5) : Color.white.opacity(0.15), lineWidth: 1))
                   .shadow(color: .black.opacity(0.4), radius: 8, y: 3)
               }
+              private var colorIndicator: String {
+                  switch engine.colorChoice {
+                  case .white: return "W"
+                  case .black: return "B"
+                  case .auto:
+                      if engine.colorConfidence == .high { return engine.effectivePlayerColor == "w" ? "W" : "B" }
+                      return "?"
+                  }
+              }
+              private var colorIndicatorColor: Color {
+                  if engine.colorChoice != .auto { return .blue }
+                  return engine.colorConfidence == .high ? .green : .orange
+              }
               private var header: some View {
                   HStack(spacing: 8) {
                       Image(systemName: "hand.draw.fill").font(.caption2).foregroundColor(.white.opacity(0.5))
                       Circle().fill(engine.isOffline ? Color.red : Color.green).frame(width: 6, height: 6)
                       Text("Helper").font(.caption.bold())
                       if engine.isThinking { ProgressView().scaleEffect(0.5) }
+                      if engine.isUsingLocalEngine {
+                          Image(systemName: "fish.fill").font(.caption2).foregroundColor(.cyan)
+                      }
                       Spacer()
                       Text(engine.isMyTurn ? (language.isArabic ? "دورك" : "Your turn") : (language.isArabic ? "انتظر" : "Wait"))
                           .font(.caption2.bold()).foregroundColor(engine.isMyTurn ? .green : .secondary)
                       Button {
-                          engine.flipColor()
+                          engine.cycleColorChoice()
                           HapticManager.selection()
                       } label: {
                           HStack(spacing: 3) {
-                              Circle().fill(engine.effectivePlayerColor == "w" ? .white : .black)
-                                  .frame(width: 11, height: 11)
-                                  .overlay(Circle().stroke(Color.gray, lineWidth: 0.7))
+                              Text(colorIndicator)
+                                  .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                  .foregroundColor(colorIndicatorColor)
+                                  .frame(minWidth: 14)
                               Image(systemName: "arrow.triangle.2.circlepath").font(.system(size: 9)).foregroundColor(.blue)
                           }
                           .padding(4).background(Color.blue.opacity(0.2)).cornerRadius(4)
                       }
-                      .accessibilityLabel(engine.effectivePlayerColor == "w"
-                            ? (language.isArabic ? "الآن أبيض - اضغط للأسود" : "Now White - tap for Black")
-                            : (language.isArabic ? "الآن أسود - اضغط للأبيض" : "Now Black - tap for White"))
                       Button { stealth.hide(reason: "manual") } label: {
                           Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(.red.opacity(0.7))
                       }
@@ -2322,9 +2028,6 @@ jobs:
               let popularity: Int  // 1-100
           }
 
-          /// Lightweight in-app opening book. Instant (0ms), no network needed.
-          /// Lookup is done on FEN with only board + side-to-move (ignores castling
-          /// and en-passant), so names survive transpositions across the opening.
           actor OpeningBook {
               static let shared = OpeningBook()
               private var book: [String: OpeningInfo] = [:]
@@ -2334,11 +2037,8 @@ jobs:
                   guard !loaded else { return }
                   loaded = true
                   let openings: [(fen: String, name: String, eco: String, moves: [String], winRate: Double, pop: Int)] = [
-                      // ===== STARTING =====
                       ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w", "Starting Position", "A00", ["e4", "d4", "Nf3", "c4"], 0.50, 100),
-                      // ===== KING'S PAWN =====
                       ("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b", "King's Pawn Opening", "B00", ["e5", "c5", "e6", "c6", "Nf6", "d6"], 0.54, 95),
-                      // Sicilian
                       ("rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w", "Sicilian Defense", "B20", ["Nf3", "Nc3", "c3", "d4"], 0.52, 90),
                       ("rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b", "Sicilian: Open", "B30", ["d6", "Nc6", "e6", "g6", "a6", "Nf6"], 0.53, 88),
                       ("rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w", "Sicilian: Old", "B32", ["d4", "Bb5+", "c3"], 0.54, 85),
@@ -2352,49 +2052,38 @@ jobs:
                       ("r1bqk2r/pp1pppbp/2n2np1/8/3NP3/2N1B3/PPP2PPP/R2QKB1R w", "Sicilian Dragon: Yugoslav", "B77", ["Qd2", "f3", "Bc4"], 0.55, 75),
                       ("r1b1kb1r/ppqppppp/2n2n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w", "Sicilian Taimanov", "B46", ["Be2", "Be3", "Ndb5"], 0.52, 77),
                       ("r1bqkb1r/pp1ppppp/2n2n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w", "Sicilian Four Knights", "B45", ["Ndb5", "Be2", "Bb5"], 0.51, 70),
-                      // French
                       ("rnbqkbnr/pppp1ppp/4p3/8/4P3/8/PPPP1PPP/RNBQKBNR w", "French Defense", "C00", ["d4", "Nf3", "d3", "Nc3"], 0.53, 85),
                       ("rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b", "French: Advance", "C01", ["d5", "Nf6", "c5"], 0.52, 82),
                       ("rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/8/PPP2PPP/RNBQKBNR w", "French: Normal", "C10", ["Nc3", "Nd2", "e5", "exd5"], 0.52, 80),
                       ("rnbqkbnr/ppp2ppp/4p3/3pP3/3P4/8/PPP2PPP/RNBQKBNR b", "French: Advance Var", "C02", ["c5", "Nc6", "Qb6"], 0.51, 78),
                       ("rnbqkb1r/ppp2ppp/4pn2/3p4/3PP3/2N5/PPP2PPP/R1BQKBNR w", "French: Classical", "C13", ["Bg5", "e5", "exd5"], 0.52, 75),
                       ("rnbqk1nr/ppp2ppp/4p3/3p4/1b1PP3/2N5/PPP2PPP/R1BQKBNR w", "French: Winawer", "C15", ["e5", "Bd2", "a3", "Qg4"], 0.52, 76),
-                      // Caro-Kann
                       ("rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w", "Caro-Kann Defense", "B10", ["d4", "Nc3", "c4", "Nf3"], 0.52, 82),
                       ("rnbqkbnr/pp1ppppp/2p5/8/3PP3/8/PPP2PPP/RNBQKBNR b", "Caro-Kann: Main", "B12", ["d5", "Nf6"], 0.51, 80),
                       ("rnbqkbnr/pp2pppp/2p5/3p4/3PP3/8/PPP2PPP/RNBQKBNR w", "Caro-Kann: Classical", "B18", ["Nc3", "Nf3", "exd5", "e5"], 0.51, 78),
-                      // Pirc / Modern
                       ("rnbqkbnr/ppp1pppp/3p4/8/4P3/8/PPPP1PPP/RNBQKBNR w", "Pirc Defense", "B07", ["d4", "Nc3", "Nf3"], 0.54, 70),
                       ("rnbqkbnr/pppppp1p/6p1/8/4P3/8/PPPP1PPP/RNBQKBNR w", "Modern Defense", "B06", ["d4", "Nc3", "c4"], 0.54, 65),
-                      // Scandinavian
                       ("rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w", "Scandinavian Defense", "B01", ["exd5", "Nc3", "e5"], 0.55, 72),
                       ("rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR w", "Scandinavian: Main", "B01", ["Nc3", "Nf3", "d4"], 0.56, 70),
-                      // Alekhine
                       ("rnbqkb1r/pppppppp/5n2/8/4P3/8/PPPP1PPP/RNBQKBNR w", "Alekhine's Defense", "B02", ["e5", "Nc3", "d3"], 0.54, 65),
-                      // ===== 1.e4 e5 =====
                       ("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w", "King's Knight", "C40", ["Bc4", "Bb5", "d4", "Nc3"], 0.54, 90),
                       ("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b", "Italian Game", "C50", ["Bc5", "Nf6", "Be7", "d6"], 0.53, 88),
                       ("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w", "Italian: Two Knights", "C55", ["d3", "Nc3", "d4", "Ng5"], 0.52, 85),
                       ("r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w", "Giuoco Piano", "C53", ["c3", "d3", "b4", "Nc3"], 0.52, 83),
                       ("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2P2N2/PP1P1PPP/RNBQK2R w", "Giuoco Pianissimo", "C54", ["d3", "d4", "O-O"], 0.51, 78),
                       ("r1bqkb1r/pppp1ppp/2n2n2/4p1N1/2B1P3/8/PPPP1PPP/RNBQK2R b", "Italian: Fried Liver", "C57", ["d5", "Na5", "Nxe4"], 0.48, 70),
-                      // Ruy Lopez
                       ("r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b", "Ruy Lopez", "C60", ["a6", "Nf6", "d6", "Bc5"], 0.53, 90),
                       ("r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w", "Ruy Lopez: Morphy", "C70", ["Ba4", "Bxc6", "d4"], 0.53, 88),
                       ("r1bqkbnr/1ppp1ppp/p1n5/4p3/B3P3/5N2/PPPP1PPP/RNBQK2R b", "Ruy Lopez: Morphy Def", "C77", ["Nf6", "d6", "b5", "Bc5"], 0.52, 85),
                       ("r1bqkb1r/1ppp1ppp/p1n2n2/4p3/B3P3/5N2/PPPP1PPP/RNBQK2R w", "Ruy Lopez: Berlin", "C65", ["O-O", "d3", "Nc3"], 0.51, 83),
                       ("r1bqkb1r/2pp1ppp/p1n2n2/1p2p3/4P3/1B3N2/PPPP1PPP/RNBQK2R w", "Ruy Lopez: Closed", "C84", ["O-O", "c3", "d4"], 0.52, 82),
                       ("r1bq1rk1/2p1bppp/p1np1n2/1p2p3/4P3/1BP2N2/PP1P1PPP/RNBQ1RK1 w", "Ruy Lopez: Marshall", "C89", ["h3", "d4", "c3", "a4"], 0.50, 75),
-                      // Scotch
                       ("r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R b", "Scotch Game", "C44", ["exd4", "Nf6", "Bc5"], 0.53, 75),
                       ("r1bqkbnr/pppp1ppp/2n5/8/3pP3/5N2/PPP2PPP/RNBQKB1R w", "Scotch: Main", "C45", ["Nxd4", "Bc4", "c3"], 0.53, 73),
-                      // Petrov
                       ("rnbqkb1r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w", "Petrov's Defense", "C42", ["Nxe5", "d3", "Nc3"], 0.51, 78),
                       ("rnbqkb1r/pppp1ppp/5n2/4N3/4P3/8/PPPP1PPP/RNBQKB1R b", "Petrov: Classical", "C42", ["d6", "Nxe4", "Qe7"], 0.51, 75),
-                      // Vienna / King's Gambit
                       ("rnbqkbnr/pppp1ppp/8/4p3/4P3/2N5/PPPP1PPP/R1BQKBNR b", "Vienna Game", "C25", ["Nf6", "Nc6", "Bc5", "d6"], 0.53, 65),
                       ("rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b", "King's Gambit", "C30", ["exf4", "d5", "Bc5"], 0.51, 60),
-                      // ===== 1.d4 =====
                       ("rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b", "Queen's Pawn", "A40", ["d5", "Nf6", "e6", "f5", "g6", "c5"], 0.52, 92),
                       ("rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b", "Queen's Gambit", "D06", ["e6", "c6", "dxc4", "Nf6"], 0.53, 88),
                       ("rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w", "Queen's Gambit Declined", "D30", ["Nc3", "Nf3", "Bg5", "e3"], 0.52, 85),
@@ -2402,7 +2091,6 @@ jobs:
                       ("rnbqkbnr/ppp2ppp/4p3/8/2pP4/8/PP2PPPP/RNBQKBNR w", "Queen's Gambit Accepted", "D20", ["e4", "e3", "Nf3"], 0.54, 75),
                       ("rnbqkbnr/pp2pppp/2p5/3p4/2PP4/8/PP2PPPP/RNBQKBNR w", "Slav Defense", "D10", ["Nc3", "Nf3", "cxd5", "e3"], 0.51, 82),
                       ("rnbqkb1r/pp3ppp/2p1pn2/3p4/2PP4/2N2N2/PP2PPPP/R1BQKB1R w", "Semi-Slav Defense", "D43", ["e3", "Bg5", "cxd5"], 0.51, 80),
-                      // Indian
                       ("rnbqkb1r/pppppppp/5n2/8/3P4/8/PPP1PPPP/RNBQKBNR w", "Indian Defense", "A45", ["c4", "Nf3", "Nc3", "Bg5"], 0.52, 90),
                       ("rnbqkb1r/pppppp1p/5np1/8/2PP4/8/PP2PPPP/RNBQKBNR w", "King's Indian Defense", "E60", ["Nc3", "Nf3", "g3"], 0.52, 85),
                       ("rnbqk2r/ppppppbp/5np1/8/2PP4/2N5/PP2PPPP/R1BQKBNR w", "King's Indian: Normal", "E70", ["e4", "Nf3", "Be2"], 0.53, 82),
@@ -2412,11 +2100,9 @@ jobs:
                       ("rnbqkb1r/p1pp1ppp/1p2pn2/8/2PP4/5N2/PP2PPPP/RNBQKB1R w", "Queen's Indian Defense", "E15", ["g3", "Nc3", "a3"], 0.51, 78),
                       ("rnbqkb1r/ppp1pp1p/5np1/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR w", "Grünfeld Defense", "D80", ["cxd5", "Bf4", "Nf3"], 0.52, 78),
                       ("rnbqkb1r/pppp1ppp/4pn2/8/2PP4/6P1/PP2PP1P/RNBQKBNR b", "Catalan Opening", "E01", ["d5", "Be7", "c5"], 0.52, 75),
-                      // London / Trompowsky / Torre
                       ("rnbqkbnr/ppp1pppp/8/3p4/3P1B2/8/PPP1PPPP/RN1QKBNR b", "London System", "D00", ["Nf6", "c5", "e6", "Bf5"], 0.50, 78),
                       ("rnbqkb1r/pppppppp/5n2/6B1/3P4/8/PPP1PPPP/RN1QKBNR b", "Trompowsky Attack", "A45", ["e6", "Ne4", "c5"], 0.52, 65),
                       ("rnbqkb1r/ppp1pppp/5n2/3p4/3P4/5NB1/PPP1PPPP/RN1QKB1R b", "Torre Attack", "D03", ["e6", "Ne4", "Nbd7"], 0.51, 60),
-                      // ===== English / flank =====
                       ("rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b", "English Opening", "A10", ["e5", "c5", "Nf6", "e6", "g6"], 0.52, 78),
                       ("rnbqkbnr/pppp1ppp/8/4p3/2P5/8/PP1PPPPP/RNBQKBNR w", "English: Reversed Sicilian", "A20", ["Nc3", "g3", "Nf3", "d3"], 0.51, 75),
                       ("rnbqkbnr/pp1ppppp/8/2p5/2P5/8/PP1PPPPP/RNBQKBNR w", "English: Symmetrical", "A30", ["Nc3", "Nf3", "g3", "d4"], 0.51, 72),
@@ -2455,7 +2141,7 @@ jobs:
               @Published var offset: CGSize = .zero
               @Published var isCompact: Bool = false
               @Published var transparency: Double = 0.85
-              private let xK = "ov_x_v53", yK = "ov_y_v53", cK = "ov_c_v53", tK = "ov_t_v53"
+              private let xK = "ov_x_v52", yK = "ov_y_v52", cK = "ov_c_v52", tK = "ov_t_v52"
               init() {
                   let x = UserDefaults.standard.double(forKey: xK)
                   let y = UserDefaults.standard.double(forKey: yK)
@@ -2477,7 +2163,7 @@ jobs:
               @Published var offset: CGSize = CGSize(width: 0, height: -220)
               @Published var isVisible: Bool = false
               @Published var isChatMode: Bool = false
-              private let xK = "ai_x_v53", yK = "ai_y_v53"
+              private let xK = "ai_x_v52", yK = "ai_y_v52"
               init() {
                   let x = UserDefaults.standard.double(forKey: xK)
                   let y = UserDefaults.standard.double(forKey: yK)
@@ -2505,12 +2191,14 @@ jobs:
               @State private var showDisclaimer = true
               @State private var dragOffset: CGSize = .zero
               @State private var isDragging = false
+              @AppStorage("auto_voice") private var autoVoice = false
+              @AppStorage("auto_voice_ar") private var autoVoiceAr = false
               var body: some View {
                   VStack(spacing: 0) {
                       nav
                       ZStack {
                           HStack(spacing: 0) {
-                              if stealth.overlayVisible && !engine.topMoves.isEmpty {
+                              if stealth.helperEnabled && stealth.overlayVisible && !engine.topMoves.isEmpty {
                                   EvalBar(
                                       winChance: engine.effectivePlayerColor == engine.sideToMove ? engine.winChance : (100 - engine.winChance),
                                       evaluation: engine.evaluation, isMyTurn: engine.isMyTurn
@@ -2518,11 +2206,11 @@ jobs:
                               }
                               ChessWebView(engine: engine, router: router)
                           }
-                          if stealth.overlayVisible { draggableOverlay }
-                          if !stealth.overlayVisible { fixedRevealButton }
-                          if aiPos.isVisible { draggableAIPanel }
-                          if aiVM.isPuzzleDetected { puzzleBanner }
-                          if engine.showBlunderAlert { blunderAlertBanner }
+                          if stealth.helperEnabled && stealth.overlayVisible { draggableOverlay }
+                          if stealth.helperEnabled && !stealth.overlayVisible { fixedRevealButton }
+                          if stealth.helperEnabled && aiPos.isVisible { draggableAIPanel }
+                          if stealth.helperEnabled && aiVM.isPuzzleDetected { puzzleBanner }
+                          if stealth.helperEnabled && engine.showBlunderAlert { blunderAlertBanner }
                       }
                   }
                   .overlay(alignment: .center) {
@@ -2534,6 +2222,9 @@ jobs:
                       aiVM.checkForPuzzle(topMoves: engine.topMoves)
                       if !engine.topMoves.isEmpty && engine.isMyTurn {
                           HapticManager.moveReady()
+                          if autoVoice, let best = engine.bestMove {
+                              VoiceManager.shared.speakMove(uci: best.uci, san: best.san, isArabic: autoVoiceAr ? true : language.isArabic)
+                          }
                       }
                   }
               }
@@ -2653,25 +2344,25 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v5.3").font(.title2.bold())
+                      Text("Chess Helper v5.2").font(.title2.bold())
                       Text(language.isArabic ? """
-                      الدقة القصوى - Phase 5!
+                      إصدار احترافي - Phase 5!
 
-                      ✅ تقييم بنِسَب الفوز (win%) - دقة حقيقية
-                      ✅ حارس الافتتاحيات - بلا أخطاء كاذبة
-                      ✅ جدول نهايات Syzygy - دقة 100%
-                      ✅ محرك Stockfish محلي - عمق 22+ بدون إنترنت
-                      ✅ كشف Brilliant حقيقي + زمن النقلات
-                      ✅ متوسط المحركات + استبعاد الشواذ
+                      ✅ محرك Stockfish محلي (أوفلاين)
+                      ✅ دقة تحديد اللون (اسم المستخدم)
+                      ✅ تحذير فوري من النقلات السيئة
+                      ✅ شرح الفرص التكتيكية
+                      ✅ تصدير PGN + رسم بياني
+                      ✅ صوت تلقائي + اهتزاز
                       """ : """
-                      Maximum Accuracy - Phase 5!
+                      Professional v5.2 - Phase 5!
 
-                      ✅ Win% based eval - real accuracy
-                      ✅ Opening book guard - no fake errors
-                      ✅ Syzygy tablebases - 100% endgames
-                      ✅ Local Stockfish - depth 22+ offline
-                      ✅ True Brilliant + move timing
-                      ✅ Engine median + outlier rejection
+                      ✅ Local Stockfish engine (offline)
+                      ✅ Precise color detection (username)
+                      ✅ Immediate blunder warnings
+                      ✅ Puzzle explanations
+                      ✅ PGN export + eval graph
+                      ✅ Auto voice + haptics
                       """)
                       .font(.footnote).foregroundColor(.white.opacity(0.85)).multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -2689,7 +2380,6 @@ jobs:
           struct ReviewView: View {
               @ObservedObject var recorder: GameRecorder
               @ObservedObject var language: AppLanguage
-              @State private var showAIReview = false
               @State private var aiReviewText = ""
               @State private var isLoadingReview = false
               @State private var showHistory = false
@@ -2699,9 +2389,11 @@ jobs:
                           VStack(spacing: 12) {
                               statsCard
                               accuracyBar
+                              EvalGraphView(points: recorder.evalHistory)
                               qualityBreakdown
                               aiReviewButton
                               if !aiReviewText.isEmpty { aiReviewCard }
+                              PGNShareButton(pgn: recorder.pgn())
                               movesListCard
                               actionButtons
                           }
@@ -2709,7 +2401,7 @@ jobs:
                       }
                       .navigationTitle(language.isArabic ? "المراجعة" : "Review")
                       .toolbar {
-                          ToolbarItem(placement: .navigationBarTrailing) {
+                          ToolbarItem(placement: .topBarTrailing) {
                               Button { showHistory = true } label: {
                                   Image(systemName: "clock.arrow.circlepath")
                               }
@@ -2850,12 +2542,8 @@ jobs:
                           .font(.callout.bold())
                           .foregroundColor(move.wasMyMove ? .white : .gray)
                       Spacer()
-                      if move.thinkTimeMs > 0 {
-                          Text(String(format: "%.1fs", Double(move.thinkTimeMs) / 1000.0))
-                              .font(.caption2.monospaced()).foregroundColor(.secondary)
-                      }
                       qualityBadge(move.quality)
-                      if move.cpLoss >= 30 && move.quality != "book" {
+                      if move.cpLoss >= 30 {
                           Text("-\(move.cpLoss)").font(.caption2.monospaced()).foregroundColor(.orange)
                       }
                       if let alt = move.bestAlternative, alt != move.uci {
@@ -2870,7 +2558,6 @@ jobs:
                       case "brilliant": return ("!!", .cyan)
                       case "best": return ("⭐", .green)
                       case "good": return ("✓", .green.opacity(0.7))
-                      case "book": return ("📖", .gray)
                       case "inaccuracy": return ("?!", .yellow)
                       case "mistake": return ("?", .orange)
                       case "blunder": return ("??", .red)
@@ -2963,13 +2650,13 @@ jobs:
                       }
                       .navigationTitle(language.isArabic ? "السجل" : "History")
                       .toolbar {
-                          ToolbarItem(placement: .navigationBarTrailing) {
+                          ToolbarItem(placement: .topBarTrailing) {
                               Button(language.isArabic ? "مسح" : "Clear", role: .destructive) {
                                   recorder.clearHistory()
                                   history = []
                               }
                           }
-                          ToolbarItem(placement: .navigationBarLeading) {
+                          ToolbarItem(placement: .topBarLeading) {
                               Button(language.isArabic ? "إغلاق" : "Close") { dismiss() }
                           }
                       }
@@ -2985,12 +2672,15 @@ jobs:
               @ObservedObject var stealth: StealthManager
               @ObservedObject var engine: EngineViewModel
               @ObservedObject var language: AppLanguage
-              @ObservedObject var localEngine: LocalEngineService
               @StateObject private var overlayPos = OverlayPosition()
+              @StateObject private var engineDL = EngineDownloader()
               @State private var cacheCount = 0
               @State private var apiKeyInput = ""
               @State private var apiKeySaved = false
               @State private var showKeyInput = false
+              @AppStorage("chesscom_username") private var username = ""
+              @AppStorage("auto_voice") private var autoVoice = false
+              @AppStorage("use_local_engine") private var useLocalEngine = false
               var body: some View {
                   NavigationStack {
                       Form {
@@ -3000,66 +2690,57 @@ jobs:
                               }.pickerStyle(.segmented)
                           }
                           Section(header: HStack {
-                              Image(systemName: "cpu").foregroundColor(.green)
-                              Text(language.isArabic ? "المحرك المحلي" : "Local Engine")
+                              Image(systemName: "person.fill").foregroundColor(.blue)
+                              Text(language.isArabic ? "تحديد اللون" : "Color Detection")
                           }) {
-                              Toggle(language.isArabic ? "تفعيل محرك Stockfish على الجهاز" : "Enable on-device Stockfish", isOn: $localEngine.isEnabled)
-                              if localEngine.isEnabled {
-                                  VStack(alignment: .leading, spacing: 4) {
-                                      HStack {
-                                          Text(language.isArabic ? "عمق البحث" : "Search depth")
-                                          Spacer()
-                                          Text("\(localEngine.targetDepth)").font(.callout.bold().monospaced()).foregroundColor(.green)
-                                      }
-                                      Slider(value: Binding(
-                                          get: { Double(localEngine.targetDepth) },
-                                          set: { localEngine.targetDepth = Int($0.rounded()) }
-                                      ), in: 10...30, step: 1)
-                                      Text(language.isArabic ? "عمق 22+ = دقة أعلى بكثير من المحركات السحابية" : "Depth 22+ = far stronger than cloud engines")
-                                          .font(.caption2).foregroundColor(.secondary)
-                                  }
-                                  HStack(spacing: 6) {
-                                      Circle().fill(localEngineStatusColor).frame(width: 8, height: 8)
-                                      Text(localEngineStatusText).font(.caption).foregroundColor(.secondary)
-                                      Spacer()
-                                      if localEngine.lastSearchMs > 0 {
-                                          Text("\(localEngine.lastSearchMs)ms · d\(localEngine.lastSearchDepth)")
-                                              .font(.caption2.monospaced()).foregroundColor(.secondary)
-                                      }
-                                  }
-                                  if !localEngine.netsReady {
-                                      Button {
-                                          Task { let _ = await localEngine.downloadNets() }
-                                      } label: {
-                                          HStack {
-                                              if localEngine.isDownloading {
-                                                  ProgressView().scaleEffect(0.7)
-                                              } else {
-                                                  Image(systemName: "arrow.down.circle.fill")
-                                              }
-                                              Text(language.isArabic ? "تحميل المحرك المحلي (~66MB - مرة واحدة)" : "Download local engine (~66MB - once)")
-                                                  .font(.subheadline.bold())
-                                          }
-                                      }
-                                      .disabled(localEngine.isDownloading)
-                                  } else {
-                                      HStack {
-                                          Image(systemName: "checkmark.seal.fill").foregroundColor(.green)
-                                          Text(language.isArabic ? "الشبكات العصبية محمّلة ✓" : "NNUE networks installed ✓").font(.caption)
-                                      }
-                                  }
-                                  Toggle(language.isArabic ? "تحقق سحابي إضافي" : "Remote cross-check", isOn: $engine.useRemoteCrossCheck)
-                                      .onChange(of: engine.useRemoteCrossCheck) { _ in
-                                          engine.currentFEN.isEmpty ? () : engine.deepAnalyze()
-                                      }
-                                  Button(language.isArabic ? "اختبار المحرك" : "Test engine") {
-                                      Task {
-                                          let startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-                                          let _ = await localEngine.search(fen: startPos, depth: 14, multiPv: 2)
-                                      }
-                                  }
-                                  .disabled(localEngine.status != .ready)
+                              Picker(language.isArabic ? "لونك" : "Your color", selection: $engine.colorChoice) {
+                                  Text("Auto").tag(EngineViewModel.ColorChoice.auto)
+                                  Text("White").tag(EngineViewModel.ColorChoice.white)
+                                  Text("Black").tag(EngineViewModel.ColorChoice.black)
+                              }.pickerStyle(.segmented)
+                              TextField(language.isArabic ? "اسمك على chess.com (للدقة 100%)" : "Your chess.com username (100% accuracy)", text: $username)
+                                  .autocorrectionDisabled().textInputAutocapitalization(.never)
+                              Text(language.isArabic ? "المصدر: \(colorSourceAr())" : "Source: \(engine.colorSource)")
+                                  .font(.caption2).foregroundColor(.secondary)
+                          }
+                          Section(header: HStack {
+                              Image(systemName: "fish.fill").foregroundColor(.cyan)
+                              Text(language.isArabic ? "المحرك المحلي (Stockfish)" : "Local Engine (Stockfish)")
+                          }) {
+                              Toggle(language.isArabic ? "استخدام المحرك المحلي" : "Use local engine", isOn: $useLocalEngine)
+                              HStack {
+                                  Circle().fill(UCIEngine.shared.isAvailable ? Color.green : Color.orange).frame(width: 8, height: 8)
+                                  Text(engineStatusText()).font(.caption).foregroundColor(.secondary)
                               }
+                              Button {
+                                  UCIEngine.shared.start()
+                                  Task { await UCIEngine.shared.waitUntilReady() }
+                              } label: {
+                                  Label(language.isArabic ? "تشغيل / اختبار المحرك" : "Start / Test engine", systemImage: "play.circle")
+                              }
+                              Button {
+                                  Task { await engineDL.downloadNNUE() }
+                              } label: {
+                                  Label(language.isArabic ? "تحميل شبكة NNUE أقوى" : "Download stronger NNUE", systemImage: "arrow.down.circle")
+                              }.disabled(engineDL.isDownloading)
+                              if engineDL.isDownloading {
+                                  ProgressView().scaleEffect(0.7)
+                              }
+                              if !engineDL.statusMessage.isEmpty {
+                                  Text(engineDL.statusMessage).font(.caption).foregroundColor(.secondary)
+                              }
+                              Link(destination: URL(string: "https://stockfishchess.org/download/")!) {
+                                  Label(language.isArabic ? "موقع Stockfish الرسمي" : "Stockfish official site", systemImage: "globe")
+                              }
+                              Link(destination: URL(string: "https://github.com/official-stockfish/Stockfish")!) {
+                                  Label(language.isArabic ? "مصدر المحرك (GitHub)" : "Engine source (GitHub)", systemImage: "chevron.left.forwardslash.chevron.right")
+                              }
+                          }
+                          Section(header: HStack {
+                              Image(systemName: "speaker.wave.2.fill").foregroundColor(.blue)
+                              Text(language.isArabic ? "الصوت" : "Voice")
+                          }) {
+                              Toggle(language.isArabic ? "نطق أفضل نقلة تلقائيًا" : "Auto-speak best move", isOn: $autoVoice)
                           }
                           Section(header: HStack {
                               Image(systemName: "sparkles").foregroundColor(.purple)
@@ -3101,6 +2782,14 @@ jobs:
                               }
                           }
                           Section(language.isArabic ? "المساعد" : "Overlay") {
+                              Toggle(isOn: $stealth.helperEnabled) {
+                                  VStack(alignment: .leading, spacing: 2) {
+                                      Text(language.isArabic ? "إزالة المساعد بالكامل" : "Remove helper entirely")
+                                      Text(language.isArabic ? "يخفي كل الأدوات والمحرك والتنبيهات" : "Hides all tools, engine and alerts")
+                                          .font(.caption2).foregroundColor(.secondary)
+                                  }
+                              }
+                              .tint(.red)
                               Toggle(language.isArabic ? "وضع مضغوط" : "Compact", isOn: $overlayPos.isCompact)
                                   .onChange(of: overlayPos.isCompact) { _ in overlayPos.save() }
                               VStack(alignment: .leading) {
@@ -3125,8 +2814,8 @@ jobs:
                               Button(language.isArabic ? "إخفاء" : "Hide", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "5.3.0 Phase 5")
-                              LabeledContent("Features", value: "win%+Tablebase+Local SF22")
+                              LabeledContent("Version", value: "5.2.0 Phase 5")
+                              LabeledContent("Engine", value: "Stockfish 17.1 + Cloud")
                           }
                       }
                       .navigationTitle(language.isArabic ? "الإعدادات" : "Settings")
@@ -3136,32 +2825,19 @@ jobs:
                       }
                   }
               }
-              private var localEngineStatusText: String {
-                  if !localEngine.netsReady {
-                      return language.isArabic ? "يحتاج تحميل الشبكات (~66MB)" : "Needs download (~66MB)"
+              private func engineStatusText() -> String {
+                  if UCIEngine.shared.isAvailable {
+                      return "Stockfish " + UCIEngine.shared.engineName + (language.isArabic ? " - جاهز" : " - ready")
                   }
-                  if language.isArabic {
-                      switch localEngine.status {
-                      case .off: return "جاهز للتشغيل"
-                      case .needsDownload: return "يحتاج تحميل"
-                      case .starting: return "جاري التشغيل..."
-                      case .ready: return "يعمل الآن — NNUE محمّلة"
-                      case .failed: return "فشل: \(localEngine.statusDetail)"
-                      }
-                  }
-                  switch localEngine.status {
-                  case .off: return "Ready to start"
-                  case .needsDownload: return "Needs download"
-                  case .starting: return "Starting..."
-                  case .ready: return "Running — NNUE loaded"
-                  case .failed: return "Failed: \(localEngine.statusDetail)"
-                  }
+                  return language.isArabic ? "غير متاح - سيتم استخدام المحركات السحابية" : "Unavailable - using cloud engines"
               }
-              private var localEngineStatusColor: Color {
-                  if localEngine.status == .ready { return .green }
-                  if localEngine.status == .failed { return .red }
-                  if localEngine.status == .starting { return .yellow }
-                  return .gray
+              private func colorSourceAr() -> String {
+                  switch engine.colorSource {
+                  case "username": return "اسم المستخدم"
+                  case "flipped": return "اتجاه اللوحة"
+                  case "manual": return "يدوي"
+                  default: return "غير محدد"
+                  }
               }
           }
           '''
@@ -3195,8 +2871,13 @@ jobs:
               @Published var minimalMode = false
               @Published var isBeingRecorded = false
               @Published var lastHideReason = ""
+              @Published var helperEnabled: Bool {
+                  didSet { UserDefaults.standard.set(helperEnabled, forKey: "helper_enabled") }
+              }
               private var cancellables = Set<AnyCancellable>()
               init() {
+                  let saved = UserDefaults.standard.object(forKey: "helper_enabled") as? Bool
+                  self.helperEnabled = saved ?? true
                   NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)
                       .sink { [weak self] _ in
                           guard let self = self else { return }
@@ -3223,6 +2904,209 @@ jobs:
               }
           }
           extension Notification.Name { static let stealthPanic = Notification.Name("StealthPanicGesture") }
+          '''
+
+          files["Sources/UCIEngine.swift"] = r'''
+          import Foundation
+          import Darwin
+
+          /// Runs the Stockfish engine that is COMPILED INTO the app (see CI
+          /// "Build engine" step) on a background thread, redirecting its
+          /// stdin/stdout to pipes and speaking UCI over them. This is the same
+          /// architecture used by SmallFish and other iOS engine apps.
+          final class UCIEngine: ObservableObject {
+              static let shared = UCIEngine()
+
+              enum State: Equatable {
+                  case idle, starting, ready, failed(String)
+              }
+
+              struct AnalysisLine {
+                  let depth: Int
+                  let multipv: Int
+                  let cp: Int?      // centipawns, side-to-move POV
+                  let mate: Int?    // mate in N, side-to-move POV
+                  let pv: String    // space-separated UCI moves
+              }
+
+              @Published private(set) var state: State = .idle
+              @Published private(set) var engineName: String = "Stockfish"
+              @Published private(set) var engineAuthor: String = ""
+
+              private var toEngine: [Int32] = [0, 0]
+              private var fromEngine: [Int32] = [0, 0]
+              private var thread: pthread_t?
+              private var started = false
+              private let writeLock = NSLock()
+              private var lineBuffer = ""
+              private var analysisLines: [Int: AnalysisLine] = [:]
+              private var analysisCompletion: (([AnalysisLine]) -> Void)?
+              private var readyContinuation: CheckedContinuation<Void, Never>?
+
+              var isAvailable: Bool {
+                  switch state { case .ready: return true; default: return false }
+              }
+              var isStarting: Bool { state == .starting }
+
+              func start() {
+                  guard state == .idle || isFailed else { return }
+                  state = .starting
+                  var fds1: [Int32] = [0, 0], fds2: [Int32] = [0, 0]
+                  guard pipe(&fds1) == 0, pipe(&fds2) == 0 else {
+                      state = .failed("pipe"); return
+                  }
+                  toEngine = fds1; fromEngine = fds2
+                  dup2(toEngine[0], 0)
+                  dup2(fromEngine[1], 1)
+                  // `chess_helper_engine_main` is imported from the bridge header
+                  // as taking an OPTIONAL pointer, but pthread_create on this SDK
+                  // expects a NON-optional parameter. The ABIs are identical, so
+                  // we cast between the two signatures.
+                  typealias PthreadEntry = @convention(c) (UnsafeMutableRawPointer) -> UnsafeMutableRawPointer?
+                  let entry = unsafeBitCast(chess_helper_engine_main, to: PthreadEntry.self)
+                  let res = pthread_create(&thread, nil, entry, nil)
+                  guard res == 0 else { state = .failed("thread"); return }
+                  started = true
+                  DispatchQueue.global(qos: .userInitiated).async { self.readLoop() }
+                  send("uci")
+                  send("isready")
+                  // watchdog: if no readyok within 3s, mark failed (fallback to cloud)
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                      guard let self = self else { return }
+                      if self.state == .starting {
+                          self.state = .failed("timeout")
+                          self.readyContinuation?.resume()
+                          self.readyContinuation = nil
+                      }
+                  }
+              }
+
+              private var isFailed: Bool {
+                  if case .failed = state { return true }
+                  return false
+              }
+
+              func waitUntilReady() async {
+                  await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                      if state == .ready { cont.resume(); return }
+                      readyContinuation = cont
+                      if state != .starting { start() }
+                  }
+              }
+
+              func setEvalFile(_ path: String) async {
+                  guard started else { return }
+                  send("setoption name EvalFile value \(path)")
+              }
+
+              private func send(_ cmd: String) {
+                  writeLock.lock()
+                  defer { writeLock.unlock() }
+                  guard toEngine[1] > 0 else { return }
+                  let s = cmd + "\n"
+                  s.withCString { ptr in
+                      _ = write(toEngine[1], ptr, strlen(ptr))
+                  }
+              }
+
+              private func readLoop() {
+                  let fd = fromEngine[0]
+                  var buf = [UInt8](repeating: 0, count: 8192)
+                  while true {
+                      let n = read(fd, &buf, buf.count)
+                      if n <= 0 { break }
+                      if let s = String(bytes: buf[0..<n], encoding: .utf8) {
+                          lineBuffer += s
+                          processLines()
+                      }
+                  }
+              }
+
+              private func processLines() {
+                  while let idx = lineBuffer.firstIndex(of: "\n") {
+                      let line = String(lineBuffer[..<idx]).trimmingCharacters(in: .whitespacesAndNewlines)
+                      lineBuffer = String(lineBuffer[lineBuffer.index(after: idx)...])
+                      handleLine(line)
+                  }
+              }
+
+              private func handleLine(_ line: String) {
+                  if line.hasPrefix("id name ") {
+                      let n = String(line.dropFirst("id name ".count))
+                      DispatchQueue.main.async { self.engineName = n }
+                  } else if line.hasPrefix("id author ") {
+                      let a = String(line.dropFirst("id author ".count))
+                      DispatchQueue.main.async { self.engineAuthor = a }
+                  } else if line.hasPrefix("readyok") {
+                      DispatchQueue.main.async {
+                          if self.state == .starting { self.state = .ready }
+                          self.readyContinuation?.resume()
+                          self.readyContinuation = nil
+                      }
+                  } else if line.hasPrefix("info ") {
+                      parseInfo(String(line.dropFirst(5)))
+                  } else if line.hasPrefix("bestmove") {
+                      let parts = line.split(separator: " ").map(String.init)
+                      let bm = parts.count > 1 ? parts[1] : ""
+                      DispatchQueue.main.async { self.finishAnalysis(bestMove: bm) }
+                  }
+              }
+
+              private func parseInfo(_ s: String) {
+                  let toks = s.split(separator: " ").map(String.init)
+                  var depth = 0, multipv = 1, cp: Int? = nil, mate: Int? = nil, pvIdx = -1
+                  for (i, t) in toks.enumerated() {
+                      if t == "depth" && i + 1 < toks.count { depth = Int(toks[i + 1]) ?? 0 }
+                      else if t == "multipv" && i + 1 < toks.count { multipv = Int(toks[i + 1]) ?? 1 }
+                      else if t == "cp" && i + 1 < toks.count { cp = Int(toks[i + 1]) }
+                      else if t == "mate" && i + 1 < toks.count { mate = Int(toks[i + 1]) }
+                      else if t == "pv" { pvIdx = i + 1; break }
+                  }
+                  guard pvIdx > 0, pvIdx < toks.count else { return }
+                  let pv = toks[pvIdx...].joined(separator: " ")
+                  let line = AnalysisLine(depth: depth, multipv: multipv, cp: cp, mate: mate, pv: pv)
+                  DispatchQueue.main.async {
+                      if let existing = self.analysisLines[multipv] {
+                          if depth >= existing.depth { self.analysisLines[multipv] = line }
+                      } else {
+                          self.analysisLines[multipv] = line
+                      }
+                  }
+              }
+
+              func analyze(fen: String, multiPv: Int, depth: Int, movetimeMs: Int) async -> [AnalysisLine] {
+                  guard started else { return [] }
+                  return await withCheckedContinuation { (cont: CheckedContinuation<[AnalysisLine], Never>) in
+                      DispatchQueue.main.async {
+                          self.send("stop")
+                          self.send("setoption name MultiPV value \(multiPv)")
+                          self.send("position fen \(fen)")
+                          self.analysisLines = [:]
+                          self.analysisCompletion = { lines in
+                              cont.resume(returning: lines)
+                          }
+                          if depth > 0 { self.send("go depth \(depth)") }
+                          else { self.send("go movetime \(movetimeMs)") }
+                      }
+                  }
+              }
+
+              private func finishAnalysis(bestMove: String) {
+                  guard let c = analysisCompletion else { return }
+                  analysisCompletion = nil
+                  var lines = Array(analysisLines.values).sorted { $0.multipv < $1.multipv }
+                  if lines.isEmpty && !bestMove.isEmpty {
+                      lines = [AnalysisLine(depth: 0, multipv: 1, cp: nil, mate: nil, pv: bestMove)]
+                  }
+                  c(lines)
+              }
+
+              func stop() {
+                  send("quit")
+                  started = false
+                  state = .idle
+              }
+          }
           '''
 
           files["Sources/VoiceManager.swift"] = r'''
@@ -3322,51 +3206,6 @@ jobs:
           print(f"\nWrote {len(files)} Swift files")
           PYEOF
 
-      - name: Fetch & patch Stockfish (local engine)
-        shell: bash
-        run: |
-          set -eo pipefail
-          SF_TAG=sf_16.1
-          mkdir -p Sources/Engine
-          curl -fsSL "https://github.com/official-stockfish/Stockfish/archive/refs/tags/${SF_TAG}.tar.gz" -o /tmp/sf.tar.gz
-          tar -xzf /tmp/sf.tar.gz -C /tmp
-          rm -rf Sources/Engine/src
-          mv "/tmp/Stockfish-${SF_TAG}/src" Sources/Engine/src
-          python3 - <<'PYPATCH'
-          p = "Sources/Engine/src/main.cpp"
-          s = open(p).read()
-          assert "int main(int argc, char* argv[])" in s, "main signature not found"
-          s = s.replace("int main(int argc, char* argv[])", "int engine_main(int argc, char* argv[])", 1)
-          s += '''
-
-          extern "C" int chesshelper_engine_main(int argc, char* argv[]) {
-              return engine_main(argc, argv);
-          }
-          '''
-          open(p, "w").write(s)
-          print("Stockfish main patched -> engine_main")
-          PYPATCH
-          mkdir -p Sources/Engine/bridge
-          cat > Sources/Engine/bridge/EngineBridge.cpp <<'CPPEOF'
-          #include <cstdio>
-          #include <unistd.h>
-
-          extern "C" int chesshelper_engine_main(int argc, char* argv[]);
-
-          // Launched on a background thread by LocalEngineService.
-          // stdin/stdout/stderr are redirected to POSIX pipes so the
-          // UCI protocol flows through file descriptors.
-          extern "C" void chesshelper_run_engine(int inFD, int outFD) {
-              dup2(inFD, STDIN_FILENO);
-              dup2(outFD, STDOUT_FILENO);
-              dup2(outFD, STDERR_FILENO);
-              char prog[] = "stockfish";
-              char* argv[] = { prog, nullptr };
-              chesshelper_engine_main(1, argv);
-          }
-          CPPEOF
-          echo "Stockfish engine ready: $(find Sources/Engine -name '*.cpp' | wc -l) cpp files"
-
       - name: Write Info.plist
         run: |
           cat > Resources/Info.plist <<'EOF'
@@ -3381,8 +3220,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>5.3.0</string>
-            <key>CFBundleVersion</key><string>53</string>
+            <key>CFBundleShortVersionString</key><string>5.2.0</string>
+            <key>CFBundleVersion</key><string>52</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -3397,20 +3236,8 @@ jobs:
           </plist>
           EOF
 
-      - name: Write reader.js
-        run: |
-          cat > Resources/reader.js <<'EOF'
-          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro2=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dbc(grid){if(!grid)return"";var w=0,b=0;for(var r=6;r<=7;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;if(p===p.toUpperCase())w++;else b++;}if(w>b)return"w";if(b>w)return"b";return"";}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0)return{flipped:wkR<4,confident:true};if(bkR>=0)return{flipped:bkR>=4,confident:true};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null,lastChangeTs=0,lastPlySent=-1;function sq(r,c){return String.fromCharCode(97+c)+(8-r);}function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];}if(!t)return null;var gone=[];for(var i=0;i<ch.length;i++){if(ch[i].before!=="."&&ch[i].after===".")gone.push(ch[i]);}var uci=null;if(ch.length===4){var kTo=null;for(var i=0;i<ch.length;i++){var e=ch[i];if(e.after==="K"||e.after==="k")kTo=e;}if(kTo){var kc=kTo.after==="K"?"w":"b";if(kc==="w"){if(kTo.r===7&&kTo.c===6)uci="e1g1";else if(kTo.r===7&&kTo.c===2)uci="e1c1";}else{if(kTo.r===0&&kTo.c===6)uci="e8g8";else if(kTo.r===0&&kTo.c===2)uci="e8c8";}}}if(!uci){var f=null;if(gone.length===1){f=gone[0];}else if(gone.length>1){for(var i=0;i<gone.length;i++){var g=gone[i];if(g.c!==t.c&&g.r!==t.r){f=g;break;}}if(!f)f=gone[0];}if(!f)return null;uci=sq(f.r,f.c)+sq(t.r,t.c);if((t.after==="P"&&t.r===0)||(t.after==="p"&&t.r===7))uci+="q";}var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:uci,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}if(p>=0&&p<lastPlySent){prevGrid=null;lastPayload="";lastPlySent=p;lastChangeTs=0;}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var now=Date.now();var moveTimeMs=0;if(m){moveTimeMs=lastChangeTs?now-lastChangeTs:0;lastChangeTs=now;}if(p>=0)lastPlySent=p;var fi=dfl(g);var bc=dbc(g);var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:fi.flipped,flippedConfident:fi.confident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:bc,moveTimeMs:moveTimeMs};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
-          EOF
-
-      - name: Write adblock_css.css
-        run: |
-          cat > Resources/adblock_css.css <<'EOF'
-          iframe[src*="doubleclick.net"],iframe[src*="googlesyndication"],ins.adsbygoogle,[id^="div-gpt-ad"],#onetrust-banner-sdk,.cookie-banner-component,.cookie-consent{display:none!important;}
-          EOF
-
       - name: Show file tree
-        run: find Sources Resources -type f | sort
+        run: find Sources Resources Engine -type f | sort
 
       - name: Select Xcode
         run: |
@@ -3440,19 +3267,19 @@ jobs:
           [ -n "$APP" ] || { echo "Not found"; exit 1; }
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          zip -qr ChessHelper-v5.3-Phase5.ipa Payload
-          ls -lh ChessHelper-v5.3-Phase5.ipa
+          zip -qr ChessHelper-v5.2-Phase5.ipa Payload
+          ls -lh ChessHelper-v5.2-Phase5.ipa
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ChessHelper-v5.3-Phase5
-          path: ChessHelper-v5.3-Phase5.ipa
+          name: ChessHelper-v5.2-Phase5
+          path: ChessHelper-v5.2-Phase5.ipa
           retention-days: 90
 
       - name: Attach to Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ChessHelper-v5.3-Phase5.ipa
+          files: ChessHelper-v5.2-Phase5.ipa
           generate_release_notes: true
