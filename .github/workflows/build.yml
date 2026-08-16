@@ -2940,12 +2940,6 @@ jobs:
               private var analysisCompletion: (([AnalysisLine]) -> Void)?
               private var readyContinuation: CheckedContinuation<Void, Never>?
 
-              // The bridge header declares `void* chess_helper_engine_main(void*)`,
-              // which Swift imports as a non-optional parameter. pthread_create
-              // expects an optional-parameter C function pointer; the ABIs are
-              // identical so we cast between the two signatures.
-              private let engineMain: @convention(c) (UnsafeMutableRawPointer) -> UnsafeMutableRawPointer? = chess_helper_engine_main
-
               var isAvailable: Bool {
                   switch state { case .ready: return true; default: return false }
               }
@@ -2961,8 +2955,12 @@ jobs:
                   toEngine = fds1; fromEngine = fds2
                   dup2(toEngine[0], 0)
                   dup2(fromEngine[1], 1)
-                  typealias PthreadEntry = @convention(c) (UnsafeMutableRawPointer?) -> UnsafeMutableRawPointer?
-                  let entry = unsafeBitCast(engineMain, to: PthreadEntry.self)
+                  // `chess_helper_engine_main` is imported from the bridge header
+                  // as taking an OPTIONAL pointer, but pthread_create on this SDK
+                  // expects a NON-optional parameter. The ABIs are identical, so
+                  // we cast between the two signatures.
+                  typealias PthreadEntry = @convention(c) (UnsafeMutableRawPointer) -> UnsafeMutableRawPointer?
+                  let entry = unsafeBitCast(chess_helper_engine_main, to: PthreadEntry.self)
                   let res = pthread_create(&thread, nil, entry, nil)
                   guard res == 0 else { state = .failed("thread"); return }
                   started = true
