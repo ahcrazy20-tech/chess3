@@ -3407,42 +3407,32 @@ jobs:
         run: |
           cat > Resources/reader.js <<'EOF'
 
-          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};
+          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});
+          // Piece map: chess.com uses data-piece like "wK","bR" (uppercase) AND some
+          // builds use lowercase "wk". We support both.
+          var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k",
+            wP:"P",wN:"N",wB:"B",wR:"R",wQ:"Q",wK:"K",bP:"p",bN:"n",bB:"b",bR:"r",bQ:"q",bK:"k"};
+          var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};
           function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}
 
-          /* ===== CORE ORIENTATION DETECTION (which color is at the BOTTOM) =====
-             The grid we read is ALWAYS in absolute chess coordinates (white's back
-             rank = grid row 7). The VISUAL orientation tells us the user's color:
-             bottom-left = '1'  -> user WHITE  (board not flipped)
-             bottom-left = '8'  -> user BLACK  (board flipped 180deg)
-             We detect it from the board's CSS transform (rotate 180) — the most
-             reliable signal — and fall back to coordinate labels.
-             ===================================================================== */
           function readBottomColor(board){
             if(!board) return "";
-            // Method 1: CSS transform on board or its ancestors -> rotate(180deg)
             var el = board, depth = 0;
             while(el && depth < 6){
               var t = el.style && el.style.transform;
-              if(!t){
-                try { t = window.getComputedStyle(el).transform; } catch(e){ t = ""; }
-              }
+              if(!t){ try { t = window.getComputedStyle(el).transform; } catch(e){ t = ""; } }
               if(t && t !== "none"){
-                // 1) inline style keeps the literal "rotate(180deg)" form
                 if(t.indexOf("rotate(180") !== -1){ return "b"; }
-                // 2) computed style returns matrix form: matrix(-1,0,0,-1,..) / matrix3d(-1,..)
                 if(/matrix\(-1[\s,]/.test(t)){ return "b"; }
                 if(/matrix3d\(-1[\s,]/.test(t)){ return "b"; }
               }
               el = el.parentElement; depth++;
             }
-            // Method 2: board attribute (some renders set flip)
             var attrs = ["data-orientation","orientation","class"];
             for(var i=0;i<attrs.length;i++){
               var v = board.getAttribute && board.getAttribute(attrs[i]);
               if(v && typeof v === "string" && v.indexOf("flip") !== -1){ return "b"; }
             }
-            // Method 3: coordinate label at bottom-left of the board
             try {
               var coords = board.querySelectorAll(".coordinates");
               for(var c=0;c<coords.length;c++){
@@ -3450,60 +3440,77 @@ jobs:
                 if(/8/.test(txt.slice(0,8)) && txt.indexOf("1") === -1){ return "b"; }
               }
             } catch(e){}
-            return "w"; // default assume white at bottom
+            return "w";
           }
 
+          function hasIn(arr,node){
+            for(var i=0;i<arr.length;i++) if(arr[i]===node) return true;
+            return false;
+          }
+
+          // Identify the piece type from an element (data-piece, class, etc.)
+          function pieceType(n){
+            var dp=n.getAttribute&&n.getAttribute("data-piece");
+            if(dp&&PM[dp]) return PM[dp];
+            var c=(n.className||"").toString();
+            var parts=c.split(/\s+/);
+            for(var i=0;i<parts.length;i++) if(PM[parts[i]]) return PM[parts[i]];
+            var lp=c.toLowerCase().split(/\s+/), co=null, na=null;
+            for(var i=0;i<lp.length;i++){ if(lp[i]==="white"||lp[i]==="black") co=lp[i]; if(PN[lp[i]]) na=lp[i]; }
+            if(co&&na){ var l=PN[na]; return co==="white"? l : l.toLowerCase(); }
+            return null;
+          }
+
+          // Robust board reader: computes each piece's square from its ACTUAL screen
+          // position (getBoundingClientRect) relative to the board's rectangle. This
+          // works with ANY positioning style (translate, translate3d, top/left, % or px)
+          // and eliminates duplicate/ghost pieces caused by transform-string parsing.
+          // Returns the grid in ABSOLUTE FEN coordinates: grid[0]=rank8, grid[7]=rank1.
           function rg(b){
             var g=[[],[],[],[],[],[],[],[]];
-            for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];
-            var all=b.querySelectorAll(".piece,piece,[data-piece]");
-            if(!all.length)return null;
-            // === DEDUPE === chess.com wraps each piece in an outer element (with
-            // data-piece) containing an inner <svg class="piece">. The selector above
-            // matches BOTH, so each piece would be read twice and duplicated on the
-            // board. Keep only the OUTERMOST matching element per piece.
+            for(var i=0;i<8;i++) g[i]=[".",".",".",".",".",".",".","."];
+            var br=b.getBoundingClientRect();
+            if(!br || br.width<8 || br.height<8) return null;
+            var cellw=br.width/8, cellh=br.height/8;
+            var all=b.querySelectorAll("wc-piece,piece,[data-piece],.piece");
+            if(!all.length) return null;
+            // Dedupe: keep only the OUTERMOST matching element per piece (chess.com
+            // wraps each piece in an outer node + an inner <svg class="piece">, so the
+            // selector matches both -> without this, each piece is read twice.
             var list=[];
             for(var k=0;k<all.length;k++){
-              var n=all[k], a=n.parentElement, hops=0, nested=false;
-              while(a && hops<6){
-                if(all.length && a.tagName){
-                  for(var z=0;z<all.length;z++){ if(all[z]===a){ nested=true; break; } }
-                }
-                if(nested)break;
-                a=a.parentElement; hops++;
+              var n=all[k], pc=n.parentElement, nested=false;
+              while(pc){
+                if(hasIn(all,pc)){ nested=true; break; }
+                pc=pc.parentElement;
               }
-              if(!nested)list.push(n);
+              if(!nested) list.push(n);
             }
-            for(var k2=0;k2<list.length;k2++){
-              var n2=list[k2],p=null,f=null,r=null;
-              var c2=(n2.className||"").toString();
-              var parts2=c2.split(/\s+/);
-              for(var i=0;i<parts2.length;i++)if(PM[parts2[i]])p=PM[parts2[i]];
-              if(!p){var dp2=n2.getAttribute&&n2.getAttribute("data-piece");if(dp2&&PM[dp2])p=PM[dp2];}
-              if(!p){var lp2=c2.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp2.length;i++){if(lp2[i]==="white"||lp2[i]==="black")co=lp2[i];if(PN[lp2[i]])na=lp2[i];}if(co&&na){var l2=PN[na];p=co==="white"?l2:l2.toLowerCase();}}
-              // position: prefer data-square / square class, fall back to transform
-              for(var i=0;i<parts2.length;i++){var m=/^square-(\d)(\d)$/.exec(parts2[i]);if(m){f=+m[1];r=+m[2];}}
-              if(f===null){var ds2=n2.getAttribute&&n2.getAttribute("data-square");if(ds2&&ds2.length===2){f=ds2.charCodeAt(0)-96;r=parseInt(ds2[1],10);}}
-              if(f===null){var st2=(n2.getAttribute&&n2.getAttribute("style"))||"";
-                // support translate(..) and translate3d(..) with % (chess.com) or px
-                var m2=/translate3?d?\(([^)]*)\)/.exec(st2);
-                if(m2){var seg=m2[1].split(","), pxv=parseFloat(seg[0]||"0"), pyv=parseFloat(seg[1]||"0");
-                  if(seg[0].indexOf("%")!==-1){var co2=Math.round(pxv/12.5),ro2=Math.round(pyv/12.5);if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;}}
-                  else { /* px: board height unknown; use board element size if available */
-                    var sz=b&&b.clientHeight?b.clientHeight:0;
-                    if(sz>0){var co3=Math.round(pxv/(sz/8)),ro3=Math.round(pyv/(sz/8));if(co3>=0&&co3<=7&&ro3>=0&&ro3<=7){f=co3+1;r=8-ro3;}}
-                  }}
-              }
-              if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8){
-                // avoid placing two different pieces on the same square (keep first)
-                if(g[8-r][f-1]===".")g[8-r][f-1]=p;
-              }
+            // Orientation: if black is at the bottom (flipped), the physical row
+            // numbering (0 = top of screen) maps differently to absolute ranks.
+            var flipped = (readBottomColor(b)==="b");
+            for(var j=0;j<list.length;j++){
+              var el=list[j];
+              var p=pieceType(el);
+              if(!p) continue;
+              var cr;
+              try { cr=el.getBoundingClientRect(); } catch(e){ continue; }
+              if(!cr || (cr.width<1 && cr.height<1)) continue;
+              var cx=cr.left+cr.width/2, cy=cr.top+cr.height/2;
+              var col=Math.floor((cx-br.left)/cellw);
+              var row=Math.floor((cy-br.top)/cellh);
+              if(col<0||col>7||row<0||row>7) continue;
+              // physical row 0 = top of screen. Convert to absolute grid row (0=rank8).
+              // Flipped (black at bottom): top of screen = rank1 -> grid row 7, so gr=7-row.
+              // Not flipped (white at bottom): top = rank8 -> grid row 0, so gr=row.
+              var gr = flipped ? (7-row) : row;
+              // only place if square is empty (keeps first real piece, drops ghosts)
+              if(g[gr][col]===".") g[gr][col]=p;
             }
             return g;
           }
 
-          /* King-position heuristic: only trusted once a king leaves its home square
-             (in the opening both kings are on rank 1/8 so it is ambiguous). */
+          /* King-position heuristic: only trusted once a king leaves its home square. */
           function dfl(grid){var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}
             var res={flipped:false,confident:false};
             if(wkR>=0&&bkR>=0 && (wkR!==7||bkR!==0)){ res.flipped=wkR<bkR; res.confident=true; return res; }
@@ -3515,9 +3522,8 @@ jobs:
           var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;
           function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}
           function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;
-            /* improved: read bottomColor directly from the board orientation */
-            var bc = readBottomColor(b);            // "w" or "b" (visual)
-            var fi = dfl(g);                          // king heuristic (confident mid-game)
+            var bc = readBottomColor(b);
+            var fi = dfl(g);
             var flipped = (bc === "b");
             var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];
             var py={grid:gs,sideToMove:side,flipped:flipped,flippedConfident:(bc==="b"||fi.confident),lastMoveUCI:m?m.uci:"",plyCount:p,bottomColor:bc};
