@@ -96,27 +96,46 @@ jobs:
           CPP
           $CXX -arch arm64 -isysroot "$SDK" -mios-version-min=16.0 -c /tmp/stub.cpp -o /tmp/stub.o
           $AR rcs Engine/libchessengine.a /tmp/stub.o
-          # ---- real Stockfish ----
+          # ---- real Stockfish: use the OFFICIAL Makefile (handles NNUE embed,
+          #      -DNO_AFFINITY for Darwin/iOS, and all nnue/ subdir sources) ----
           git clone --depth 1 --branch sf_17.1 https://github.com/official-stockfish/Stockfish.git /tmp/sf
           cd /tmp/sf/src
-          make net 2>/dev/null || true
-          FLAGS="-arch arm64 -isysroot $SDK -mios-version-min=16.0 -O3 -DNDEBUG -std=c++17 -Dmain=stockfish_main -DIS_64BIT -DNO_PEXT -DNO_POPCNT -DNO_AVX2 -DNO_AVX512 -DNO_BMI2 -fno-exceptions"
-          mkdir -p obj
-          for f in *.cpp; do
-            $CXX $FLAGS -c "$f" -o "obj/${f%.cpp}.o" 2>/dev/null || true
-          done
-          cat > obj/wrap.cpp <<'CPP'
+          make net >/dev/null 2>&1 || true
+
+          # Cross-compile for iOS arm64. ARCH=armv8 + Darwin host makes the
+          # Makefile set -DIS_64BIT -DNO_AFFINITY -DNO_POPCNT -DNO_PEXT etc.
+          # -Dmain=stockfish_main lets us wrap main() in a static library.
+          # (The final link step fails because there is no "main" symbol —
+          #  that is expected; we only need the object files.)
+          make -j"$(sysctl -n hw.ncpu)" build \
+            ARCH=armv8 \
+            COMP=clang \
+            CXX="$CXX" \
+            EXTRACXXFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=16.0 -Dmain=stockfish_main" \
+            >/dev/null 2>&1 || true
+
+          # ---- wrap main() and archive every object into a static lib ----
+          cat > /tmp/sf/src/wrap.cpp <<'CPP'
           int stockfish_main(int, char**);
           extern "C" void* chess_helper_engine_main(void*) {
-              char* argv[] = {(char*)"stockfish", (char*)0};
+              char* argv[] = {(char*)"stockfish", (char*)nullptr};
               stockfish_main(1, argv);
-              return 0;
+              return nullptr;
           }
           CPP
-          $CXX $FLAGS -c obj/wrap.cpp -o obj/wrap.o
-          $AR rcs /tmp/libchessengine.a obj/*.o
-          cp /tmp/libchessengine.a Engine/libchessengine.a
-          echo "Stockfish engine built OK"
+          $CXX -arch arm64 -isysroot "$SDK" -mios-version-min=16.0 -O3 -std=c++17 \
+               -c /tmp/sf/src/wrap.cpp -o /tmp/sf/src/wrap.o
+
+          OBJS=$(find /tmp/sf/src -name '*.o' -type f ! -name 'wrap.o')
+          COUNT=$(echo "$OBJS" | wc -l | tr -d ' ')
+          echo "compiled $COUNT engine object files"
+          if [ "$COUNT" -gt 10 ]; then
+            $AR rcs /tmp/libchessengine.a $OBJS /tmp/sf/src/wrap.o
+            cp /tmp/libchessengine.a Engine/libchessengine.a
+            echo "Stockfish engine built OK (static lib, $COUNT objects)"
+          else
+            echo "Too few objects ($COUNT) — keeping stub, cloud engines will be used"
+          fi
 
       - name: Write reader.js
         run: |
