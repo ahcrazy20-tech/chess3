@@ -16,6 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Clean & prepare
         run: |
           rm -rf Sources Resources ChessHelper.xcodeproj build Payload
@@ -555,9 +559,10 @@ jobs:
                   brilliantCount = 0; bestCount = 0; goodCount = 0
                   inaccuracyCount = 0; mistakeCount = 0; blunderCount = 0
               }
+              // IMPROVED: separate brilliant from best, clearer weights
               private func recomputeAccuracy() {
                   guard myMoveCount > 0 else { currentAccuracy = 100.0; return }
-                  let total = brilliantCount * 100 + bestCount * 100 + goodCount * 90 + inaccuracyCount * 70 + mistakeCount * 40 + blunderCount * 10
+                  let total = brilliantCount * 100 + bestCount * 95 + goodCount * 80 + inaccuracyCount * 60 + mistakeCount * 40 + blunderCount * 15
                   currentAccuracy = Double(total) / Double(myMoveCount)
               }
               private let storeKey = "chess_helper_game_history"
@@ -820,9 +825,11 @@ jobs:
                   return book[key]
               }
               
+              // IMPROVED: match on board + side only (ignore castling/en passant)
+              // so the opening name is recognized through transpositions all game.
               private func normalizeFen(_ fen: String) -> String {
                   let parts = fen.split(separator: " ").map(String.init)
-                  if parts.count >= 3 { return "\(parts[0]) \(parts[1]) \(parts[2])" }
+                  if parts.count >= 2 { return "\(parts[0]) \(parts[1])" }
                   return parts.first ?? fen
               }
               
@@ -969,6 +976,7 @@ jobs:
           files["Sources/LocalEngine.swift"] = r'''
           import Foundation
           import WebKit
+          import UIKit
 
           struct LocalEngineResult {
               let bestMove: String
@@ -1005,19 +1013,34 @@ jobs:
                   let cc = WKUserContentController()
                   cc.add(self, name: StealthConfig.engineBridge)
                   config.userContentController = cc
+                  config.websiteDataStore = .default()
+                  config.defaultWebpagePreferences.allowsContentJavaScript = true
                   
-                  let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: config)
+                  let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 200), configuration: config)
                   wv.isHidden = true
+                  
+                  // CRITICAL FIX: attach the webview to the app window so its JS
+                  // timers/Worker keep running (a detached webview is throttled).
+                  attachToWindow(wv)
                   
                   let html = createEngineHTML()
                   wv.loadHTMLString(html, baseURL: nil)
                   
                   webView = wv
                   
-                  // Engine will signal ready via message
-                  DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
                       self?.isReady = true
                   }
+              }
+              
+              private func attachToWindow(_ wv: WKWebView) {
+                  guard let scene = UIApplication.shared.connectedScenes
+                          .compactMap({ $0 as? UIWindowScene })
+                          .first(where: { $0.activationState == .foregroundActive }),
+                        let window = scene.windows.first else { return }
+                  window.addSubview(wv)
+                  wv.frame = CGRect(x: -400, y: -400, width: 320, height: 200)
+                  wv.layer.zPosition = -999
               }
               
               func analyze(fen: String, depth: Int = 22, multiPV: Int = 3, onResult: @escaping (LocalEngineResult) -> Void) {
@@ -1027,9 +1050,7 @@ jobs:
                   currentDepth = 0
                   analysisCallback = onResult
                   
-                  let js = """
-                  analyzePosition('\(fen)', \(depth), \(multiPV));
-                  """
+                  let js = "analyzePosition('\(fen)', \(depth), \(multiPV));"
                   wv.evaluateJavaScript(js, completionHandler: nil)
               }
               
@@ -1041,13 +1062,8 @@ jobs:
               
               func getBestMove(fen: String, depth: Int = 20, callback: @escaping (String) -> Void) {
                   guard isReady, let wv = webView else { return }
-                  
                   bestMoveCallback = callback
-                  
-                  let js = """
-                  getBestMove('\(fen)', \(depth));
-                  """
-                  wv.evaluateJavaScript(js, completionHandler: nil)
+                  wv.evaluateJavaScript("getBestMove('\(fen)', \(depth));", completionHandler: nil)
               }
               
               private func createEngineHTML() -> String {
@@ -1055,11 +1071,13 @@ jobs:
                   <!DOCTYPE html>
                   <html>
                   <head>
+                  <meta name="viewport" content="width=device-width, initial-scale=1">
                   <script>
                   var engine = null;
                   var analyzing = false;
                   var currentPV = [];
                   var lastInfo = {};
+                  var bootTimer = null;
                   
                   function initEngine() {
                       try {
@@ -1077,8 +1095,7 @@ jobs:
                           engine.postMessage('setoption name MultiPV value 3');
                           engine.postMessage('isready');
                           
-                          // Notify Swift
-                          setTimeout(function() {
+                          bootTimer = setTimeout(function() {
                               sendToSwift({type: 'ready'});
                           }, 1500);
                       } catch(e) {
@@ -1087,11 +1104,12 @@ jobs:
                   }
                   
                   function processEngineLine(line) {
+                      if (typeof line !== 'string') { try { line = line.data || ''; } catch(e){} }
+                      if (typeof line !== 'string') return;
                       if (line.indexOf('bestmove') === 0) {
                           var parts = line.split(' ');
                           var bestMove = parts[1] || '';
                           var ponder = parts[3] || null;
-                          
                           sendToSwift({
                               type: 'bestmove',
                               bestMove: bestMove,
@@ -1103,13 +1121,11 @@ jobs:
                               nodes: lastInfo.nodes || 0,
                               time: lastInfo.time || 0
                           });
-                          
                           analyzing = false;
                       }
                       else if (line.indexOf('info depth') !== -1) {
                           var info = parseInfo(line);
                           lastInfo = info;
-                          
                           sendToSwift({
                               type: 'info',
                               depth: info.depth,
@@ -1238,12 +1254,163 @@ jobs:
           print(f"\nWrote Tablebase & Local Engine")
           PYEOF
 
-      - name: Generate Swift files (Part 4 - Engine Service)
+      - name: Generate Swift files (Part 4 - Engine Service + SAN)
         shell: bash
         run: |
           python3 <<'PYEOF'
           import os, textwrap
           files = {}
+
+          # ========== NEW: Standard Algebraic Notation generator ==========
+          files["Sources/SanGenerator.swift"] = r'''
+          import Foundation
+
+          /// Generates Standard Algebraic Notation from a UCI move + FEN.
+          /// ADDITIVE feature (does not modify existing code).
+          /// Handles: piece letters, captures, castle, pawn pushes, promotion,
+          /// disambiguation, and basic check/checkmate detection.
+          enum SanGenerator {
+
+              static func generate(uci: String, fen: String) -> String {
+                  guard uci.count >= 4,
+                        let grid = MoveValidator.parseFen(fen) else { return uci }
+                  let parts = fen.split(separator: " ").map(String.init)
+                  guard parts.count >= 2 else { return uci }
+                  let side = parts[1]
+                  guard let from = MoveValidator.squareToCoord(String(uci.prefix(2))),
+                        let to = MoveValidator.squareToCoord(String(uci.dropFirst(2).prefix(2))) else { return uci }
+                  let piece = grid[from.row][from.col]
+                  guard piece != "." else { return uci }
+
+                  let promoteChar = uci.count >= 5 ? uci.suffix(1).uppercased() : ""
+                  let dest = String(uci.dropFirst(2).prefix(2))
+                  let isCapture = grid[to.row][to.col] != "."
+                  let isWhite = piece.isUppercase
+                  let low = piece.lowercased()
+
+                  // Castle
+                  if low == "k" && abs(to.col - from.col) == 2 {
+                      var san = to.col < from.col ? "O-O-O" : "O-O"
+                      san += checkSuffix(grid: grid, from: from, to: to, piece: piece, promoteChar: "", isWhite: isWhite)
+                      return san
+                  }
+
+                  var san = ""
+                  if low == "p" {
+                      if isCapture { san += String(UnicodeScalar(97 + from.col)!) + "x" }
+                      san += dest
+                      if !promoteChar.isEmpty { san += "=" + promoteChar }
+                  } else {
+                      san += piece.uppercased()
+                      san += disambiguation(piece: piece, from: from, to: to, grid: grid)
+                      if isCapture { san += "x" }
+                      san += dest
+                  }
+
+                  san += checkSuffix(grid: grid, from: from, to: to, piece: piece, promoteChar: promoteChar, isWhite: isWhite)
+                  return san
+              }
+
+              private static func disambiguation(piece: Character, from: (row: Int, col: Int), to: (row: Int, col: Int), grid: [[Character]]) -> String {
+                  var sameFile = false, sameRank = false
+                  var rivals = 0
+                  for r in 0..<8 {
+                      for c in 0..<8 {
+                          if (r == from.row && c == from.col) { continue }
+                          if grid[r][c] != piece { continue }
+                          if canReach(piece: piece, from: (r, c), to: to, grid: grid) {
+                              rivals += 1
+                              if c == to.col { sameFile = true }
+                              if r == to.row { sameRank = true }
+                          }
+                      }
+                  }
+                  guard rivals > 0 else { return "" }
+                  if !sameFile { return String(UnicodeScalar(97 + from.col)!) }
+                  if !sameRank { return String(8 - from.row) }
+                  return String(UnicodeScalar(97 + from.col)!) + String(8 - from.row)
+              }
+
+              private static func canReach(piece: Character, from: (row: Int, col: Int), to: (row: Int, col: Int), grid: [[Character]]) -> Bool {
+                  let dr = to.row - from.row, dc = to.col - from.col
+                  let adr = abs(dr), adc = abs(dc)
+                  switch piece.lowercased() {
+                  case "n": return (adr == 2 && adc == 1) || (adr == 1 && adc == 2)
+                  case "b": return adr == adc
+                  case "r": return dr == 0 || dc == 0
+                  case "q": return adr == adc || dr == 0 || dc == 0
+                  case "k": return max(adr, adc) == 1
+                  case "p":
+                      let dir = piece.isUppercase ? -1 : 1
+                      return (dr == dir && adc == 1) || (dr == dir && adc == 0)
+                  default: return false
+                  }
+              }
+
+              private static func checkSuffix(grid: [[Character]], from: (row: Int, col: Int), to: (row: Int, col: Int), piece: Character, promoteChar: String, isWhite: Bool) -> String {
+                  guard var ng = applyMove(grid: grid, from: from, to: to, piece: piece, promoteChar: promoteChar) else { return "" }
+                  let enemyKing: Character = isWhite ? "k" : "K"
+                  guard let kp = findPiece(ng, enemyKing) else { return "" }
+                  if !isAttacked(grid: ng, r: kp.row, c: kp.col, byWhite: !isWhite) { return "" }
+                  if kingHasNoLegalEscape(ng, king: enemyKing, at: kp, attackerWhite: !isWhite) {
+                      return "#"
+                  }
+                  return "+"
+              }
+
+              private static func applyMove(grid: [[Character]], from: (row: Int, col: Int), to: (row: Int, col: Int), piece: Character, promoteChar: String) -> [[Character]]? {
+                  var ng = grid
+                  var moved = piece
+                  if piece.lowercased() == "p" && !promoteChar.isEmpty {
+                      moved = Character(promoteChar)
+                      if !piece.isUppercase { moved = Character(promoteChar.lowercased()) }
+                  }
+                  ng[from.row][from.col] = "."
+                  ng[to.row][to.col] = moved
+                  return ng
+              }
+
+              private static func findPiece(_ grid: [[Character]], _ p: Character) -> (row: Int, col: Int)? {
+                  for r in 0..<8 { for c in 0..<8 { if grid[r][c] == p { return (r, c) } } }
+                  return nil
+              }
+
+              private static func isAttacked(grid: [[Character]], r: Int, c: Int, byWhite: Bool) -> Bool {
+                  let target = byWhite ? "K" : "k"
+                  for rr in 0..<8 { for cc in 0..<8 {
+                      let p = grid[rr][cc]
+                      if p == "." { continue }
+                      if (byWhite && !p.isUppercase) { continue }
+                      if (!byWhite && p.isUppercase) { continue }
+                      if p.lowercased() == "k" && p == target { continue }
+                      if canReach(piece: p, from: (rr, cc), to: (r, c), grid: grid) { return true }
+                      if p.lowercased() == "p" {
+                          let dir = byWhite ? -1 : 1
+                          if (rr + dir == r) && abs(cc - c) == 1 { return true }
+                      }
+                  }}
+                  return false
+              }
+
+              private static func kingHasNoLegalEscape(_ grid: [[Character]], king: Character, at kp: (row: Int, col: Int), attackerWhite: Bool) -> Bool {
+                  let enemyWhite = !attackerWhite
+                  for dr in -1...1 { for dc in -1...1 {
+                      if dr == 0 && dc == 0 { continue }
+                      let r = kp.row + dr, c = kp.col + dc
+                      if r < 0 || r > 7 || c < 0 || c > 7 { continue }
+                      let occ = grid[r][c]
+                      if occ != "." {
+                          let occWhite = occ.isUppercase
+                          if occWhite == enemyWhite { continue }
+                          if !isAttacked(grid: grid, r: r, c: c, byWhite: attackerWhite) { return false }
+                          continue
+                      }
+                      if !isAttacked(grid: grid, r: r, c: c, byWhite: attackerWhite) { return false }
+                  }}
+                  return true
+              }
+          }
+          '''
 
           # ========== Main Engine Service - Combines all sources ==========
           files["Sources/EngineService.swift"] = r'''
@@ -1327,7 +1494,7 @@ jobs:
                   do {
                       let (data, resp) = try await URLSession.shared.data(for: req)
                       guard let http = resp as? HTTPURLResponse else { return nil }
-                      if http.statusCode == 404 { return [] }
+                      if http.statusCode == 404 { return [] }   // no cached eval -> NOT failure
                       guard http.statusCode == 200 else { return nil }
                       guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
                       let depth = (json["depth"] as? Int) ?? 20
@@ -1338,7 +1505,8 @@ jobs:
                           let fm = String(ms.split(separator: " ").first ?? "")
                           guard !fm.isEmpty, MoveValidator.isPlausibleMove(uci: fm, fen: fen) else { continue }
                           let cp = pv["cp"] as? Int; let mate = pv["mate"] as? Int
-                          moves.append(TopMove(rank: idx + 1, uci: fm, san: fm, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: depth, source: "LC", votes: 1))
+                          let san = SanGenerator.generate(uci: fm, fen: fen)
+                          moves.append(TopMove(rank: idx + 1, uci: fm, san: san, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: depth, source: "LC", votes: 1))
                       }
                       return moves
                   } catch { return nil }
@@ -1359,7 +1527,7 @@ jobs:
                       guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
                       let uci = (json["move"] as? String) ?? ""
                       guard !uci.isEmpty, MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
-                      let san = (json["san"] as? String) ?? uci
+                      let san = (json["san"] as? String) ?? SanGenerator.generate(uci: uci, fen: fen)
                       let eval = json["eval"] as? Double; let mate = json["mate"] as? Int
                       let cp = eval.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? depth
                       return TopMove(rank: 1, uci: uci, san: san, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "CA", votes: 1)
@@ -1385,8 +1553,26 @@ jobs:
                       guard !uci.isEmpty, MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
                       let ev = json["evaluation"] as? Double; let mate = json["mate"] as? Int
                       let cp = ev.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? depth
-                      return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "SF", votes: 1)
+                      let san = SanGenerator.generate(uci: uci, fen: fen)
+                      return TopMove(rank: 1, uci: uci, san: san, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "SF", votes: 1)
                   } catch { return nil }
+              }
+              
+              // MARK: - Local engine fallback (works offline)
+              static func callLocalEngine(fen: String, depth: Int) async -> TopMove? {
+                  await withCheckedContinuation { cont in
+                      Task { @MainActor in
+                          guard LocalEngine.shared.isReady else { cont.resume(returning: nil); return }
+                          LocalEngine.shared.analyze(fen: fen, depth: min(depth, 18), multiPV: 1) { r in
+                              let best = r.bestMove
+                              guard !best.isEmpty, MoveValidator.isPlausibleMove(uci: best, fen: fen) else {
+                                  cont.resume(returning: nil); return
+                              }
+                              let san = SanGenerator.generate(uci: best, fen: fen)
+                              cont.resume(returning: TopMove(rank: 1, uci: best, san: san, evaluationCp: r.evaluation, mateIn: r.mateIn, depth: r.depth, source: "🧠", votes: 1))
+                          }
+                      }
+                  }
               }
               
               // MARK: - Main Analysis Function
@@ -1401,7 +1587,8 @@ jobs:
                   let (openingInfo, bookMoves) = await checkOpeningBook(fen: fen)
                   if let opening = openingInfo, !bookMoves.isEmpty {
                       let moves = bookMoves.prefix(multiPV).enumerated().map { idx, move in
-                          TopMove(rank: idx + 1, uci: move, san: move, evaluationCp: 0, mateIn: nil, depth: 99, source: "📖", votes: 3)
+                          let san = SanGenerator.generate(uci: move, fen: fen)
+                          return TopMove(rank: idx + 1, uci: move, san: san, evaluationCp: 0, mateIn: nil, depth: 99, source: "📖", votes: 3)
                       }
                       let a = EngineAnalysis(topMoves: Array(moves), bestMove: moves.first, depth: 99, sourcesUsed: "📖 Opening Book", confidence: 3, debugFen: fen, openingName: opening.name, openingECO: opening.eco, tablebaseResult: nil, isMatchMode: isMatchMode)
                       await MainActor.run { onUpdate(a) }
@@ -1420,7 +1607,6 @@ jobs:
                           case .draw, .unknown: evalCp = 0; mate = nil
                           }
                           
-                          // Get all tablebase moves
                           var tbMoves: [TopMove] = []
                           for (idx, m) in tb.allMoves.prefix(multiPV).enumerated() {
                               let mEval: Int
@@ -1429,11 +1615,13 @@ jobs:
                               case .loss: mEval = -10000 + (m.dtz ?? 0)
                               case .draw, .unknown: mEval = 0
                               }
-                              tbMoves.append(TopMove(rank: idx + 1, uci: m.uci, san: m.uci, evaluationCp: mEval, mateIn: m.category == .win ? (m.dtz ?? 0) / 2 : nil, depth: 99, source: "🏁", votes: 3))
+                              let san = SanGenerator.generate(uci: m.uci, fen: fen)
+                              tbMoves.append(TopMove(rank: idx + 1, uci: m.uci, san: san, evaluationCp: mEval, mateIn: m.category == .win ? (m.dtz ?? 0) / 2 : nil, depth: 99, source: "🏁", votes: 3))
                           }
                           
                           if tbMoves.isEmpty {
-                              tbMoves = [TopMove(rank: 1, uci: bestMove, san: bestMove, evaluationCp: evalCp, mateIn: mate, depth: 99, source: "🏁", votes: 3)]
+                              let san = SanGenerator.generate(uci: bestMove, fen: fen)
+                              tbMoves = [TopMove(rank: 1, uci: bestMove, san: san, evaluationCp: evalCp, mateIn: mate, depth: 99, source: "🏁", votes: 3)]
                           }
                           
                           let a = EngineAnalysis(topMoves: tbMoves, bestMove: tbMoves.first, depth: 99, sourcesUsed: "🏁 Tablebase", confidence: 3, debugFen: fen, openingName: nil, openingECO: nil, tablebaseResult: tb, isMatchMode: isMatchMode)
@@ -1452,7 +1640,7 @@ jobs:
                       return a
                   }
                   
-                  // 4. Call all engines in parallel
+                  // 4. Call all cloud engines in parallel
                   async let lichessResult = callLichessCloud(fen: fen, multiPv: multiPV)
                   async let chessApiResult = callChessApi(fen: fen, depth: depth)
                   async let stockfishResult = callStockfishOnline(fen: fen, depth: depth)
@@ -1464,46 +1652,64 @@ jobs:
                   let stockfish = await stockfishResult
                   try Task.checkCancellation()
                   
-                  // 5. Merge results with voting system
-                  var moveVotes: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
+                  // 5. FAIR voting: one vote per source for its best move only,
+                  //    so a multi-PV source can't dominate the others.
+                  var bestBySource: [String: TopMove] = [:]
+                  if let lm = lichess, !lm.isEmpty, let first = lm.first { bestBySource["LC"] = first }
+                  if let m = chessApi { bestBySource["CA"] = m }
+                  if let m = stockfish { bestBySource["SF"] = m }
                   
-                  if let lm = lichess {
-                      for m in lm {
-                          if var e = moveVotes[m.uci] { e.votes += 1; e.sources.append("LC"); moveVotes[m.uci] = e }
-                          else { moveVotes[m.uci] = (m, 1, ["LC"]) }
+                  // 6. If ALL cloud engines failed (nil = network error / no
+                  //    response), fall back to local Stockfish so we still get an
+                  //    answer offline instead of showing "Offline".
+                  if bestBySource.isEmpty {
+                      if let local = await callLocalEngine(fen: fen, depth: depth) {
+                          let a = EngineAnalysis(topMoves: [local], bestMove: local, depth: local.depth, sourcesUsed: "🧠 Local", confidence: 1, debugFen: fen, openingName: nil, openingECO: nil, tablebaseResult: nil, isMatchMode: isMatchMode)
+                          await MainActor.run { onUpdate(a) }
+                          return a
                       }
-                  }
-                  if let m = chessApi {
-                      if var e = moveVotes[m.uci] { e.votes += 1; e.sources.append("CA"); moveVotes[m.uci] = e }
-                      else { moveVotes[m.uci] = (m, 1, ["CA"]) }
-                  }
-                  if let m = stockfish {
-                      if var e = moveVotes[m.uci] { e.votes += 1; e.sources.append("SF"); moveVotes[m.uci] = e }
-                      else { moveVotes[m.uci] = (m, 1, ["SF"]) }
+                      throw EngineError.networkOffline
                   }
                   
-                  guard !moveVotes.isEmpty else {
-                      if lichess == nil && chessApi == nil && stockfish == nil { throw EngineError.networkOffline }
-                      throw EngineError.allEnginesFailed
+                  // 7. Build combined candidate list and merge
+                  var combined: [TopMove] = []
+                  if let lm = lichess { combined.append(contentsOf: lm) }
+                  if let m = chessApi { combined.append(m) }
+                  if let m = stockfish { combined.append(m) }
+                  
+                  var voteCount: [String: Int] = [:]
+                  var sourceOf: [String: [String]] = [:]
+                  for (src, mv) in bestBySource {
+                      voteCount[mv.uci, default: 0] += 1
+                      sourceOf[mv.uci, default: []].append(src)
                   }
                   
-                  // Sort by votes, then by evaluation
-                  let sorted = moveVotes.values.sorted { a, b in
-                      if a.votes != b.votes { return a.votes > b.votes }
-                      return a.move.rankScore > b.move.rankScore
+                  var unique: [String: TopMove] = [:]
+                  for m in combined {
+                      if let ex = unique[m.uci] {
+                          if m.rankScore > ex.rankScore { unique[m.uci] = m }
+                      } else { unique[m.uci] = m }
                   }
                   
-                  let finalMoves: [TopMove] = sorted.prefix(multiPV).enumerated().map { (idx, e) in
-                      TopMove(rank: idx + 1, uci: e.move.uci, san: e.move.san, evaluationCp: e.move.evaluationCp, mateIn: e.move.mateIn, depth: e.move.depth, source: e.sources.joined(separator: "+"), votes: e.votes)
+                  let sorted = unique.values.sorted { a, b in
+                      let av = voteCount[a.uci] ?? 0, bv = voteCount[b.uci] ?? 0
+                      if av != bv { return av > bv }
+                      return a.rankScore > b.rankScore
+                  }
+                  
+                  let finalMoves: [TopMove] = sorted.prefix(multiPV).enumerated().map { idx, m in
+                      let votes = voteCount[m.uci] ?? 0
+                      let srcs = (sourceOf[m.uci] ?? [m.source])
+                      let san = SanGenerator.generate(uci: m.uci, fen: fen)
+                      return TopMove(rank: idx + 1, uci: m.uci, san: san, evaluationCp: m.evaluationCp, mateIn: m.mateIn, depth: m.depth, source: srcs.joined(separator: "+"), votes: votes)
                   }
                   
                   let topVotes = finalMoves.first?.votes ?? 1
-                  let allSources = Array(Set(moveVotes.values.flatMap { $0.sources })).sorted().joined(separator: "+")
+                  let allSources = Array(Set(bestBySource.keys)).sorted().joined(separator: "+")
                   let bestDepth = finalMoves.map { $0.depth }.max() ?? depth
                   
                   let analysis = EngineAnalysis(topMoves: finalMoves, bestMove: finalMoves.first, depth: bestDepth, sourcesUsed: allSources, confidence: min(topVotes, 3), debugFen: fen, openingName: nil, openingECO: nil, tablebaseResult: nil, isMatchMode: isMatchMode)
                   
-                  // Cache results (not for match mode)
                   if !isMatchMode {
                       await AnalysisCache.shared.set(fen: fen, moves: finalMoves, depth: bestDepth, sources: allSources, confidence: min(topVotes, 3))
                   }
@@ -1519,7 +1725,7 @@ jobs:
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, "w") as f: f.write(content)
               print(f"  ✅ {path}")
-          print(f"\nWrote Engine Service")
+          print(f"\nWrote Engine Service + SAN generator")
           PYEOF
 
       - name: Generate Swift files (Part 5 - ViewModels)
@@ -1595,10 +1801,20 @@ jobs:
               private var moveHistoryUCI: [String] = []
               private var lastKnownPly: Int = -1
               
+              // ---- Color detection stabilization ----
+              // bottomColor (read from the board's visual orientation) is the
+              // most reliable signal. We cross-check with the king heuristic and
+              // require a couple of consistent samples before committing, so the
+              // detected color never flickers during navigation/board flipping.
+              private var pendingColor: String? = nil
+              private var pendingColorCount = 0
+              private let colorCommitThreshold = 2
+              
               weak var recorder: GameRecorder?
               
               func setManualColor(_ c: String?) {
                   manualPlayerColor = c
+                  pendingColor = nil; pendingColorCount = 0
                   if !currentFEN.isEmpty { lastSuccessfulFEN = ""; analyze(fen: currentFEN) }
               }
               
@@ -1635,6 +1851,47 @@ jobs:
                   let bottomColor: String
               }
               
+              private func updateDetectedColor(_ bottomColor: String, flipped: Bool, flippedConfident: Bool) {
+                  guard manualPlayerColor == nil else { return }
+                  
+                  // Best signal: bottomColor (a real visual read from the board).
+                  var candidate: String? = nil
+                  var sourceConfidence: Bool = false
+                  
+                  if !bottomColor.isEmpty {
+                      candidate = bottomColor
+                      sourceConfidence = true
+                  } else if flippedConfident {
+                      candidate = flipped ? "b" : "w"
+                      sourceConfidence = true
+                  }
+                  
+                  guard let cand = candidate else { return }
+                  if !sourceConfidence { return }
+                  
+                  // Hysteresis: only commit after N consistent samples, or
+                  // instantly when both signals agree.
+                  if let pending = pendingColor, pending == cand {
+                      pendingColorCount += 1
+                  } else {
+                      pendingColor = cand
+                      pendingColorCount = 1
+                  }
+                  
+                  let agree = flippedConfident && (flipped ? "b" : "w") == cand
+                  if pendingColorCount >= colorCommitThreshold || agree {
+                      if detectedPlayerColor != cand {
+                          detectedPlayerColor = cand
+                          // Color changed => previous eval/quality context invalid
+                          previousEvalWhitePOV = nil
+                          previousFEN = ""
+                          previousBestMove = nil
+                      }
+                      pendingColor = nil
+                      pendingColorCount = 0
+                  }
+              }
+              
               func ingest(_ p: BoardPayload) {
                   // Check if helper is completely hidden
                   if AppSettings.shared.isHelperCompletelyHidden { return }
@@ -1643,14 +1900,8 @@ jobs:
                   lastMoveUCI = p.lastMoveUCI
                   plyCount = p.plyCount
                   
-                  // Color detection using flipped state
-                  if manualPlayerColor == nil {
-                      if p.flippedConfident {
-                          detectedPlayerColor = p.flipped ? "b" : "w"
-                      } else if !p.bottomColor.isEmpty {
-                          detectedPlayerColor = p.bottomColor
-                      }
-                  }
+                  // Color detection using improved orientation logic
+                  updateDetectedColor(bottomColor: p.bottomColor, flipped: p.flipped, flippedConfident: p.flippedConfident)
                   
                   // Track move history
                   if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
@@ -1670,11 +1921,8 @@ jobs:
                   var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
                   for r in 0..<8 { for c in 0..<8 { grid[r][c] = chars[r * 8 + c] } }
                   
-                  if p.flipped {
-                      var flipped: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
-                      for r in 0..<8 { for c in 0..<8 { flipped[r][c] = grid[7 - r][7 - c] } }
-                      grid = flipped
-                  }
+                  // grid arrives in absolute coordinates (white back rank = row 7)
+                  // from reader.js, so no flip is needed here for FEN building.
                   
                   let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
                   if FenValidator.validate(fen) != nil { return }
@@ -3156,10 +3404,57 @@ jobs:
           </plist>
           EOF
 
-      - name: Write reader.js
+      - name: Write reader.js (with color detection)
         run: |
           cat > Resources/reader.js <<'EOF'
-          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro>=0&&ro<=7){f=co2+1;r=8-ro;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0)return{flipped:wkR<4,confident:true};if(bkR>=0)return{flipped:bkR>=4,confident:true};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var fi=dfl(g);var bc=fi.flipped?"b":"w";var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:fi.flipped,flippedConfident:fi.confident,lastMoveUCI:m?m.uci:"",plyCount:p,bottomColor:bc};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
+          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};
+          function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}
+          function readBottomColor(board){
+            if(!board) return "";
+            var el = board, depth = 0;
+            while(el && depth < 6){
+              var t = el.style && el.style.transform;
+              if(!t){ try { t = window.getComputedStyle(el).transform; } catch(e){ t = ""; } }
+              if(t && t !== "none"){
+                if(t.indexOf("rotate(180") !== -1){ return "b"; }
+                if(/matrix\(-1[\s,]/.test(t)){ return "b"; }
+                if(/matrix3d\(-1[\s,]/.test(t)){ return "b"; }
+              }
+              el = el.parentElement; depth++;
+            }
+            var attrs = ["data-orientation","orientation","class"];
+            for(var i=0;i<attrs.length;i++){
+              var v = board.getAttribute && board.getAttribute(attrs[i]);
+              if(v && typeof v === "string" && v.indexOf("flip") !== -1){ return "b"; }
+            }
+            try {
+              var coords = board.querySelectorAll(".coordinates");
+              for(var c=0;c<coords.length;c++){
+                var txt = coords[c].textContent || "";
+                if(/8/.test(txt.slice(0,8)) && txt.indexOf("1") === -1){ return "b"; }
+              }
+            } catch(e){}
+            return "w";
+          }
+          function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro>=0&&ro<=7){f=co2+1;r=8-ro;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}
+          function dfl(grid){var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}
+            var res={flipped:false,confident:false};
+            if(wkR>=0&&bkR>=0 && (wkR!==7||bkR!==0)){ res.flipped=wkR<bkR; res.confident=true; return res; }
+            if(wkR>=0 && wkR!==7){ res.flipped=wkR<4; res.confident=true; return res; }
+            if(bkR>=0 && bkR!==0){ res.flipped=bkR>=4; res.confident=true; return res; }
+            return res;}
+          function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}
+          function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}
+          var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;
+          function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}
+          function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;
+            var bc = readBottomColor(b);
+            var fi = dfl(g);
+            var flipped = (bc === "b");
+            var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];
+            var py={grid:gs,sideToMove:side,flipped:flipped,flippedConfident:(bc==="b"||fi.confident),lastMoveUCI:m?m.uci:"",plyCount:p,bottomColor:bc};
+            var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}
+          Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
           EOF
 
       - name: Write adblock_css.css
