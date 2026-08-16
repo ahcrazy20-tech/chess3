@@ -1,4 +1,4 @@
-name: Build ChessHelper v5.2
+name: Build ChessHelper v6.0
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -31,8 +31,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "5.2.0"
-              CURRENT_PROJECT_VERSION: "52"
+              MARKETING_VERSION: "6.0.0"
+              CURRENT_PROJECT_VERSION: "60"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -64,7 +64,7 @@ jobs:
                   PROVISIONING_PROFILE_SPECIFIER: ""
           EOF
 
-      - name: Generate all Swift source files
+      - name: Generate Swift source files (Part 1 - Core)
         shell: bash
         run: |
           python3 <<'PYEOF'
@@ -150,9 +150,11 @@ jobs:
               static let bridgeName: String = randomName(prefix: "_", length: 6)
               static let readerFlag: String = randomName(prefix: "_", length: 8)
               static let startFuncName: String = randomName(prefix: "_", length: 8)
+              static let localEngineBridge: String = randomName(prefix: "_sf_", length: 6)
               private static let userAgents = [
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
                   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1",
+                  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
               ]
               static func randomUserAgent() -> String { userAgents.randomElement()! }
               static func readerInterval() -> Int { Int.random(in: 500...900) }
@@ -185,6 +187,16 @@ jobs:
                   if total < 4 { return "only \(total) pieces" }
                   if total > 32 { return "\(total) pieces" }
                   return nil
+              }
+              
+              static func countPieces(_ fen: String) -> Int {
+                  let parts = fen.split(separator: " ").map(String.init)
+                  guard let boardPart = parts.first else { return 0 }
+                  var count = 0
+                  for ch in boardPart {
+                      if ch.isLetter { count += 1 }
+                  }
+                  return count
               }
           }
           '''
@@ -348,7 +360,7 @@ jobs:
               @Published var offset: CGSize = .zero
               @Published var isCompact: Bool = false
               @Published var transparency: Double = 0.85
-              private let xK = "ov_x_v52", yK = "ov_y_v52", cK = "ov_c_v52", tK = "ov_t_v52"
+              private let xK = "ov_x_v60", yK = "ov_y_v60", cK = "ov_c_v60", tK = "ov_t_v60"
               init() {
                   let x = UserDefaults.standard.double(forKey: xK)
                   let y = UserDefaults.standard.double(forKey: yK)
@@ -370,7 +382,7 @@ jobs:
               @Published var offset: CGSize = CGSize(width: 0, height: -220)
               @Published var isVisible: Bool = false
               @Published var isChatMode: Bool = false
-              private let xK = "ai_x_v52", yK = "ai_y_v52"
+              private let xK = "ai_x_v60", yK = "ai_y_v60"
               init() {
                   let x = UserDefaults.standard.double(forKey: xK)
                   let y = UserDefaults.standard.double(forKey: yK)
@@ -399,7 +411,7 @@ jobs:
               func set(fen: String, moves: [TopMove], depth: Int, sources: String, confidence: Int) {
                   cache[fen] = Entry(moves: moves, depth: depth, sources: sources, confidence: confidence)
                   order.removeAll { $0 == fen }; order.append(fen)
-                  while order.count > 200 { let o = order.removeFirst(); cache.removeValue(forKey: o) }
+                  while order.count > 500 { let o = order.removeFirst(); cache.removeValue(forKey: o) }
               }
               func clear() { cache.removeAll(); order.removeAll() }
               func count() -> Int { cache.count }
@@ -428,6 +440,15 @@ jobs:
                   let g = UISelectionFeedbackGenerator()
                   g.prepare()
                   g.selectionChanged()
+              }
+              static func tacticalOpportunity() {
+                  let g = UINotificationFeedbackGenerator()
+                  g.prepare()
+                  g.notificationOccurred(.success)
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                      let g2 = UIImpactFeedbackGenerator(style: .heavy)
+                      g2.impactOccurred()
+                  }
               }
           }
           '''
@@ -517,6 +538,444 @@ jobs:
                   default: fileAr = String(file)
                   }
                   return "\(fileAr)\(rank)"
+              }
+          }
+          '''
+
+          for path, content in files.items():
+              content = textwrap.dedent(content).strip() + "\n"
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w") as f: f.write(content)
+              print(f"  ✅ {path}")
+          print(f"\nWrote {len(files)} Swift files (Part 1 - Core)")
+          PYEOF
+
+      - name: Generate Swift source files (Part 2 - Opening Book & Tablebase)
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import os, textwrap
+          files = {}
+
+          # ========== Opening Book Service ==========
+          files["Sources/OpeningBook.swift"] = r'''
+          import Foundation
+
+          struct OpeningInfo: Codable {
+              let name: String
+              let eco: String
+              let moves: [String]
+              let winRate: Double?
+          }
+
+          actor OpeningBook {
+              static let shared = OpeningBook()
+              
+              private var book: [String: OpeningInfo] = [:]
+              private var loaded = false
+              
+              func load() {
+                  guard !loaded else { return }
+                  loaded = true
+                  
+                  // Built-in opening database
+                  let openings: [(fen: String, name: String, eco: String, moves: [String], winRate: Double)] = [
+                      // Starting position
+                      ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -", "Starting Position", "A00", ["e4", "d4", "Nf3", "c4"], 0.50),
+                      
+                      // King's Pawn
+                      ("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq -", "King's Pawn Opening", "B00", ["e5", "c5", "e6", "c6", "d5"], 0.52),
+                      
+                      // Sicilian Defense
+                      ("rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -", "Sicilian Defense", "B20", ["Nf3", "Nc3", "c3", "f4"], 0.54),
+                      ("rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq -", "Sicilian Defense: Open", "B30", ["d6", "Nc6", "e6", "g6"], 0.53),
+                      ("rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "Sicilian Defense: Old Sicilian", "B32", ["d4", "Bb5+", "c3"], 0.54),
+                      ("rnbqkbnr/pp2pppp/3p4/2p5/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq -", "Sicilian Defense: Open", "B50", ["cxd4", "Nf6"], 0.53),
+                      ("r1bqkbnr/pp1ppppp/2n5/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "Sicilian Defense: Old Sicilian", "B30", ["d4", "Bb5", "Nc3"], 0.53),
+                      ("rnbqkb1r/pp1ppppp/5n2/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "Sicilian Defense: Hyperaccelerated Dragon", "B27", ["e5", "Nc3", "d4"], 0.52),
+                      
+                      // French Defense
+                      ("rnbqkbnr/pppp1ppp/4p3/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -", "French Defense", "C00", ["d4", "Nf3", "d3"], 0.53),
+                      ("rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "French Defense: Normal", "C01", ["d5", "Nf6"], 0.52),
+                      ("rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/8/PPP2PPP/RNBQKBNR w KQkq -", "French Defense: Normal", "C10", ["Nc3", "Nd2", "e5", "exd5"], 0.52),
+                      
+                      // Caro-Kann Defense
+                      ("rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -", "Caro-Kann Defense", "B10", ["d4", "Nc3", "c4", "Nf3"], 0.52),
+                      ("rnbqkbnr/pp1ppppp/2p5/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq -", "Caro-Kann Defense: Main Line", "B12", ["d5", "Nf6"], 0.51),
+                      
+                      // Italian Game
+                      ("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "King's Knight Opening", "C40", ["Bc4", "Bb5", "d4", "Nc3"], 0.54),
+                      ("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "Italian Game", "C50", ["Bc5", "Nf6", "Be7", "d6"], 0.53),
+                      ("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "Italian Game: Two Knights", "C55", ["d3", "Nc3", "d4", "Ng5"], 0.52),
+                      ("r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "Italian Game: Giuoco Piano", "C53", ["c3", "d3", "b4", "Nc3"], 0.52),
+                      
+                      // Ruy Lopez
+                      ("r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b KQkq -", "Ruy Lopez", "C60", ["a6", "Nf6", "d6", "Bc5"], 0.53),
+                      ("r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w KQkq -", "Ruy Lopez: Morphy Defense", "C70", ["Ba4", "Bxc6", "d4"], 0.53),
+                      
+                      // Scotch Game
+                      ("r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R b KQkq -", "Scotch Game", "C44", ["exd4", "Nf6"], 0.52),
+                      
+                      // Queen's Pawn
+                      ("rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b KQkq -", "Queen's Pawn Opening", "A40", ["d5", "Nf6", "e6", "f5"], 0.52),
+                      
+                      // Queen's Gambit
+                      ("rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b KQkq -", "Queen's Gambit", "D06", ["e6", "c6", "dxc4", "Nf6"], 0.53),
+                      ("rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -", "Queen's Gambit Declined", "D30", ["Nc3", "Nf3", "Bg5", "cxd5"], 0.52),
+                      ("rnbqkbnr/pp2pppp/2p5/3p4/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -", "Slav Defense", "D10", ["Nc3", "Nf3", "cxd5", "e3"], 0.51),
+                      
+                      // Indian Defenses
+                      ("rnbqkb1r/pppppppp/5n2/8/3P4/8/PPP1PPPP/RNBQKBNR w KQkq -", "Indian Defense", "A45", ["c4", "Nf3", "Nc3", "Bg5"], 0.52),
+                      ("rnbqkb1r/pppppppp/5n2/8/2PP4/8/PP2PPPP/RNBQKBNR b KQkq -", "Indian Defense", "A50", ["e6", "g6", "c5", "e5"], 0.52),
+                      ("rnbqkb1r/pppppp1p/5np1/8/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -", "King's Indian Defense", "E60", ["Nc3", "Nf3", "g3"], 0.52),
+                      ("rnbqk2r/ppppppbp/5np1/8/2PP4/2N5/PP2PPPP/R1BQKBNR w KQkq -", "King's Indian Defense: Normal", "E70", ["e4", "Nf3", "Be2"], 0.52),
+                      ("rnbqkb1r/pppp1ppp/4pn2/8/2PP4/8/PP2PPPP/RNBQKBNR w KQkq -", "Nimzo-Indian Defense", "E20", ["Nc3", "Nf3", "a3", "g3"], 0.51),
+                      ("rnbqk2r/pppp1ppp/4pn2/8/1bPP4/2N5/PP2PPPP/R1BQKBNR w KQkq -", "Nimzo-Indian Defense", "E21", ["Qc2", "e3", "Bd2", "Nf3"], 0.51),
+                      
+                      // English Opening
+                      ("rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b KQkq -", "English Opening", "A10", ["e5", "c5", "Nf6", "e6", "g6"], 0.51),
+                      ("rnbqkbnr/pppp1ppp/8/4p3/2P5/8/PP1PPPPP/RNBQKBNR w KQkq -", "English Opening: Reversed Sicilian", "A20", ["Nc3", "g3", "Nf3"], 0.51),
+                      
+                      // London System
+                      ("rnbqkbnr/ppp1pppp/8/3p4/3P4/8/PPP1PPPP/RNBQKBNR w KQkq -", "Queen's Pawn Game", "D00", ["Bf4", "Nf3", "c4", "e3"], 0.51),
+                      ("rnbqkbnr/ppp1pppp/8/3p4/3P1B2/8/PPP1PPPP/RN1QKBNR b KQkq -", "London System", "D00", ["Nf6", "c5", "e6", "Bf5"], 0.50),
+                      
+                      // Scandinavian Defense
+                      ("rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -", "Scandinavian Defense", "B01", ["exd5", "Nc3", "e5"], 0.54),
+                      ("rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR w KQkq -", "Scandinavian Defense: Main Line", "B01", ["Nc3", "Nf3", "d4"], 0.55),
+                      
+                      // Pirc Defense
+                      ("rnbqkbnr/ppp1pppp/3p4/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -", "Pirc Defense", "B07", ["d4", "Nc3", "Nf3"], 0.54),
+                      ("rnbqkb1r/ppp1pppp/3p1n2/8/3PP3/8/PPP2PPP/RNBQKBNR w KQkq -", "Pirc Defense", "B08", ["Nc3", "Nf3", "f3"], 0.53),
+                      
+                      // Alekhine's Defense
+                      ("rnbqkb1r/pppppppp/5n2/8/4P3/8/PPPP1PPP/RNBQKBNR w KQkq -", "Alekhine's Defense", "B02", ["e5", "Nc3", "d3"], 0.54),
+                      
+                      // Dutch Defense
+                      ("rnbqkbnr/ppppp1pp/8/5p2/3P4/8/PPP1PPPP/RNBQKBNR w KQkq -", "Dutch Defense", "A80", ["c4", "g3", "Nf3", "Nc3"], 0.53),
+                      
+                      // Grünfeld Defense
+                      ("rnbqkb1r/ppp1pp1p/5np1/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR w KQkq -", "Grünfeld Defense", "D80", ["cxd5", "Bf4", "Nf3", "e3"], 0.52),
+                      
+                      // Catalan Opening
+                      ("rnbqkb1r/pppp1ppp/4pn2/8/2PP4/6P1/PP2PP1P/RNBQKBNR b KQkq -", "Catalan Opening", "E01", ["d5", "Be7", "c5"], 0.51),
+                      
+                      // Vienna Game
+                      ("rnbqkbnr/pppp1ppp/8/4p3/4P3/2N5/PPPP1PPP/R1BQKBNR b KQkq -", "Vienna Game", "C25", ["Nf6", "Nc6", "Bc5"], 0.52),
+                      
+                      // Philidor Defense
+                      ("rnbqkbnr/ppp2ppp/3p4/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "Philidor Defense", "C41", ["d4", "Bc4", "Nc3"], 0.55),
+                      
+                      // Petrov's Defense
+                      ("rnbqkb1r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq -", "Petrov's Defense", "C42", ["Nxe5", "d3", "Nc3"], 0.51),
+                  ]
+                  
+                  for opening in openings {
+                      let normalizedFen = normalizeFenForLookup(opening.fen)
+                      book[normalizedFen] = OpeningInfo(
+                          name: opening.name,
+                          eco: opening.eco,
+                          moves: opening.moves,
+                          winRate: opening.winRate
+                      )
+                  }
+              }
+              
+              func lookup(fen: String) -> OpeningInfo? {
+                  let normalized = normalizeFenForLookup(fen)
+                  return book[normalized]
+              }
+              
+              private func normalizeFenForLookup(_ fen: String) -> String {
+                  // Only use board position, side to move, and castling rights for lookup
+                  let parts = fen.split(separator: " ").map(String.init)
+                  if parts.count >= 3 {
+                      return "\(parts[0]) \(parts[1]) \(parts[2])"
+                  }
+                  return parts.first ?? fen
+              }
+              
+              func getSuggestedMoves(fen: String) -> [String] {
+                  if let info = lookup(fen: fen) {
+                      return info.moves
+                  }
+                  return []
+              }
+          }
+          '''
+
+          # ========== Tablebase Service ==========
+          files["Sources/TablebaseService.swift"] = r'''
+          import Foundation
+
+          struct TablebaseResult {
+              enum Category: String {
+                  case win = "win"
+                  case draw = "draw"
+                  case loss = "loss"
+                  case unknown = "unknown"
+              }
+              
+              let category: Category
+              let dtm: Int?  // Distance to mate (if available)
+              let dtz: Int?  // Distance to zeroing (50-move rule)
+              let bestMove: String?
+              let wdl: Int?  // Win/Draw/Loss score
+          }
+
+          enum TablebaseService {
+              private static let baseURL = "https://tablebase.lichess.ovh/standard"
+              private static var cache: [String: TablebaseResult] = [:]
+              
+              static func probe(fen: String) async -> TablebaseResult? {
+                  // Check cache first
+                  let cacheKey = normalizeFen(fen)
+                  if let cached = cache[cacheKey] {
+                      return cached
+                  }
+                  
+                  // Only query if 7 or fewer pieces
+                  let pieceCount = FenValidator.countPieces(fen)
+                  guard pieceCount <= 7 else { return nil }
+                  
+                  guard var comps = URLComponents(string: baseURL) else { return nil }
+                  comps.queryItems = [URLQueryItem(name: "fen", value: fen)]
+                  
+                  guard let url = comps.url else { return nil }
+                  
+                  var req = URLRequest(url: url)
+                  req.timeoutInterval = 5
+                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                  
+                  do {
+                      let (data, resp) = try await URLSession.shared.data(for: req)
+                      guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+                      
+                      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+                      
+                      let result = parseResult(json)
+                      cache[cacheKey] = result
+                      
+                      // Limit cache size
+                      if cache.count > 1000 {
+                          cache.removeAll()
+                      }
+                      
+                      return result
+                  } catch {
+                      return nil
+                  }
+              }
+              
+              private static func parseResult(_ json: [String: Any]) -> TablebaseResult {
+                  let categoryStr = (json["category"] as? String) ?? "unknown"
+                  let category: TablebaseResult.Category
+                  switch categoryStr {
+                  case "win": category = .win
+                  case "cursed-win", "blessed-loss": category = .draw
+                  case "draw": category = .draw
+                  case "loss": category = .loss
+                  default: category = .unknown
+                  }
+                  
+                  let dtm = json["dtm"] as? Int
+                  let dtz = json["dtz"] as? Int
+                  let wdl = json["wdl"] as? Int
+                  
+                  var bestMove: String? = nil
+                  if let moves = json["moves"] as? [[String: Any]], let first = moves.first {
+                      bestMove = first["uci"] as? String
+                  }
+                  
+                  return TablebaseResult(
+                      category: category,
+                      dtm: dtm,
+                      dtz: dtz,
+                      bestMove: bestMove,
+                      wdl: wdl
+                  )
+              }
+              
+              private static func normalizeFen(_ fen: String) -> String {
+                  let parts = fen.split(separator: " ").map(String.init)
+                  if parts.count >= 4 {
+                      return "\(parts[0]) \(parts[1]) \(parts[2]) \(parts[3])"
+                  }
+                  return fen
+              }
+              
+              static func clearCache() {
+                  cache.removeAll()
+              }
+          }
+          '''
+
+          # ========== Local Stockfish Engine ==========
+          files["Sources/LocalStockfish.swift"] = r'''
+          import Foundation
+          import WebKit
+
+          actor LocalStockfishEngine {
+              static let shared = LocalStockfishEngine()
+              
+              private var webView: WKWebView?
+              private var isReady = false
+              private var pendingAnalysis: [(fen: String, depth: Int, continuation: CheckedContinuation<LocalAnalysisResult?, Never>)] = []
+              private var currentFen: String?
+              
+              struct LocalAnalysisResult {
+                  let bestMove: String
+                  let evaluation: Int  // centipawns
+                  let mateIn: Int?
+                  let depth: Int
+                  let pv: [String]  // principal variation
+              }
+              
+              func initialize() async {
+                  guard webView == nil else { return }
+                  
+                  await MainActor.run {
+                      let config = WKWebViewConfiguration()
+                      let cc = WKUserContentController()
+                      config.userContentController = cc
+                      
+                      let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: 1, height: 1), configuration: config)
+                      wv.isHidden = true
+                      
+                      // Load Stockfish HTML
+                      if let html = createStockfishHTML() {
+                          wv.loadHTMLString(html, baseURL: nil)
+                      }
+                      
+                      self.webView = wv
+                  }
+                  
+                  // Wait for engine to be ready
+                  try? await Task.sleep(nanoseconds: 2_000_000_000)
+                  isReady = true
+              }
+              
+              func analyze(fen: String, depth: Int = 20) async -> LocalAnalysisResult? {
+                  guard isReady, let webView = await MainActor.run(body: { self.webView }) else {
+                      return nil
+                  }
+                  
+                  currentFen = fen
+                  
+                  return await withCheckedContinuation { continuation in
+                      Task { @MainActor in
+                          let js = """
+                          if (typeof stockfish !== 'undefined' && stockfish.postMessage) {
+                              stockfish.postMessage('position fen \(fen)');
+                              stockfish.postMessage('go depth \(depth)');
+                          }
+                          """
+                          webView.evaluateJavaScript(js) { _, _ in }
+                          
+                          // Wait for analysis (simplified - in production use proper callbacks)
+                          Task {
+                              try? await Task.sleep(nanoseconds: UInt64(depth) * 100_000_000)
+                              
+                              let getResult = """
+                              (function() {
+                                  if (typeof lastAnalysis !== 'undefined') {
+                                      return JSON.stringify(lastAnalysis);
+                                  }
+                                  return null;
+                              })()
+                              """
+                              
+                              await MainActor.run {
+                                  webView.evaluateJavaScript(getResult) { result, _ in
+                                      if let jsonStr = result as? String,
+                                         let data = jsonStr.data(using: .utf8),
+                                         let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                                          let bestMove = json["bestMove"] as? String ?? ""
+                                          let eval = json["eval"] as? Int ?? 0
+                                          let mate = json["mate"] as? Int
+                                          let d = json["depth"] as? Int ?? depth
+                                          let pv = json["pv"] as? [String] ?? []
+                                          
+                                          continuation.resume(returning: LocalAnalysisResult(
+                                              bestMove: bestMove,
+                                              evaluation: eval,
+                                              mateIn: mate,
+                                              depth: d,
+                                              pv: pv
+                                          ))
+                                      } else {
+                                          continuation.resume(returning: nil)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              
+              private func createStockfishHTML() -> String? {
+                  // Minimal HTML to load Stockfish.js
+                  return """
+                  <!DOCTYPE html>
+                  <html>
+                  <head>
+                      <script>
+                          var lastAnalysis = null;
+                          var stockfish = null;
+                          
+                          function initEngine() {
+                              // Use stockfish.js from CDN for now
+                              // In production, bundle it locally
+                              try {
+                                  stockfish = new Worker('https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js');
+                                  
+                                  stockfish.onmessage = function(e) {
+                                      var line = e.data;
+                                      
+                                      if (line.indexOf('bestmove') === 0) {
+                                          var parts = line.split(' ');
+                                          if (parts.length >= 2) {
+                                              lastAnalysis = lastAnalysis || {};
+                                              lastAnalysis.bestMove = parts[1];
+                                          }
+                                      }
+                                      
+                                      if (line.indexOf('info depth') !== -1) {
+                                          var depthMatch = line.match(/depth (\\d+)/);
+                                          var scoreMatch = line.match(/score cp (-?\\d+)/);
+                                          var mateMatch = line.match(/score mate (-?\\d+)/);
+                                          var pvMatch = line.match(/pv (.+)/);
+                                          
+                                          lastAnalysis = lastAnalysis || {};
+                                          if (depthMatch) lastAnalysis.depth = parseInt(depthMatch[1]);
+                                          if (scoreMatch) lastAnalysis.eval = parseInt(scoreMatch[1]);
+                                          if (mateMatch) lastAnalysis.mate = parseInt(mateMatch[1]);
+                                          if (pvMatch) lastAnalysis.pv = pvMatch[1].split(' ');
+                                      }
+                                  };
+                                  
+                                  stockfish.postMessage('uci');
+                                  stockfish.postMessage('setoption name Threads value 1');
+                                  stockfish.postMessage('setoption name Hash value 16');
+                                  stockfish.postMessage('isready');
+                              } catch(e) {
+                                  console.error('Failed to init Stockfish:', e);
+                              }
+                          }
+                          
+                          window.onload = initEngine;
+                      </script>
+                  </head>
+                  <body></body>
+                  </html>
+                  """
+              }
+              
+              func stop() async {
+                  guard let webView = await MainActor.run(body: { self.webView }) else { return }
+                  await MainActor.run {
+                      webView.evaluateJavaScript("if(stockfish)stockfish.postMessage('stop');", completionHandler: nil)
+                  }
               }
           }
           '''
@@ -638,7 +1097,22 @@ jobs:
           }
           '''
 
-          # ========== GroqService with TIMEOUT + RETRY ==========
+          for path, content in files.items():
+              content = textwrap.dedent(content).strip() + "\n"
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w") as f: f.write(content)
+              print(f"  ✅ {path}")
+          print(f"\nWrote {len(files)} Swift files (Part 2 - Opening Book & Tablebase)")
+          PYEOF
+
+      - name: Generate Swift source files (Part 3 - Services)
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import os, textwrap
+          files = {}
+
+          # ========== GroqService ==========
           files["Sources/GroqService.swift"] = r'''
           import Foundation
           enum GroqService {
@@ -655,18 +1129,12 @@ jobs:
                   case timeout
                   var errorDescription: String? {
                       switch self {
-                      case .noKey:
-                          return "No Groq API key. Add it in Settings."
-                      case .invalidKey:
-                          return "Invalid API key."
-                      case .networkError(let m):
-                          return "Network: \(m)"
-                      case .rateLimited:
-                          return "Too many requests. Try again later."
-                      case .parseError:
-                          return "Bad AI response"
-                      case .timeout:
-                          return "Request timeout. Check your connection."
+                      case .noKey: return "No Groq API key. Add it in Settings."
+                      case .invalidKey: return "Invalid API key."
+                      case .networkError(let m): return "Network: \(m)"
+                      case .rateLimited: return "Too many requests. Try again later."
+                      case .parseError: return "Bad AI response"
+                      case .timeout: return "Request timeout. Check your connection."
                       }
                   }
               }
@@ -695,123 +1163,67 @@ jobs:
                   for attempt in 0..<2 {
                       do {
                           let (data, resp) = try await URLSession.shared.data(for: req)
-                          guard let http = resp as? HTTPURLResponse else {
-                              throw GroqError.networkError("No response")
-                          }
-                          if http.statusCode == 401 {
-                              throw GroqError.invalidKey
-                          }
-                          if http.statusCode == 429 {
-                              throw GroqError.rateLimited
-                          }
-                          guard (200..<300).contains(http.statusCode) else {
-                              throw GroqError.networkError("HTTP \(http.statusCode)")
-                          }
+                          guard let http = resp as? HTTPURLResponse else { throw GroqError.networkError("No response") }
+                          if http.statusCode == 401 { throw GroqError.invalidKey }
+                          if http.statusCode == 429 { throw GroqError.rateLimited }
+                          guard (200..<300).contains(http.statusCode) else { throw GroqError.networkError("HTTP \(http.statusCode)") }
                           guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                                 let choices = json["choices"] as? [[String: Any]],
                                 let first = choices.first,
                                 let message = first["message"] as? [String: Any],
-                                let content = message["content"] as? String else {
-                              throw GroqError.parseError
-                          }
+                                let content = message["content"] as? String else { throw GroqError.parseError }
                           return content.trimmingCharacters(in: .whitespacesAndNewlines)
                       } catch let error as URLError where error.code == .timedOut {
                           lastError = GroqError.timeout
-                          if attempt < 1 {
-                              try? await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempt)) * 1_000_000_000))
-                              continue
-                          }
+                          if attempt < 1 { try? await Task.sleep(nanoseconds: 1_000_000_000); continue }
                       } catch {
                           lastError = error
-                          if attempt < 1 && shouldRetry(error) {
-                              try? await Task.sleep(nanoseconds: 1_000_000_000)
-                              continue
-                          }
+                          if attempt < 1 { try? await Task.sleep(nanoseconds: 1_000_000_000); continue }
                       }
                       break
                   }
                   throw lastError ?? GroqError.networkError("Unknown error")
               }
-              private static func shouldRetry(_ error: Error) -> Bool {
-                  if let urlError = error as? URLError {
-                      return urlError.code == .timedOut ||
-                             urlError.code == .networkConnectionLost ||
-                             urlError.code == .notConnectedToInternet
-                  }
-                  if let groqError = error as? GroqError {
-                      switch groqError {
-                      case .timeout, .networkError:
-                          return true
-                      case .rateLimited:
-                          return false
-                      default:
-                          return false
-                      }
-                  }
-                  return false
-              }
               static func explainMove(fen: String, uci: String, san: String, eval: String, isArabic: Bool, ranking: Int, totalMoves: Int) async throws -> String {
-                  let sys = isArabic ?
-                      "أنت مدرب شطرنج محترف. اشرح النقلات بالعربية بشكل مفصل ومفيد." :
-                      "You are a GM-level chess coach. Explain moves clearly."
+                  let sys = isArabic ? "أنت مدرب شطرنج محترف. اشرح النقلات بالعربية بشكل مفصل ومفيد." : "You are a GM-level chess coach. Explain moves clearly."
                   let usr = isArabic ?
                       "الموقف: \(fen)\nالنقلة #\(ranking): \(san) (\(uci))\nالتقييم: \(eval)\n\nاشرحلي:\n1. لماذا هذه النقلة جيدة؟\n2. الخطة الاستراتيجية\n3. تهديدات الخصم\n4. نصائح تكتيكية\n\n4-6 أسطر." :
                       "Position: \(fen)\nMove #\(ranking): \(san) (\(uci))\nEval: \(eval)\n\nExplain:\n1. Why is this good?\n2. Strategic plan\n3. Opponent threats\n4. Tactical tips\n\n4-6 lines."
-                  return try await chat(messages: [
-                      ChatMessage(role: "system", content: sys),
-                      ChatMessage(role: "user", content: usr)
-                  ], temperature: 0.4)
+                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.4)
               }
               static func askAboutPosition(fen: String, question: String, isArabic: Bool, history: [ChatMessage] = []) async throws -> String {
-                  let sys = isArabic ?
-                      "أنت مدرب شطرنج. الموقف: \(fen). أجب بالعربية بشكل مفصل." :
-                      "You are a chess coach. Position: \(fen). Answer clearly."
+                  let sys = isArabic ? "أنت مدرب شطرنج. الموقف: \(fen). أجب بالعربية بشكل مفصل." : "You are a chess coach. Position: \(fen). Answer clearly."
                   var msgs: [ChatMessage] = [ChatMessage(role: "system", content: sys)]
                   msgs.append(contentsOf: history)
                   msgs.append(ChatMessage(role: "user", content: question))
                   return try await chat(messages: msgs, temperature: 0.7)
               }
               static func analyzeThreats(fen: String, isArabic: Bool) async throws -> String {
-                  let sys = isArabic ?
-                      "أنت مدرب شطرنج. حلل التهديدات بإيجاز." :
-                      "Chess coach. Analyze threats concisely."
+                  let sys = isArabic ? "أنت مدرب شطرنج. حلل التهديدات بإيجاز." : "Chess coach. Analyze threats concisely."
                   let usr = isArabic ?
                       "الموقف: \(fen)\n\nحدد:\n1. كل تهديدات الخصم\n2. القطع المعرضة للخطر\n3. أي فخاخ\n\nمختصر 3-5 أسطر." :
                       "Position: \(fen)\n\nIdentify:\n1. All threats\n2. Pieces in danger\n3. Traps\n\nConcise 3-5 lines."
-                  return try await chat(messages: [
-                      ChatMessage(role: "system", content: sys),
-                      ChatMessage(role: "user", content: usr)
-                  ], temperature: 0.3)
+                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.3)
               }
               static func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) async throws -> String {
-                  let sys = isArabic ?
-                      "أنت مدرب شطرنج تكتيكي محترف." :
-                      "You are a tactical chess coach."
+                  let sys = isArabic ? "أنت مدرب شطرنج تكتيكي محترف." : "You are a tactical chess coach."
                   let usr = isArabic ?
-                      "الموقف: \(fen)\nأفضل نقلة: \(bestMove)\n\nهذه فرصة تكتيكية! اشرح:\n1. نوع التكتيك (شوكة، سيخ، اكتشاف، إلخ)\n2. لماذا هذه النقلة تفوز؟\n3. ما هو الرد المتوقع؟\n4. النتيجة النهائية\n\n4-6 أسطر واضحة." :
-                      "Position: \(fen)\nBest move: \(bestMove)\n\nThis is a tactical opportunity! Explain:\n1. Type of tactic (fork, pin, discovered, etc.)\n2. Why does this move win?\n3. What's the expected response?\n4. Final outcome\n\n4-6 clear lines."
-                  return try await chat(messages: [
-                      ChatMessage(role: "system", content: sys),
-                      ChatMessage(role: "user", content: usr)
-                  ], temperature: 0.3)
+                      "الموقف: \(fen)\nأفضل نقلة: \(bestMove)\n\nهذه فرصة تكتيكية! اشرح:\n1. نوع التكتيك\n2. لماذا هذه النقلة تفوز؟\n3. الرد المتوقع\n4. النتيجة\n\n4-6 أسطر." :
+                      "Position: \(fen)\nBest move: \(bestMove)\n\nTactical opportunity! Explain:\n1. Type of tactic\n2. Why does this win?\n3. Expected response\n4. Outcome\n\n4-6 lines."
+                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.3)
               }
               static func reviewGame(movesUCI: [String], accuracy: Double, blunders: Int, mistakes: Int, isArabic: Bool) async throws -> String {
-                  let sys = isArabic ?
-                      "أنت مدرب شطرنج محترف. راجع اللعبة بأسلوب مشجع لكن صادق." :
-                      "You are a professional chess coach. Review the game encouragingly but honestly."
+                  let sys = isArabic ? "أنت مدرب شطرنج محترف. راجع اللعبة بأسلوب مشجع لكن صادق." : "You are a professional chess coach. Review the game encouragingly but honestly."
                   let movesStr = movesUCI.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: " ")
                   let usr = isArabic ?
-                      "اللعبة:\n\(movesStr)\n\nالدقة: \(Int(accuracy))%\nأخطاء فادحة: \(blunders)\nأخطاء: \(mistakes)\n\nاعطني:\n1. ملخص أداء اللاعب\n2. أهم نقاط القوة\n3. أهم نقاط الضعف\n4. نصيحة للتحسن\n\n5-8 أسطر." :
-                      "Game:\n\(movesStr)\n\nAccuracy: \(Int(accuracy))%\nBlunders: \(blunders)\nMistakes: \(mistakes)\n\nGive me:\n1. Performance summary\n2. Key strengths\n3. Key weaknesses\n4. Improvement tip\n\n5-8 lines."
-                  return try await chat(messages: [
-                      ChatMessage(role: "system", content: sys),
-                      ChatMessage(role: "user", content: usr)
-                  ], temperature: 0.5)
+                      "اللعبة:\n\(movesStr)\n\nالدقة: \(Int(accuracy))%\nأخطاء فادحة: \(blunders)\nأخطاء: \(mistakes)\n\nاعطني ملخص وتحسينات. 5-8 أسطر." :
+                      "Game:\n\(movesStr)\n\nAccuracy: \(Int(accuracy))%\nBlunders: \(blunders)\nMistakes: \(mistakes)\n\nGive summary and improvements. 5-8 lines."
+                  return try await chat(messages: [ChatMessage(role: "system", content: sys), ChatMessage(role: "user", content: usr)], temperature: 0.5)
               }
           }
           '''
 
-          # ========== EngineService with FAST RACE ==========
+          # ========== EngineService - UPDATED with Opening Book + Tablebase ==========
           files["Sources/EngineService.swift"] = r'''
           import Foundation
           struct TopMove: Identifiable, Equatable {
@@ -838,6 +1250,8 @@ jobs:
               let topMoves: [TopMove]; let bestMove: TopMove?
               let depth: Int; let sourcesUsed: String
               let confidence: Int; let debugFen: String
+              let openingName: String?
+              let tablebaseResult: TablebaseResult?
           }
           enum EngineError: Error, LocalizedError {
               case badFen(String), networkOffline, allEnginesFailed, cancelled
@@ -851,6 +1265,18 @@ jobs:
               }
           }
           enum EngineService {
+              // MARK: - Opening Book Check (INSTANT)
+              static func checkOpeningBook(fen: String) async -> OpeningInfo? {
+                  await OpeningBook.shared.load()
+                  return await OpeningBook.shared.lookup(fen: fen)
+              }
+              
+              // MARK: - Tablebase Check (for endgames)
+              static func checkTablebase(fen: String) async -> TablebaseResult? {
+                  return await TablebaseService.probe(fen: fen)
+              }
+              
+              // MARK: - Cloud APIs
               static func callLichessCloud(fen: String, multiPv: Int = 3) async -> [TopMove]? {
                   var comps = URLComponents(string: "https://lichess.org/api/cloud-eval")!
                   comps.queryItems = [URLQueryItem(name: "fen", value: fen), URLQueryItem(name: "multiPv", value: "\(multiPv)")]
@@ -878,12 +1304,13 @@ jobs:
                       return moves
                   } catch { return nil }
               }
+              
               static func callChessApi(fen: String, deep: Bool = false) async -> TopMove? {
                   guard let url = URL(string: "https://chess-api.com/v1") else { return nil }
                   var req = URLRequest(url: url); req.httpMethod = "POST"
                   req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  req.timeoutInterval = deep ? 12 : 5; req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                  req.timeoutInterval = deep ? 12 : 5
                   let body: [String: Any] = ["fen": fen, "depth": deep ? 18 : 13, "maxThinkingTime": deep ? 800 : 200]
                   guard let hb = try? JSONSerialization.data(withJSONObject: body) else { return nil }
                   req.httpBody = hb
@@ -898,12 +1325,12 @@ jobs:
                       return TopMove(rank: 1, uci: uci, san: san, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "cA", votes: 1)
                   } catch { return nil }
               }
+              
               static func callStockfishOnline(fen: String, deep: Bool = false) async -> TopMove? {
                   var comps = URLComponents(string: "https://stockfish.online/api/s/v2.php")!
                   comps.queryItems = [URLQueryItem(name: "fen", value: fen), URLQueryItem(name: "depth", value: deep ? "15" : "13")]
                   guard let url = comps.url else { return nil }
                   var req = URLRequest(url: url); req.timeoutInterval = deep ? 12 : 5
-                  req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
                   do {
                       let (data, _) = try await URLSession.shared.data(for: req)
@@ -914,30 +1341,76 @@ jobs:
                       var uci = ""
                       for (i, p) in parts.enumerated() where p == "bestmove" && i+1 < parts.count { uci = parts[i+1]; break }
                       if uci.isEmpty { uci = parts.first ?? "" }
-                      guard !uci.isEmpty else { return nil }
-                      guard MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
+                      guard !uci.isEmpty, MoveValidator.isPlausibleMove(uci: uci, fen: fen) else { return nil }
                       let ev = json["evaluation"] as? Double; let mate = json["mate"] as? Int
                       let cp: Int? = ev.map { Int(($0 * 100).rounded()) }; let d = (json["depth"] as? Int) ?? 13
                       return TopMove(rank: 1, uci: uci, san: uci, evaluationCp: cp, mateIn: (mate == 0 ? nil : mate), depth: d, source: "sf", votes: 1)
                   } catch { return nil }
               }
+              
+              // MARK: - Main Analysis (with Opening Book + Tablebase + Engines)
               static func analyzeStreaming(fen: String, moveHistory: [String], deep: Bool = false,
                                             onUpdate: @escaping @MainActor (EngineAnalysis) -> Void) async throws -> EngineAnalysis {
                   if let issue = FenValidator.validate(fen) { throw EngineError.badFen(issue) }
+                  
+                  // 1. Check Opening Book FIRST (instant!)
+                  let openingInfo = await checkOpeningBook(fen: fen)
+                  if let opening = openingInfo {
+                      // Return opening book moves immediately
+                      let bookMoves = opening.moves.prefix(3).enumerated().map { idx, move in
+                          TopMove(rank: idx + 1, uci: move, san: move, evaluationCp: 0, mateIn: nil, depth: 99, source: "book", votes: 3)
+                      }
+                      if !bookMoves.isEmpty {
+                          let a = EngineAnalysis(topMoves: Array(bookMoves), bestMove: bookMoves.first, depth: 99,
+                                                  sourcesUsed: "📖 book", confidence: 3, debugFen: fen,
+                                                  openingName: "\(opening.eco): \(opening.name)", tablebaseResult: nil)
+                          await MainActor.run { onUpdate(a) }
+                          return a
+                      }
+                  }
+                  
+                  // 2. Check Tablebase for endgames (≤7 pieces)
+                  let pieceCount = FenValidator.countPieces(fen)
+                  var tbResult: TablebaseResult? = nil
+                  if pieceCount <= 7 {
+                      tbResult = await checkTablebase(fen: fen)
+                      if let tb = tbResult, let bestMove = tb.bestMove {
+                          let evalCp: Int
+                          switch tb.category {
+                          case .win: evalCp = 10000
+                          case .loss: evalCp = -10000
+                          case .draw, .unknown: evalCp = 0
+                          }
+                          let tbMove = TopMove(rank: 1, uci: bestMove, san: bestMove, evaluationCp: evalCp,
+                                               mateIn: tb.dtm, depth: 99, source: "TB", votes: 3)
+                          let a = EngineAnalysis(topMoves: [tbMove], bestMove: tbMove, depth: 99,
+                                                  sourcesUsed: "🏁 tablebase", confidence: 3, debugFen: fen,
+                                                  openingName: nil, tablebaseResult: tb)
+                          await MainActor.run { onUpdate(a) }
+                          return a
+                      }
+                  }
+                  
+                  // 3. Check Cache
                   if !deep, let cached = await AnalysisCache.shared.get(fen: fen) {
                       let cm = cached.moves.enumerated().map { (i, m) in
                           TopMove(rank: i + 1, uci: m.uci, san: m.san, evaluationCp: m.evaluationCp, mateIn: m.mateIn, depth: m.depth, source: "cache", votes: m.votes)
                       }
-                      let a = EngineAnalysis(topMoves: cm, bestMove: cm.first, depth: cached.depth, sourcesUsed: "cache", confidence: cached.confidence, debugFen: fen)
+                      let a = EngineAnalysis(topMoves: cm, bestMove: cm.first, depth: cached.depth, sourcesUsed: "cache", confidence: cached.confidence, debugFen: fen, openingName: nil, tablebaseResult: nil)
                       await MainActor.run { onUpdate(a) }
                       return a
                   }
+                  
+                  // 4. Call Cloud APIs in parallel
                   async let lr = callLichessCloud(fen: fen, multiPv: deep ? 5 : 3)
                   async let cr = callChessApi(fen: fen, deep: deep)
                   async let sr = callStockfishOnline(fen: fen, deep: deep)
+                  
                   let lichess = await lr; try Task.checkCancellation()
                   let cA = await cr; try Task.checkCancellation()
                   let sf = await sr; try Task.checkCancellation()
+                  
+                  // 5. Merge results with voting
                   var mv: [String: (move: TopMove, votes: Int, sources: [String])] = [:]
                   if let lm = lichess { for m in lm {
                       if var e = mv[m.uci] { e.votes += 1; e.sources.append("lc"); mv[m.uci] = e }
@@ -951,10 +1424,12 @@ jobs:
                       if var e = mv[m.uci] { e.votes += 1; e.sources.append("sf"); mv[m.uci] = e }
                       else { mv[m.uci] = (m, 1, ["sf"]) }
                   }
+                  
                   guard !mv.isEmpty else {
                       if lichess == nil && cA == nil && sf == nil { throw EngineError.networkOffline }
                       throw EngineError.allEnginesFailed
                   }
+                  
                   let sorted = mv.values.sorted { a, b in
                       if a.votes != b.votes { return a.votes > b.votes }
                       return a.move.rankScore > b.move.rankScore
@@ -966,18 +1441,34 @@ jobs:
                   let topV = final.first?.votes ?? 1
                   let allS = Array(Set(mv.values.flatMap { $0.sources })).sorted().joined(separator: "+")
                   let bestD = final.map { $0.depth }.max() ?? 13
-                  let identical = final.count >= 2 && final.allSatisfy { $0.evaluationCp == final.first?.evaluationCp }
-                  let analysis = EngineAnalysis(topMoves: final, bestMove: final.first, depth: bestD, sourcesUsed: allS, confidence: min(topV, 3), debugFen: fen)
-                  if !identical && !deep {
+                  
+                  let analysis = EngineAnalysis(topMoves: final, bestMove: final.first, depth: bestD, sourcesUsed: allS, confidence: min(topV, 3), debugFen: fen, openingName: nil, tablebaseResult: nil)
+                  
+                  if !deep {
                       await AnalysisCache.shared.set(fen: fen, moves: final, depth: bestD, sources: allS, confidence: min(topV, 3))
                   }
+                  
                   await MainActor.run { onUpdate(analysis) }
                   return analysis
               }
           }
           '''
 
-          # ========== AIAssistantViewModel ==========
+          for path, content in files.items():
+              content = textwrap.dedent(content).strip() + "\n"
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w") as f: f.write(content)
+              print(f"  ✅ {path}")
+          print(f"\nWrote {len(files)} Swift files (Part 3 - Services)")
+          PYEOF
+
+      - name: Generate Swift source files (Part 4 - ViewModels)
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import os, textwrap
+          files = {}
+
           files["Sources/AIAssistantViewModel.swift"] = r'''
           import Foundation
           import SwiftUI
@@ -1004,22 +1495,16 @@ jobs:
               func explainMove(fen: String, uci: String, san: String, eval: String, ranking: Int, totalMoves: Int, isArabic: Bool) {
                   let cacheKey = "\(fen)|\(uci)|\(isArabic ? "ar" : "en")"
                   if let cached = explanationCache[cacheKey] {
-                      currentExplanation = cached; currentExplainedMove = san
-                      explanationError = ""; isLoadingExplanation = false; return
+                      currentExplanation = cached; currentExplainedMove = san; explanationError = ""; isLoadingExplanation = false; return
                   }
-                  currentExplanation = ""; currentExplainedMove = san
-                  explanationError = ""; isLoadingExplanation = true
+                  currentExplanation = ""; currentExplainedMove = san; explanationError = ""; isLoadingExplanation = true
                   explanationTask?.cancel()
                   explanationTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
                           let r = try await GroqService.explainMove(fen: fen, uci: uci, san: san, eval: eval, isArabic: isArabic, ranking: ranking, totalMoves: totalMoves)
                           if Task.isCancelled { return }
-                          await MainActor.run {
-                              self.currentExplanation = r
-                              self.explanationCache[cacheKey] = r
-                              self.isLoadingExplanation = false
-                          }
+                          await MainActor.run { self.currentExplanation = r; self.explanationCache[cacheKey] = r; self.isLoadingExplanation = false }
                       } catch {
                           if Task.isCancelled { return }
                           await MainActor.run { self.explanationError = error.localizedDescription; self.isLoadingExplanation = false }
@@ -1027,20 +1512,15 @@ jobs:
                   }
               }
               func explainPuzzle(fen: String, bestMove: String, isArabic: Bool) {
-                  currentExplanation = ""
-                  currentExplainedMove = "🧩 " + (isArabic ? "فرصة تكتيكية" : "Tactical Opportunity")
-                  explanationError = ""
-                  isLoadingExplanation = true
+                  currentExplanation = ""; currentExplainedMove = "🧩 " + (isArabic ? "فرصة تكتيكية" : "Tactical Opportunity")
+                  explanationError = ""; isLoadingExplanation = true
                   explanationTask?.cancel()
                   explanationTask = Task { [weak self] in
                       guard let self = self else { return }
                       do {
                           let r = try await GroqService.explainPuzzle(fen: fen, bestMove: bestMove, isArabic: isArabic)
                           if Task.isCancelled { return }
-                          await MainActor.run {
-                              self.currentExplanation = r
-                              self.isLoadingExplanation = false
-                          }
+                          await MainActor.run { self.currentExplanation = r; self.isLoadingExplanation = false }
                       } catch {
                           if Task.isCancelled { return }
                           await MainActor.run { self.explanationError = error.localizedDescription; self.isLoadingExplanation = false }
@@ -1049,14 +1529,9 @@ jobs:
               }
               func clearExplanation() { currentExplanation = ""; currentExplainedMove = ""; explanationError = "" }
               func sendChat(fen: String, isArabic: Bool) {
-                  let q = chatInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                  guard !q.isEmpty else { return }
-                  chatInput = ""
-                  chatMessages.append(ChatEntry(role: "user", text: q))
-                  isLoadingChat = true
-                  let hist: [GroqService.ChatMessage] = chatMessages.suffix(6).dropLast().map {
-                      GroqService.ChatMessage(role: $0.role == "user" ? "user" : "assistant", content: $0.text)
-                  }
+                  let q = chatInput.trimmingCharacters(in: .whitespacesAndNewlines); guard !q.isEmpty else { return }
+                  chatInput = ""; chatMessages.append(ChatEntry(role: "user", text: q)); isLoadingChat = true
+                  let hist: [GroqService.ChatMessage] = chatMessages.suffix(6).dropLast().map { GroqService.ChatMessage(role: $0.role == "user" ? "user" : "assistant", content: $0.text) }
                   Task { [weak self] in
                       guard let self = self else { return }
                       do {
@@ -1088,14 +1563,12 @@ jobs:
                       isPuzzleDetected = true
                       if let mate = best.mateIn { puzzleHint = "🧩 M\(abs(mate))!" }
                       else { puzzleHint = "🧩 +\(Int(gap))cp!" }
-                  } else {
-                      isPuzzleDetected = false; puzzleHint = ""
-                  }
+                  } else { isPuzzleDetected = false; puzzleHint = "" }
               }
           }
           '''
 
-          # ========== EngineViewModel with BLUNDER ALERT ==========
+          # ========== EngineViewModel - FIXED COLOR DETECTION ==========
           files["Sources/EngineViewModel.swift"] = r'''
           import Foundation
           import SwiftUI
@@ -1135,6 +1608,9 @@ jobs:
               @Published var enabled = true
               @Published var showBlunderAlert = false
               @Published var blunderAlertText = ""
+              @Published var currentOpeningName: String? = nil
+              @Published var isTablebasePosition = false
+              @Published var tablebaseCategory: String = ""
               var bestMove: TopMove? { topMoves.first }
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
               var isMyTurn: Bool { effectivePlayerColor == sideToMove }
@@ -1149,33 +1625,57 @@ jobs:
               private var moveHistoryUCI: [String] = []
               private var lastKnownPly: Int = -1
               weak var recorder: GameRecorder?
+              
+              // ✅ FIXED: Manual color toggle
               func setManualColor(_ c: String?) {
                   manualPlayerColor = c
+                  UserDefaults.standard.set(c, forKey: "manual_player_color")
                   if !currentFEN.isEmpty { lastSuccessfulFEN = ""; queueAnalyze(fen: currentFEN, immediate: true) }
               }
-              func flipColor() { setManualColor(effectivePlayerColor == "w" ? "b" : "w") }
+              
+              func flipColor() {
+                  let newColor = effectivePlayerColor == "w" ? "b" : "w"
+                  setManualColor(newColor)
+                  HapticManager.selection()
+              }
+              
               func resetFenTracker() {
                   fenBuilder.reset(); moveHistoryUCI = []; lastKnownPly = -1; lastSuccessfulFEN = ""
                   previousEvalWhitePOV = nil; previousFEN = ""; previousBestMove = nil
+                  currentOpeningName = nil; isTablebasePosition = false
                   Task { await AnalysisCache.shared.clear() }
                   recorder?.startNewGame()
               }
+              
               func deepAnalyze() {
                   guard !currentFEN.isEmpty else { return }
                   lastSuccessfulFEN = ""; isDeepAnalyzing = true
                   Task { await run(fen: currentFEN, deep: true) }
               }
+              
               struct BoardPayload {
                   let grid: String, sideToMove: String
                   let flipped: Bool, flippedConfident: Bool
                   let lastMoveUCI: String, plyCount: Int, detectionConfidence: String
                   let bottomColor: String
               }
+              
               func ingest(_ p: BoardPayload) {
                   guard enabled else { return }
                   sideToMove = p.sideToMove; lastMoveUCI = p.lastMoveUCI; plyCount = p.plyCount
                   confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  if p.bottomColor == "w" || p.bottomColor == "b" { detectedPlayerColor = p.bottomColor }
+                  
+                  // ✅ FIXED: Use flipped to detect player color correctly
+                  // flipped = true means black is at bottom = you are black
+                  // flipped = false means white is at bottom = you are white
+                  if manualPlayerColor == nil {
+                      if p.flippedConfident {
+                          detectedPlayerColor = p.flipped ? "b" : "w"
+                      } else if !p.bottomColor.isEmpty {
+                          detectedPlayerColor = p.bottomColor
+                      }
+                  }
+                  
                   if p.plyCount > lastKnownPly && !p.lastMoveUCI.isEmpty {
                       moveHistoryUCI.append(p.lastMoveUCI); lastKnownPly = p.plyCount
                   }
@@ -1194,9 +1694,11 @@ jobs:
                       previousFEN = currentFEN
                       currentFEN = fen; topMoves = []; evaluation = "—"; winChance = 50
                       errorMessage = ""; sourcesUsed = ""; engineConfidence = 0
+                      currentOpeningName = nil; isTablebasePosition = false
                       queueAnalyze(fen: fen)
                   }
               }
+              
               private func queueAnalyze(fen: String, immediate: Bool = false) {
                   debounceTask?.cancel(); retryTask?.cancel()
                   debounceTask = Task { [weak self] in
@@ -1205,6 +1707,7 @@ jobs:
                       await self?.run(fen: fen, deep: false)
                   }
               }
+              
               private func run(fen: String, deep: Bool) async {
                   if !deep && fen == lastSuccessfulFEN { return }
                   analysisTask?.cancel(); isThinking = true; errorMessage = ""
@@ -1218,6 +1721,11 @@ jobs:
                                   self.evaluation = best.evalString; self.winChance = best.winChance; self.depth = best.depth
                               }
                               self.sourcesUsed = partial.sourcesUsed; self.engineConfidence = partial.confidence
+                              self.currentOpeningName = partial.openingName
+                              if let tb = partial.tablebaseResult {
+                                  self.isTablebasePosition = true
+                                  self.tablebaseCategory = tb.category.rawValue.uppercased()
+                              }
                           }
                           if Task.isCancelled { return }
                           guard fen == self.currentFEN else { return }
@@ -1228,28 +1736,22 @@ jobs:
                               self.sourcesUsed = a.sourcesUsed; self.engineConfidence = a.confidence
                               self.isThinking = false; self.isDeepAnalyzing = false; self.isOffline = false
                               self.errorMessage = ""; self.lastSuccessfulFEN = fen
+                              self.currentOpeningName = a.openingName
+                              if let tb = a.tablebaseResult {
+                                  self.isTablebasePosition = true
+                                  self.tablebaseCategory = tb.category.rawValue.uppercased()
+                              }
                               let wpov = self.evalWhitePOV(a.bestMove)
                               self.computeQuality(cur: wpov)
                               if !self.previousFEN.isEmpty && !self.lastMoveUCI.isEmpty {
                                   let prevCP = self.previousEvalWhitePOV.map { Int(($0 * 100).rounded()) }
                                   let currCP = a.bestMove?.evaluationCp
-                                  self.recorder?.recordMove(
-                                      previousFen: self.previousFEN, previousEval: prevCP,
-                                      currentFen: fen, currentEval: currCP,
-                                      lastMoveUCI: self.lastMoveUCI, wasMyMove: self.lastMoveWasMine,
-                                      bestMoveUCI: self.previousBestMove, plyCount: self.plyCount
-                                  )
+                                  self.recorder?.recordMove(previousFen: self.previousFEN, previousEval: prevCP, currentFen: fen, currentEval: currCP, lastMoveUCI: self.lastMoveUCI, wasMyMove: self.lastMoveWasMine, bestMoveUCI: self.previousBestMove, plyCount: self.plyCount)
                                   if self.lastMoveWasMine && self.lastMoveCentipawnLoss >= 100 {
-                                      let qualityText = self.lastMoveQuality.rawValue
-                                      self.blunderAlertText = "\(qualityText) −\(self.lastMoveCentipawnLoss)cp"
+                                      self.blunderAlertText = "\(self.lastMoveQuality.rawValue) −\(self.lastMoveCentipawnLoss)cp"
                                       self.showBlunderAlert = true
                                       HapticManager.blunderWarning()
-                                      Task {
-                                          try? await Task.sleep(nanoseconds: 3_000_000_000)
-                                          await MainActor.run {
-                                              self.showBlunderAlert = false
-                                          }
-                                      }
+                                      Task { try? await Task.sleep(nanoseconds: 3_000_000_000); await MainActor.run { self.showBlunderAlert = false } }
                                   }
                               }
                               self.previousBestMove = a.bestMove?.uci
@@ -1273,25 +1775,25 @@ jobs:
                       }
                   }
               }
+              
               private func scheduleRetry(fen: String) {
                   retryTask?.cancel()
                   retryTask = Task { [weak self] in
                       try? await Task.sleep(nanoseconds: 5_000_000_000)
-                      guard let self = self, !Task.isCancelled else { return }
-                      guard fen == self.currentFEN, self.topMoves.isEmpty else { return }
+                      guard let self = self, !Task.isCancelled, fen == self.currentFEN, self.topMoves.isEmpty else { return }
                       await self.run(fen: fen, deep: false)
                   }
               }
+              
               private func evalWhitePOV(_ m: TopMove?) -> Double {
                   guard let m = m else { return 0 }
                   if let mate = m.mateIn, mate != 0 { return mate > 0 ? 30 : -30 }
                   let cp = Double(m.evaluationCp ?? 0) / 100.0
                   return sideToMove == "w" ? cp : -cp
               }
+              
               private func computeQuality(cur: Double) {
-                  guard let prev = previousEvalWhitePOV, !lastMoveUCI.isEmpty else {
-                      lastMoveQuality = .none; lastMoveCentipawnLoss = 0; return
-                  }
+                  guard let prev = previousEvalWhitePOV, !lastMoveUCI.isEmpty else { lastMoveQuality = .none; lastMoveCentipawnLoss = 0; return }
                   let mul: Double = (sideToMove == "w") ? -1 : 1
                   let loss = (prev - cur) * mul
                   let cp = Int((loss * 100).rounded())
@@ -1306,14 +1808,11 @@ jobs:
                   case 100...299: lastMoveQuality = .mistake
                   default: lastMoveQuality = .blunder
                   }
-                  if lastMoveWasMine && cp >= 100 {
-                      HapticManager.blunderWarning()
-                  }
+                  if lastMoveWasMine && cp >= 100 { HapticManager.blunderWarning() }
               }
           }
           '''
 
-          # ========== StealthManager ==========
           files["Sources/StealthManager.swift"] = r'''
           import SwiftUI
           import UIKit
@@ -1354,314 +1853,21 @@ jobs:
           extension Notification.Name { static let stealthPanic = Notification.Name("StealthPanicGesture") }
           '''
 
-          # ========== Review View ==========
-          files["Sources/ReviewView.swift"] = r'''
-          import SwiftUI
-          struct ReviewView: View {
-              @ObservedObject var recorder: GameRecorder
-              @ObservedObject var language: AppLanguage
-              @State private var showAIReview = false
-              @State private var aiReviewText = ""
-              @State private var isLoadingReview = false
-              @State private var showHistory = false
-              var body: some View {
-                  NavigationStack {
-                      ScrollView {
-                          VStack(spacing: 12) {
-                              statsCard
-                              accuracyBar
-                              qualityBreakdown
-                              aiReviewButton
-                              if !aiReviewText.isEmpty { aiReviewCard }
-                              movesListCard
-                              actionButtons
-                          }
-                          .padding()
-                      }
-                      .navigationTitle(language.isArabic ? "المراجعة" : "Review")
-                      .toolbar {
-                          ToolbarItem(placement: .topBarTrailing) {
-                              Button { showHistory = true } label: {
-                                  Image(systemName: "clock.arrow.circlepath")
-                              }
-                          }
-                      }
-                      .sheet(isPresented: $showHistory) {
-                          HistoryView(recorder: recorder, language: language)
-                      }
-                  }
-              }
-              private var statsCard: some View {
-                  VStack(alignment: .leading, spacing: 8) {
-                      HStack {
-                          Image(systemName: "chart.bar.fill").foregroundColor(.green)
-                          Text(language.isArabic ? "إحصائيات اللعبة" : "Game Stats").font(.headline)
-                          Spacer()
-                          Text("\(recorder.moves.count) " + (language.isArabic ? "نقلة" : "moves"))
-                              .font(.caption).foregroundColor(.secondary)
-                      }
-                      HStack(spacing: 20) {
-                          statItem(value: "\(recorder.myMoveCount)", label: language.isArabic ? "نقلاتك" : "Your moves", color: .blue)
-                          statItem(value: "\(recorder.moves.count - recorder.myMoveCount)", label: language.isArabic ? "الخصم" : "Opponent", color: .gray)
-                      }
-                  }
-                  .padding()
-                  .background(Color.gray.opacity(0.15))
-                  .cornerRadius(12)
-              }
-              private func statItem(value: String, label: String, color: Color) -> some View {
-                  VStack(alignment: .leading, spacing: 2) {
-                      Text(value).font(.title2.bold()).foregroundColor(color)
-                      Text(label).font(.caption).foregroundColor(.secondary)
-                  }
-              }
-              private var accuracyBar: some View {
-                  VStack(alignment: .leading, spacing: 6) {
-                      HStack {
-                          Text(language.isArabic ? "الدقة" : "Accuracy").font(.subheadline.bold())
-                          Spacer()
-                          Text("\(Int(recorder.currentAccuracy))%")
-                              .font(.title.bold())
-                              .foregroundColor(accuracyColor)
-                      }
-                      GeometryReader { geo in
-                          ZStack(alignment: .leading) {
-                              RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3))
-                              RoundedRectangle(cornerRadius: 6).fill(accuracyColor)
-                                  .frame(width: geo.size.width * CGFloat(recorder.currentAccuracy / 100))
-                          }
-                      }
-                      .frame(height: 12)
-                  }
-                  .padding()
-                  .background(Color.gray.opacity(0.15))
-                  .cornerRadius(12)
-              }
-              private var accuracyColor: Color {
-                  if recorder.currentAccuracy >= 90 { return .green }
-                  if recorder.currentAccuracy >= 75 { return .yellow }
-                  if recorder.currentAccuracy >= 60 { return .orange }
-                  return .red
-              }
-              private var qualityBreakdown: some View {
-                  VStack(alignment: .leading, spacing: 8) {
-                      Text(language.isArabic ? "تفاصيل جودة النقلات" : "Move Quality").font(.subheadline.bold())
-                      qualityRow(icon: "✨", label: language.isArabic ? "رائعة" : "Brilliant", count: recorder.brilliantCount, color: .cyan)
-                      qualityRow(icon: "⭐", label: language.isArabic ? "أفضل" : "Best", count: recorder.bestCount, color: .green)
-                      qualityRow(icon: "✓", label: language.isArabic ? "جيدة" : "Good", count: recorder.goodCount, color: Color.green.opacity(0.7))
-                      qualityRow(icon: "?!", label: language.isArabic ? "غير دقيقة" : "Inaccuracy", count: recorder.inaccuracyCount, color: .yellow)
-                      qualityRow(icon: "?", label: language.isArabic ? "خطأ" : "Mistake", count: recorder.mistakeCount, color: .orange)
-                      qualityRow(icon: "??", label: language.isArabic ? "خطأ فادح" : "Blunder", count: recorder.blunderCount, color: .red)
-                  }
-                  .padding()
-                  .background(Color.gray.opacity(0.15))
-                  .cornerRadius(12)
-              }
-              private func qualityRow(icon: String, label: String, count: Int, color: Color) -> some View {
-                  HStack {
-                      Text(icon).frame(width: 30)
-                      Text(label).font(.caption)
-                      Spacer()
-                      Text("\(count)").font(.caption.bold()).foregroundColor(color)
-                  }
-                  .padding(.vertical, 2)
-              }
-              private var aiReviewButton: some View {
-                  Button { requestAIReview() } label: {
-                      HStack {
-                          if isLoadingReview {
-                              ProgressView().scaleEffect(0.7)
-                              Text(language.isArabic ? "جاري التحليل..." : "Analyzing...").font(.subheadline.bold())
-                          } else {
-                              Image(systemName: "sparkles")
-                              Text(language.isArabic ? "طلب تحليل AI للعبة" : "Request AI Game Review").font(.subheadline.bold())
-                          }
-                      }
-                      .frame(maxWidth: .infinity)
-                      .padding()
-                      .background(Color.purple.opacity(0.3))
-                      .foregroundColor(.purple)
-                      .cornerRadius(10)
-                  }
-                  .disabled(isLoadingReview || recorder.moves.isEmpty)
-              }
-              private var aiReviewCard: some View {
-                  VStack(alignment: .leading, spacing: 8) {
-                      HStack {
-                          Image(systemName: "sparkles").foregroundColor(.purple)
-                          Text(language.isArabic ? "تحليل AI" : "AI Review").font(.headline)
-                      }
-                      Text(aiReviewText)
-                          .font(.callout)
-                          .foregroundColor(.white.opacity(0.9))
-                          .fixedSize(horizontal: false, vertical: true)
-                  }
-                  .padding()
-                  .background(Color.purple.opacity(0.15))
-                  .cornerRadius(12)
-              }
-              private var movesListCard: some View {
-                  VStack(alignment: .leading, spacing: 6) {
-                      Text(language.isArabic ? "قائمة النقلات" : "Move List").font(.subheadline.bold())
-                      if recorder.moves.isEmpty {
-                          Text(language.isArabic ? "لا توجد نقلات بعد" : "No moves yet")
-                              .font(.caption).foregroundColor(.secondary).padding()
-                      } else {
-                          ForEach(recorder.moves) { move in moveRow(move) }
-                      }
-                  }
-                  .padding()
-                  .background(Color.gray.opacity(0.15))
-                  .cornerRadius(12)
-              }
-              private func moveRow(_ move: GameRecorder.MoveRecord) -> some View {
-                  HStack {
-                      Text("\(move.ply).").font(.caption.monospaced()).foregroundColor(.secondary).frame(width: 30)
-                      Text(move.san.isEmpty ? move.uci : move.san)
-                          .font(.callout.bold())
-                          .foregroundColor(move.wasMyMove ? .white : .gray)
-                      Spacer()
-                      qualityBadge(move.quality)
-                      if move.cpLoss >= 30 {
-                          Text("-\(move.cpLoss)").font(.caption2.monospaced()).foregroundColor(.orange)
-                      }
-                      if let alt = move.bestAlternative, alt != move.uci {
-                          Text("→ \(alt)").font(.caption2.monospaced()).foregroundColor(.green)
-                      }
-                  }
-                  .padding(.vertical, 2)
-              }
-              private func qualityBadge(_ q: String) -> some View {
-                  let (label, color): (String, Color) = {
-                      switch q {
-                      case "brilliant": return ("!!", .cyan)
-                      case "best": return ("⭐", .green)
-                      case "good": return ("✓", .green.opacity(0.7))
-                      case "inaccuracy": return ("?!", .yellow)
-                      case "mistake": return ("?", .orange)
-                      case "blunder": return ("??", .red)
-                      default: return ("", .gray)
-                      }
-                  }()
-                  return Text(label)
-                      .font(.caption.bold())
-                      .foregroundColor(color)
-                      .padding(.horizontal, 6).padding(.vertical, 2)
-                      .background(color.opacity(0.2))
-                      .cornerRadius(4)
-              }
-              private var actionButtons: some View {
-                  HStack(spacing: 8) {
-                      Button {
-                          recorder.saveCurrentGame()
-                          HapticManager.success()
-                      } label: {
-                          Label(language.isArabic ? "حفظ" : "Save", systemImage: "square.and.arrow.down")
-                              .frame(maxWidth: .infinity)
-                              .padding()
-                              .background(Color.blue.opacity(0.3))
-                              .cornerRadius(8)
-                      }
-                      Button {
-                          recorder.startNewGame()
-                          aiReviewText = ""
-                          HapticManager.selection()
-                      } label: {
-                          Label(language.isArabic ? "لعبة جديدة" : "New Game", systemImage: "arrow.clockwise")
-                              .frame(maxWidth: .infinity)
-                              .padding()
-                              .background(Color.red.opacity(0.3))
-                              .cornerRadius(8)
-                      }
-                  }
-              }
-              private func requestAIReview() {
-                  guard !recorder.moves.isEmpty else { return }
-                  isLoadingReview = true
-                  aiReviewText = ""
-                  let movesUCI = recorder.moves.map { $0.uci }
-                  Task {
-                      do {
-                          let r = try await GroqService.reviewGame(
-                              movesUCI: movesUCI,
-                              accuracy: recorder.currentAccuracy,
-                              blunders: recorder.blunderCount,
-                              mistakes: recorder.mistakeCount,
-                              isArabic: language.isArabic
-                          )
-                          await MainActor.run {
-                              aiReviewText = r
-                              isLoadingReview = false
-                          }
-                      } catch {
-                          await MainActor.run {
-                              aiReviewText = "⚠️ \(error.localizedDescription)"
-                              isLoadingReview = false
-                          }
-                      }
-                  }
-              }
-          }
-          struct HistoryView: View {
-              @ObservedObject var recorder: GameRecorder
-              @ObservedObject var language: AppLanguage
-              @Environment(\.dismiss) var dismiss
-              @State private var history: [GameHistoryEntry] = []
-              var body: some View {
-                  NavigationStack {
-                      List {
-                          if history.isEmpty {
-                              Text(language.isArabic ? "لا توجد ألعاب محفوظة" : "No saved games")
-                                  .foregroundColor(.secondary)
-                          } else {
-                              ForEach(history) { entry in
-                                  VStack(alignment: .leading, spacing: 4) {
-                                      HStack {
-                                          Text(entry.date, style: .date).font(.caption)
-                                          Spacer()
-                                          Text("\(Int(entry.accuracy))%").font(.caption.bold()).foregroundColor(.green)
-                                      }
-                                      Text("\(entry.moves.count) " + (language.isArabic ? "نقلة" : "moves"))
-                                          .font(.caption2).foregroundColor(.secondary)
-                                  }
-                              }
-                          }
-                      }
-                      .navigationTitle(language.isArabic ? "السجل" : "History")
-                      .toolbar {
-                          ToolbarItem(placement: .topBarTrailing) {
-                              Button(language.isArabic ? "مسح" : "Clear", role: .destructive) {
-                                  recorder.clearHistory()
-                                  history = []
-                              }
-                          }
-                          ToolbarItem(placement: .topBarLeading) {
-                              Button(language.isArabic ? "إغلاق" : "Close") { dismiss() }
-                          }
-                      }
-                      .onAppear { history = recorder.loadHistory() }
-                  }
-              }
-          }
-          '''
-
-          # Continue in next part...
           for path, content in files.items():
               content = textwrap.dedent(content).strip() + "\n"
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, "w") as f: f.write(content)
               print(f"  ✅ {path}")
-          print(f"\nWrote {len(files)} Swift files (Part 1)")
+          print(f"\nWrote {len(files)} Swift files (Part 4 - ViewModels)")
           PYEOF
 
-      - name: Generate remaining Swift files (Part 2)
+      - name: Generate Swift source files (Part 5 - Views)
         shell: bash
         run: |
           python3 <<'PYEOF'
           import os, textwrap
           files = {}
 
-          # ========== ContentView ==========
           files["Sources/ContentView.swift"] = r'''
           import SwiftUI
           struct ContentView: View {
@@ -1677,7 +1883,7 @@ jobs:
                           .tabItem { Label(language.isArabic ? "لعب" : "Play", systemImage: "gamecontroller.fill") }.tag(0)
                       ReviewView(recorder: recorder, language: language)
                           .tabItem { Label(language.isArabic ? "مراجعة" : "Review", systemImage: "magnifyingglass") }.tag(1)
-                      SimpleTabView(title: language.isArabic ? "افتتاحيات" : "Openings", icon: "book.fill")
+                      OpeningsTabView(language: language)
                           .tabItem { Label(language.isArabic ? "افتتاحيات" : "Openings", systemImage: "book.fill") }.tag(2)
                       SimpleTabView(title: language.isArabic ? "ألغاز" : "Puzzles", icon: "puzzlepiece.fill")
                           .tabItem { Label(language.isArabic ? "ألغاز" : "Puzzles", systemImage: "puzzlepiece.fill") }.tag(3)
@@ -1686,9 +1892,7 @@ jobs:
                   }
                   .tint(.green)
                   .environment(\.layoutDirection, language.isArabic ? .rightToLeft : .leftToRight)
-                  .onAppear {
-                      engine.recorder = recorder
-                  }
+                  .onAppear { engine.recorder = recorder }
               }
           }
           struct SimpleTabView: View {
@@ -1698,14 +1902,40 @@ jobs:
                       VStack(spacing: 20) {
                           Image(systemName: icon).font(.system(size: 60)).foregroundColor(.green)
                           Text(title).font(.largeTitle.bold())
-                          Text("v6.0 Coming").foregroundColor(.secondary)
+                          Text("Coming Soon").foregroundColor(.secondary)
                       }.navigationTitle(title)
                   }
               }
           }
+          struct OpeningsTabView: View {
+              @ObservedObject var language: AppLanguage
+              @State private var openings: [(eco: String, name: String)] = []
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          ForEach(openings, id: \.eco) { opening in
+                              HStack {
+                                  Text(opening.eco).font(.caption.bold().monospaced()).foregroundColor(.green).frame(width: 40)
+                                  Text(opening.name).font(.subheadline)
+                              }
+                          }
+                      }
+                      .navigationTitle(language.isArabic ? "الافتتاحيات" : "Openings")
+                      .task { await loadOpenings() }
+                  }
+              }
+              func loadOpenings() async {
+                  await OpeningBook.shared.load()
+                  // Get sample openings
+                  openings = [
+                      ("B20", "Sicilian Defense"), ("C00", "French Defense"), ("B10", "Caro-Kann Defense"),
+                      ("C50", "Italian Game"), ("C60", "Ruy Lopez"), ("D06", "Queen's Gambit"),
+                      ("E60", "King's Indian"), ("A10", "English Opening"), ("D00", "London System")
+                  ]
+              }
+          }
           '''
 
-          # ========== PlayView ==========
           files["Sources/PlayView.swift"] = r'''
           import SwiftUI
           struct PlayView: View {
@@ -1726,10 +1956,7 @@ jobs:
                       ZStack {
                           HStack(spacing: 0) {
                               if stealth.overlayVisible && !engine.topMoves.isEmpty {
-                                  EvalBar(
-                                      winChance: engine.effectivePlayerColor == engine.sideToMove ? engine.winChance : (100 - engine.winChance),
-                                      evaluation: engine.evaluation, isMyTurn: engine.isMyTurn
-                                  )
+                                  EvalBar(winChance: engine.effectivePlayerColor == engine.sideToMove ? engine.winChance : (100 - engine.winChance), evaluation: engine.evaluation, isMyTurn: engine.isMyTurn)
                               }
                               ChessWebView(engine: engine, router: router)
                           }
@@ -1738,41 +1965,49 @@ jobs:
                           if aiPos.isVisible { draggableAIPanel }
                           if aiVM.isPuzzleDetected { puzzleBanner }
                           if engine.showBlunderAlert { blunderAlertBanner }
+                          if let opening = engine.currentOpeningName { openingBanner(opening) }
                       }
                   }
                   .overlay(alignment: .center) {
-                      if showDisclaimer {
-                          DisclaimerCard(language: language) { withAnimation { showDisclaimer = false } }.padding(24)
-                      }
+                      if showDisclaimer { DisclaimerCard(language: language) { withAnimation { showDisclaimer = false } }.padding(24) }
                   }
                   .onChange(of: engine.topMoves.count) { _ in
                       aiVM.checkForPuzzle(topMoves: engine.topMoves)
-                      if !engine.topMoves.isEmpty && engine.isMyTurn {
-                          HapticManager.moveReady()
+                      if !engine.topMoves.isEmpty && engine.isMyTurn { HapticManager.moveReady() }
+                  }
+              }
+              private func openingBanner(_ name: String) -> some View {
+                  VStack {
+                      HStack(spacing: 8) {
+                          Image(systemName: "book.fill").foregroundColor(.purple)
+                          Text(name).font(.caption.bold()).foregroundColor(.white)
+                          Spacer()
                       }
+                      .padding(.horizontal, 12).padding(.vertical, 6)
+                      .background(Color.purple.opacity(0.3))
+                      .cornerRadius(8)
+                      .padding(.horizontal, 20).padding(.top, 50)
+                      Spacer()
                   }
               }
               private var puzzleBanner: some View {
                   VStack {
                       Button {
                           if let best = engine.bestMove {
-                              aiPos.isVisible = true
-                              aiPos.isChatMode = false
+                              aiPos.isVisible = true; aiPos.isChatMode = false
                               aiVM.explainPuzzle(fen: engine.currentFEN, bestMove: best.san.isEmpty ? best.uci : best.san, isArabic: language.isArabic)
-                              HapticManager.selection()
+                              HapticManager.tacticalOpportunity()
                           }
                       } label: {
                           HStack(spacing: 8) {
                               Image(systemName: "puzzlepiece.fill").foregroundColor(.yellow)
-                              Text(language.isArabic ? "🧩 فرصة تكتيكية! (اضغط للشرح)" : "🧩 Tactical opportunity! (tap for AI)")
-                                  .font(.caption.bold()).foregroundColor(.yellow)
+                              Text(language.isArabic ? "🧩 فرصة تكتيكية!" : "🧩 Tactical opportunity!").font(.caption.bold()).foregroundColor(.yellow)
                               Spacer()
                               Text(aiVM.puzzleHint).font(.caption.bold().monospaced()).foregroundColor(.yellow)
                               Image(systemName: "sparkles").foregroundColor(.purple).font(.caption)
                           }
                           .padding(.horizontal, 12).padding(.vertical, 8)
-                          .background(Color.yellow.opacity(0.25))
-                          .cornerRadius(10)
+                          .background(Color.yellow.opacity(0.25)).cornerRadius(10)
                           .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.yellow.opacity(0.6), lineWidth: 1))
                       }
                       .padding(.horizontal, 20).padding(.top, 6)
@@ -1784,17 +2019,14 @@ jobs:
                       Spacer()
                       HStack(spacing: 8) {
                           Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.red)
-                          Text(language.isArabic ? "⚠️ نقلة سيئة!" : "⚠️ Bad move!")
-                              .font(.subheadline.bold()).foregroundColor(.red)
+                          Text(language.isArabic ? "⚠️ نقلة سيئة!" : "⚠️ Bad move!").font(.subheadline.bold()).foregroundColor(.red)
                           Spacer()
                           Text(engine.blunderAlertText).font(.caption.bold().monospaced()).foregroundColor(.red)
                       }
                       .padding(.horizontal, 16).padding(.vertical, 12)
-                      .background(Color.red.opacity(0.25))
-                      .cornerRadius(12)
+                      .background(Color.red.opacity(0.25)).cornerRadius(12)
                       .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.red.opacity(0.7), lineWidth: 2))
-                      .padding(.horizontal, 20)
-                      .padding(.bottom, 140)
+                      .padding(.horizontal, 20).padding(.bottom, 140)
                       .shadow(color: .red.opacity(0.5), radius: 10)
                       .transition(.move(edge: .bottom).combined(with: .opacity))
                   }
@@ -1802,21 +2034,12 @@ jobs:
               }
               private var draggableOverlay: some View {
                   GeometryReader { geo in
-                      HelperOverlay(engine: engine, stealth: stealth, overlayPos: overlayPos,
-                                    aiVM: aiVM, aiPos: aiPos, language: language)
+                      HelperOverlay(engine: engine, stealth: stealth, overlayPos: overlayPos, aiVM: aiVM, aiPos: aiPos, language: language)
                           .opacity(isDragging ? 1.0 : overlayPos.transparency)
-                          .position(
-                              x: geo.size.width / 2 + overlayPos.offset.width + dragOffset.width,
-                              y: geo.size.height - 100 + overlayPos.offset.height + dragOffset.height
-                          )
-                          .gesture(
-                              DragGesture(minimumDistance: 5)
-                                  .onChanged { v in isDragging = true; dragOffset = v.translation }
-                                  .onEnded { v in
-                                      overlayPos.offset = CGSize(width: overlayPos.offset.width + v.translation.width, height: overlayPos.offset.height + v.translation.height)
-                                      dragOffset = .zero; isDragging = false; overlayPos.save()
-                                  }
-                          )
+                          .position(x: geo.size.width / 2 + overlayPos.offset.width + dragOffset.width, y: geo.size.height - 100 + overlayPos.offset.height + dragOffset.height)
+                          .gesture(DragGesture(minimumDistance: 5)
+                              .onChanged { v in isDragging = true; dragOffset = v.translation }
+                              .onEnded { v in overlayPos.offset = CGSize(width: overlayPos.offset.width + v.translation.width, height: overlayPos.offset.height + v.translation.height); dragOffset = .zero; isDragging = false; overlayPos.save() })
                   }
               }
               private var draggableAIPanel: some View {
@@ -1836,10 +2059,8 @@ jobs:
                           .padding(.horizontal, 20).padding(.vertical, 12)
                           .background(Color.green).foregroundColor(.white)
                           .cornerRadius(24).shadow(color: .black.opacity(0.6), radius: 8, y: 3)
-                      }
-                      .padding(.bottom, 24)
-                  }
-                  .frame(maxWidth: .infinity)
+                      }.padding(.bottom, 24)
+                  }.frame(maxWidth: .infinity)
               }
               private var nav: some View {
                   HStack(spacing: 8) {
@@ -1849,16 +2070,12 @@ jobs:
                       btn("puzzlepiece.fill", language.isArabic ? "ألغاز" : "Puzzles") { router.openInPlay("https://www.chess.com/puzzles") }
                       btn("chart.line.uptrend.xyaxis", language.isArabic ? "تحليل" : "Analysis") { router.openInPlay("https://www.chess.com/analysis") }
                   }
-                  .padding(.horizontal, 8).padding(.vertical, 6)
-                  .background(Color.black.opacity(0.6))
+                  .padding(.horizontal, 8).padding(.vertical, 6).background(Color.black.opacity(0.6))
               }
               private func btn(_ icon: String, _ label: String, action: @escaping () -> Void) -> some View {
                   Button(action: action) {
-                      VStack(spacing: 2) {
-                          Image(systemName: icon).font(.system(size: 14))
-                          Text(label).font(.system(size: 10))
-                      }
-                      .frame(maxWidth: .infinity).foregroundColor(.white.opacity(0.9))
+                      VStack(spacing: 2) { Image(systemName: icon).font(.system(size: 14)); Text(label).font(.system(size: 10)) }
+                          .frame(maxWidth: .infinity).foregroundColor(.white.opacity(0.9))
                   }
               }
           }
@@ -1868,25 +2085,23 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v5.2").font(.title2.bold())
+                      Text("Chess Helper v6.0").font(.title2.bold())
                       Text(language.isArabic ? """
-                      إصدار احترافي - Phase 4!
-
-                      ✅ Timeout Protection (12s max)
-                      ✅ Fast Move Race (50% أسرع)
-                      ✅ تحذير فوري من النقلات السيئة
-                      ✅ شرح الفرص التكتيكية
-                      ✅ صوت + اهتزاز محسن
-                      ✅ Tab المراجعة الكامل
+                      🚀 الإصدار السادس!
+                      
+                      ✅ كشف لون اللاعب التلقائي
+                      ✅ قاعدة بيانات الافتتاحيات
+                      ✅ Tablebase للنهايات
+                      ✅ تحليل محلي Stockfish
+                      ✅ زر تبديل اللون 🔄
                       """ : """
-                      Professional v5.2 - Phase 4!
-
-                      ✅ Timeout Protection (12s max)
-                      ✅ Fast Move Race (50% faster)
-                      ✅ Immediate blunder warnings
-                      ✅ Puzzle explanations
-                      ✅ Enhanced voice + haptics
-                      ✅ Complete Review tab
+                      🚀 Version 6.0!
+                      
+                      ✅ Auto player color detection
+                      ✅ Opening book database
+                      ✅ Tablebase endgames
+                      ✅ Local Stockfish analysis
+                      ✅ Color flip button 🔄
                       """)
                       .font(.footnote).foregroundColor(.white.opacity(0.85)).multilineTextAlignment(.leading)
                       Button(action: onDismiss) {
@@ -1899,7 +2114,6 @@ jobs:
           }
           '''
 
-          # ========== EvalBar ==========
           files["Sources/EvalBar.swift"] = r'''
           import SwiftUI
           struct EvalBar: View {
@@ -1916,22 +2130,32 @@ jobs:
                       VStack(spacing: 0) {
                           Color.clear.frame(height: CGFloat(100 - winChance) / 100 * 400)
                           Color.black.frame(height: CGFloat(winChance) / 100 * 400)
-                      }
-                      .frame(height: 400)
+                      }.frame(height: 400)
                   }
                   .overlay(alignment: .center) {
-                      Text(evaluation)
-                          .font(.system(size: 9, weight: .bold, design: .monospaced))
-                          .foregroundColor(.green)
-                          .shadow(color: .black, radius: 2)
-                          .rotationEffect(.degrees(-90))
+                      Text(evaluation).font(.system(size: 9, weight: .bold, design: .monospaced)).foregroundColor(.green).shadow(color: .black, radius: 2).rotationEffect(.degrees(-90))
                   }
                   .frame(width: 22).cornerRadius(4).shadow(radius: 3)
               }
           }
           '''
 
-          # ========== HelperOverlay ==========
+          for path, content in files.items():
+              content = textwrap.dedent(content).strip() + "\n"
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w") as f: f.write(content)
+              print(f"  ✅ {path}")
+          print(f"\nWrote {len(files)} Swift files (Part 5 - Views)")
+          PYEOF
+
+      - name: Generate Swift source files (Part 6 - More Views)
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import os, textwrap
+          files = {}
+
+          # ========== HelperOverlay - WITH FLIP BUTTON ==========
           files["Sources/HelperOverlay.swift"] = r'''
           import SwiftUI
           struct HelperOverlay: View {
@@ -1948,8 +2172,7 @@ jobs:
                       Button { stealth.toggleMinimalMode() } label: {
                           Circle().fill(engine.isOffline ? Color.red : (engine.isMyTurn ? Color.green : Color.gray))
                               .frame(width: 24, height: 24)
-                              .overlay(Circle().stroke(Color.white.opacity(0.4), lineWidth: 1))
-                              .shadow(radius: 3)
+                              .overlay(Circle().stroke(Color.white.opacity(0.4), lineWidth: 1)).shadow(radius: 3)
                       }
                   } else { panel.frame(maxWidth: maxWidth) }
               }
@@ -1957,14 +2180,8 @@ jobs:
                   VStack(spacing: 0) {
                       header
                       if expanded {
-                          if engine.isOffline {
-                              HStack(spacing: 4) {
-                                  Image(systemName: "wifi.slash").font(.caption2).foregroundColor(.red)
-                                  Text("OFFLINE").font(.caption2.bold()).foregroundColor(.red)
-                                  Spacer(); ProgressView().scaleEffect(0.5)
-                              }
-                              .padding(.horizontal, 10).padding(.vertical, 3).background(Color.red.opacity(0.15))
-                          }
+                          if engine.isOffline { offlineBar }
+                          if engine.isTablebasePosition { tablebaseBar }
                           bestMoveHighlight
                           if !overlayPos.isCompact { movesSection }
                           actionButtons
@@ -1976,13 +2193,42 @@ jobs:
                   .overlay(RoundedRectangle(cornerRadius: 12).stroke(engine.isOffline ? Color.red.opacity(0.5) : Color.white.opacity(0.15), lineWidth: 1))
                   .shadow(color: .black.opacity(0.4), radius: 8, y: 3)
               }
+              private var offlineBar: some View {
+                  HStack(spacing: 4) {
+                      Image(systemName: "wifi.slash").font(.caption2).foregroundColor(.red)
+                      Text("OFFLINE").font(.caption2.bold()).foregroundColor(.red)
+                      Spacer(); ProgressView().scaleEffect(0.5)
+                  }
+                  .padding(.horizontal, 10).padding(.vertical, 3).background(Color.red.opacity(0.15))
+              }
+              private var tablebaseBar: some View {
+                  HStack(spacing: 4) {
+                      Image(systemName: "tablecells.fill").font(.caption2).foregroundColor(.cyan)
+                      Text("TABLEBASE: \(engine.tablebaseCategory)").font(.caption2.bold()).foregroundColor(.cyan)
+                      Spacer()
+                  }
+                  .padding(.horizontal, 10).padding(.vertical, 3).background(Color.cyan.opacity(0.15))
+              }
               private var header: some View {
-                  HStack(spacing: 8) {
+                  HStack(spacing: 6) {
                       Image(systemName: "hand.draw.fill").font(.caption2).foregroundColor(.white.opacity(0.5))
                       Circle().fill(engine.isOffline ? Color.red : Color.green).frame(width: 6, height: 6)
                       Text("Helper").font(.caption.bold())
                       if engine.isThinking { ProgressView().scaleEffect(0.5) }
                       Spacer()
+                      
+                      // ✅ COLOR INDICATOR WITH FLIP BUTTON
+                      Button { engine.flipColor() } label: {
+                          HStack(spacing: 3) {
+                              Circle().fill(engine.effectivePlayerColor == "w" ? .white : .black)
+                                  .frame(width: 12, height: 12)
+                                  .overlay(Circle().stroke(Color.gray, lineWidth: 1))
+                              Image(systemName: "arrow.triangle.2.circlepath").font(.caption2).foregroundColor(.blue)
+                          }
+                          .padding(.horizontal, 6).padding(.vertical, 2)
+                          .background(Color.blue.opacity(0.2)).cornerRadius(6)
+                      }
+                      
                       Text(engine.isMyTurn ? (language.isArabic ? "دورك" : "Your turn") : (language.isArabic ? "انتظر" : "Wait"))
                           .font(.caption2.bold()).foregroundColor(engine.isMyTurn ? .green : .secondary)
                       Button { stealth.hide(reason: "manual") } label: {
@@ -2000,15 +2246,11 @@ jobs:
                       HStack(spacing: 10) {
                           VStack(alignment: .leading, spacing: 1) {
                               HStack(spacing: 3) {
-                                  Image(systemName: "star.fill").font(.caption2).foregroundColor(cc)
-                                  Text(language.isArabic ? "الأفضل" : "BEST").font(.caption2.bold()).foregroundColor(cc)
-                                  Text(confidenceLabel).font(.caption2.bold().monospaced())
-                                      .padding(.horizontal, 4).background(cc.opacity(0.25))
-                                      .foregroundColor(cc).cornerRadius(3)
+                                  Image(systemName: best.source.contains("book") ? "book.fill" : (best.source.contains("TB") ? "tablecells.fill" : "star.fill")).font(.caption2).foregroundColor(cc)
+                                  Text(best.source.contains("book") ? "BOOK" : (best.source.contains("TB") ? "TB" : (language.isArabic ? "الأفضل" : "BEST"))).font(.caption2.bold()).foregroundColor(cc)
+                                  Text(confidenceLabel).font(.caption2.bold().monospaced()).padding(.horizontal, 4).background(cc.opacity(0.25)).foregroundColor(cc).cornerRadius(3)
                               }
-                              Text(best.san.isEmpty ? best.uci : best.san)
-                                  .font(.system(size: overlayPos.isCompact ? 22 : 28, weight: .black, design: .rounded))
-                                  .foregroundColor(cc).minimumScaleFactor(0.7).lineLimit(1)
+                              Text(best.san.isEmpty ? best.uci : best.san).font(.system(size: overlayPos.isCompact ? 22 : 28, weight: .black, design: .rounded)).foregroundColor(cc).minimumScaleFactor(0.7).lineLimit(1)
                               Text(best.uci).font(.caption2.monospaced()).foregroundColor(.secondary)
                           }
                           Spacer()
@@ -2019,8 +2261,7 @@ jobs:
                                   VoiceManager.shared.speakMove(uci: best.uci, san: best.san, isArabic: language.isArabic)
                                   HapticManager.selection()
                               } label: {
-                                  Image(systemName: "speaker.wave.2.fill").font(.caption).foregroundColor(.blue)
-                                      .padding(3).background(Color.blue.opacity(0.2)).cornerRadius(4)
+                                  Image(systemName: "speaker.wave.2.fill").font(.caption).foregroundColor(.blue).padding(3).background(Color.blue.opacity(0.2)).cornerRadius(4)
                               }
                           }
                       }
@@ -2031,16 +2272,20 @@ jobs:
                   }
               }
               private var confidenceColor: Color {
+                  if engine.bestMove?.source.contains("book") == true { return .purple }
+                  if engine.bestMove?.source.contains("TB") == true { return .cyan }
                   switch engine.engineConfidence { case 3: return .green; case 2: return .yellow; case 1: return .orange; default: return .gray }
               }
               private var confidenceLabel: String {
+                  if engine.bestMove?.source.contains("book") == true { return "📖" }
+                  if engine.bestMove?.source.contains("TB") == true { return "🏁" }
                   switch engine.engineConfidence { case 3: return "3/3"; case 2: return "2/3"; case 1: return "1/3"; default: return "?" }
               }
               private var movesSection: some View {
                   VStack(alignment: .leading, spacing: 2) {
                       Divider().opacity(0.3)
                       ForEach(Array(engine.topMoves.enumerated()), id: \.element.id) { idx, m in
-                          let rc = rankColor(idx + 1, votes: m.votes)
+                          let rc = rankColor(idx + 1, votes: m.votes, source: m.source)
                           HStack(spacing: 5) {
                               Text("#\(idx+1)").font(.caption2.bold().monospaced()).foregroundColor(rc).frame(width: 18)
                               Text(m.san.isEmpty ? m.uci : m.san).font(.caption.bold()).foregroundColor(rc)
@@ -2053,8 +2298,7 @@ jobs:
                               Text(m.evalString).font(.caption2.bold().monospaced()).foregroundColor(rc)
                               Button {
                                   aiPos.isVisible = true; aiPos.isChatMode = false
-                                  aiVM.explainMove(fen: engine.currentFEN, uci: m.uci, san: m.san, eval: m.evalString,
-                                                   ranking: idx + 1, totalMoves: engine.topMoves.count, isArabic: language.isArabic)
+                                  aiVM.explainMove(fen: engine.currentFEN, uci: m.uci, san: m.san, eval: m.evalString, ranking: idx + 1, totalMoves: engine.topMoves.count, isArabic: language.isArabic)
                               } label: {
                                   Image(systemName: "sparkles").font(.caption2).foregroundColor(.purple)
                               }
@@ -2069,16 +2313,11 @@ jobs:
                       Button {
                           if let best = engine.bestMove {
                               aiPos.isVisible = true; aiPos.isChatMode = false
-                              aiVM.explainMove(fen: engine.currentFEN, uci: best.uci, san: best.san, eval: best.evalString,
-                                               ranking: best.rank, totalMoves: engine.topMoves.count, isArabic: language.isArabic)
+                              aiVM.explainMove(fen: engine.currentFEN, uci: best.uci, san: best.san, eval: best.evalString, ranking: best.rank, totalMoves: engine.topMoves.count, isArabic: language.isArabic)
                           }
                       } label: {
-                          HStack(spacing: 4) {
-                              Image(systemName: "sparkles").font(.caption2)
-                              Text(language.isArabic ? "اسأل AI" : "Ask AI").font(.caption2.bold())
-                          }
-                          .padding(.horizontal, 8).padding(.vertical, 5)
-                          .background(Color.purple.opacity(0.3)).foregroundColor(.purple).cornerRadius(6)
+                          HStack(spacing: 4) { Image(systemName: "sparkles").font(.caption2); Text(language.isArabic ? "اسأل AI" : "Ask AI").font(.caption2.bold()) }
+                              .padding(.horizontal, 8).padding(.vertical, 5).background(Color.purple.opacity(0.3)).foregroundColor(.purple).cornerRadius(6)
                       }
                       Button { engine.deepAnalyze() } label: {
                           HStack(spacing: 4) {
@@ -2086,24 +2325,19 @@ jobs:
                               else { Image(systemName: "brain.head.profile").font(.caption2) }
                               Text(language.isArabic ? "عميق" : "Deep").font(.caption2.bold())
                           }
-                          .padding(.horizontal, 8).padding(.vertical, 5)
-                          .background(Color.cyan.opacity(0.3)).foregroundColor(.cyan).cornerRadius(6)
+                          .padding(.horizontal, 8).padding(.vertical, 5).background(Color.cyan.opacity(0.3)).foregroundColor(.cyan).cornerRadius(6)
                       }.disabled(engine.isDeepAnalyzing)
-                      Button {
-                          aiPos.isVisible = true; aiPos.isChatMode = true
-                      } label: {
-                          HStack(spacing: 4) {
-                              Image(systemName: "bubble.left.and.bubble.right.fill").font(.caption2)
-                              Text(language.isArabic ? "دردشة" : "Chat").font(.caption2.bold())
-                          }
-                          .padding(.horizontal, 8).padding(.vertical, 5)
-                          .background(Color.blue.opacity(0.3)).foregroundColor(.blue).cornerRadius(6)
+                      Button { aiPos.isVisible = true; aiPos.isChatMode = true } label: {
+                          HStack(spacing: 4) { Image(systemName: "bubble.left.and.bubble.right.fill").font(.caption2); Text(language.isArabic ? "دردشة" : "Chat").font(.caption2.bold()) }
+                              .padding(.horizontal, 8).padding(.vertical, 5).background(Color.blue.opacity(0.3)).foregroundColor(.blue).cornerRadius(6)
                       }
                       Spacer()
                   }
                   .padding(.horizontal, 8).padding(.vertical, 4)
               }
-              private func rankColor(_ rank: Int, votes: Int) -> Color {
+              private func rankColor(_ rank: Int, votes: Int, source: String) -> Color {
+                  if source.contains("book") { return .purple }
+                  if source.contains("TB") { return .cyan }
                   if votes >= 3 { return .green }; if votes >= 2 { return .yellow }
                   switch rank { case 1: return .orange; case 2: return .white.opacity(0.85); default: return .white.opacity(0.7) }
               }
@@ -2112,10 +2346,7 @@ jobs:
                       Text(engine.lastMoveWasMine ? (language.isArabic ? "أنت:" : "You:") : (language.isArabic ? "الخصم:" : "Opp:")).font(.caption2).foregroundColor(.secondary)
                       Text(engine.lastMoveUCI).font(.caption2.monospaced()).foregroundColor(.white.opacity(0.85))
                       Spacer()
-                      Text(engine.lastMoveQuality.rawValue).font(.caption2.bold())
-                          .padding(.horizontal, 4).padding(.vertical, 1)
-                          .background(engine.lastMoveQuality.color.opacity(0.25))
-                          .foregroundColor(engine.lastMoveQuality.color).cornerRadius(3)
+                      Text(engine.lastMoveQuality.rawValue).font(.caption2.bold()).padding(.horizontal, 4).padding(.vertical, 1).background(engine.lastMoveQuality.color.opacity(0.25)).foregroundColor(engine.lastMoveQuality.color).cornerRadius(3)
                   }
                   .padding(.horizontal, 10).padding(.bottom, 4)
               }
@@ -2129,7 +2360,6 @@ jobs:
           }
           '''
 
-          # ========== AIAssistantPanel ==========
           files["Sources/AIAssistantPanel.swift"] = r'''
           import SwiftUI
           struct AIAssistantPanel: View {
@@ -2141,23 +2371,15 @@ jobs:
               @State private var panelDragOffset: CGSize = .zero
               var body: some View {
                   VStack(spacing: 0) {
-                      header.gesture(
-                          DragGesture(minimumDistance: 5)
-                              .onChanged { v in panelDragOffset = v.translation }
-                              .onEnded { v in
-                                  aiPos.offset = CGSize(width: aiPos.offset.width + v.translation.width, height: aiPos.offset.height + v.translation.height)
-                                  panelDragOffset = .zero
-                                  aiPos.save()
-                              }
-                      )
+                      header.gesture(DragGesture(minimumDistance: 5)
+                          .onChanged { v in panelDragOffset = v.translation }
+                          .onEnded { v in aiPos.offset = CGSize(width: aiPos.offset.width + v.translation.width, height: aiPos.offset.height + v.translation.height); panelDragOffset = .zero; aiPos.save() })
                       if aiPos.isChatMode { chatContent } else { explanationContent }
                       if !aiPos.isChatMode { threatSection }
                   }
-                  .frame(maxWidth: 320)
-                  .background(.ultraThinMaterial).cornerRadius(14)
+                  .frame(maxWidth: 320).background(.ultraThinMaterial).cornerRadius(14)
                   .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.purple.opacity(0.4), lineWidth: 1.5))
-                  .shadow(color: .purple.opacity(0.3), radius: 10, y: 4)
-                  .offset(panelDragOffset)
+                  .shadow(color: .purple.opacity(0.3), radius: 10, y: 4).offset(panelDragOffset)
               }
               private var header: some View {
                   HStack(spacing: 6) {
@@ -2166,139 +2388,219 @@ jobs:
                       Text("AI").font(.caption.bold()).foregroundColor(.purple)
                       Spacer()
                       if !aiVM.currentExplanation.isEmpty && !aiPos.isChatMode {
-                          Button {
-                              VoiceManager.shared.speak(text: aiVM.currentExplanation, isArabic: language.isArabic)
-                              HapticManager.selection()
-                          } label: {
+                          Button { VoiceManager.shared.speak(text: aiVM.currentExplanation, isArabic: language.isArabic); HapticManager.selection() } label: {
                               Image(systemName: "speaker.wave.2.fill").font(.caption).foregroundColor(.blue)
                           }
                       }
                       Button { withAnimation { aiPos.isChatMode.toggle() } } label: {
-                          Image(systemName: aiPos.isChatMode ? "text.bubble.fill" : "bubble.left.and.bubble.right.fill")
-                              .font(.caption).foregroundColor(.blue)
+                          Image(systemName: aiPos.isChatMode ? "text.bubble.fill" : "bubble.left.and.bubble.right.fill").font(.caption).foregroundColor(.blue)
                       }
                       Button { aiPos.isVisible = false } label: {
                           Image(systemName: "xmark.circle.fill").font(.caption).foregroundColor(.red.opacity(0.7))
                       }
                   }
-                  .padding(.horizontal, 10).padding(.vertical, 6).background(Color.purple.opacity(0.15))
-                  .contentShape(Rectangle())
+                  .padding(.horizontal, 10).padding(.vertical, 6).background(Color.purple.opacity(0.15)).contentShape(Rectangle())
               }
               private var explanationContent: some View {
                   ScrollView {
                       VStack(alignment: .leading, spacing: 6) {
                           if !aiVM.currentExplainedMove.isEmpty {
-                              HStack {
-                                  Image(systemName: "star.fill").font(.caption).foregroundColor(.purple)
-                                  Text(aiVM.currentExplainedMove).font(.callout.bold()).foregroundColor(.purple)
-                              }
+                              HStack { Image(systemName: "star.fill").font(.caption).foregroundColor(.purple); Text(aiVM.currentExplainedMove).font(.callout.bold()).foregroundColor(.purple) }
                           }
-                          if aiVM.isLoadingExplanation {
-                              HStack {
-                                  ProgressView().scaleEffect(0.7)
-                                  Text(language.isArabic ? "AI يفكر..." : "AI thinking...").font(.caption).foregroundColor(.secondary)
-                              }
-                          } else if !aiVM.explanationError.isEmpty {
-                              Text("⚠️ \(aiVM.explanationError)").font(.caption).foregroundColor(.orange)
-                          } else if !aiVM.currentExplanation.isEmpty {
-                              Text(aiVM.currentExplanation).font(.callout).foregroundColor(.white.opacity(0.9))
-                                  .fixedSize(horizontal: false, vertical: true)
-                          } else {
-                              Text(language.isArabic ? "اضغط 'اسأل AI' للحصول على شرح" : "Tap 'Ask AI' for explanation")
-                                  .font(.caption).foregroundColor(.secondary)
-                          }
-                      }
-                      .padding(10)
-                  }
-                  .frame(maxHeight: 280)
+                          if aiVM.isLoadingExplanation { HStack { ProgressView().scaleEffect(0.7); Text(language.isArabic ? "AI يفكر..." : "AI thinking...").font(.caption).foregroundColor(.secondary) } }
+                          else if !aiVM.explanationError.isEmpty { Text("⚠️ \(aiVM.explanationError)").font(.caption).foregroundColor(.orange) }
+                          else if !aiVM.currentExplanation.isEmpty { Text(aiVM.currentExplanation).font(.callout).foregroundColor(.white.opacity(0.9)).fixedSize(horizontal: false, vertical: true) }
+                          else { Text(language.isArabic ? "اضغط 'اسأل AI' للحصول على شرح" : "Tap 'Ask AI' for explanation").font(.caption).foregroundColor(.secondary) }
+                      }.padding(10)
+                  }.frame(maxHeight: 280)
               }
               private var threatSection: some View {
                   VStack(spacing: 4) {
                       Divider().opacity(0.3)
-                      Button {
-                          aiVM.analyzeThreats(fen: engine.currentFEN, isArabic: language.isArabic)
-                      } label: {
+                      Button { aiVM.analyzeThreats(fen: engine.currentFEN, isArabic: language.isArabic) } label: {
                           HStack(spacing: 4) {
                               if aiVM.isLoadingThreats { ProgressView().scaleEffect(0.5) }
                               else { Image(systemName: "exclamationmark.shield.fill").font(.caption2) }
                               Text(language.isArabic ? "تحليل التهديدات" : "Analyze Threats").font(.caption2.bold())
                           }
-                          .padding(.horizontal, 8).padding(.vertical, 4)
-                          .background(Color.red.opacity(0.2)).foregroundColor(.red).cornerRadius(6)
+                          .padding(.horizontal, 8).padding(.vertical, 4).background(Color.red.opacity(0.2)).foregroundColor(.red).cornerRadius(6)
                       }.disabled(aiVM.isLoadingThreats)
                       if !aiVM.threatAnalysis.isEmpty {
-                          ScrollView {
-                              Text(aiVM.threatAnalysis).font(.caption).foregroundColor(.white.opacity(0.85))
-                                  .fixedSize(horizontal: false, vertical: true).padding(.horizontal, 10)
-                          }
-                          .frame(maxHeight: 120)
+                          ScrollView { Text(aiVM.threatAnalysis).font(.caption).foregroundColor(.white.opacity(0.85)).fixedSize(horizontal: false, vertical: true).padding(.horizontal, 10) }.frame(maxHeight: 120)
                       }
-                  }
-                  .padding(.bottom, 6)
+                  }.padding(.bottom, 6)
               }
               private var chatContent: some View {
                   VStack(spacing: 0) {
                       ScrollViewReader { proxy in
                           ScrollView {
                               VStack(alignment: .leading, spacing: 8) {
-                                  if aiVM.chatMessages.isEmpty {
-                                      Text(language.isArabic ? "اسأل AI!\n\nمثال:\n• إيه أحسن استراتيجية؟" : "Ask AI!\n\nExamples:\n• Best strategy?")
-                                          .font(.caption).foregroundColor(.secondary).padding(12)
-                                  }
+                                  if aiVM.chatMessages.isEmpty { Text(language.isArabic ? "اسأل AI!" : "Ask AI!").font(.caption).foregroundColor(.secondary).padding(12) }
                                   ForEach(aiVM.chatMessages) { msg in
                                       HStack {
                                           if msg.role == "user" { Spacer() }
-                                          Text(msg.text).font(.caption)
-                                              .padding(.horizontal, 10).padding(.vertical, 6)
+                                          Text(msg.text).font(.caption).padding(.horizontal, 10).padding(.vertical, 6)
                                               .background(msg.role == "user" ? Color.blue.opacity(0.3) : Color.purple.opacity(0.2))
                                               .foregroundColor(.white.opacity(0.9)).cornerRadius(8)
                                               .frame(maxWidth: 240, alignment: msg.role == "user" ? .trailing : .leading)
                                           if msg.role == "ai" { Spacer() }
-                                      }
-                                      .id(msg.id)
+                                      }.id(msg.id)
                                   }
-                                  if aiVM.isLoadingChat {
-                                      HStack {
-                                          ProgressView().scaleEffect(0.6)
-                                          Text(language.isArabic ? "يكتب..." : "typing...").font(.caption2).foregroundColor(.secondary)
-                                      }.padding(.horizontal, 10)
-                                  }
-                              }
-                              .padding(6)
-                          }
-                          .frame(maxHeight: 280)
-                          .onChange(of: aiVM.chatMessages.count) { _ in
-                              if let last = aiVM.chatMessages.last {
-                                  withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                              }
-                          }
+                                  if aiVM.isLoadingChat { HStack { ProgressView().scaleEffect(0.6); Text(language.isArabic ? "يكتب..." : "typing...").font(.caption2).foregroundColor(.secondary) }.padding(.horizontal, 10) }
+                              }.padding(6)
+                          }.frame(maxHeight: 280)
+                          .onChange(of: aiVM.chatMessages.count) { _ in if let last = aiVM.chatMessages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } } }
                       }
                       HStack(spacing: 6) {
                           TextField(language.isArabic ? "اكتب سؤالك..." : "Your question...", text: $aiVM.chatInput)
-                              .font(.caption).padding(.horizontal, 8).padding(.vertical, 6)
-                              .background(Color.black.opacity(0.3)).cornerRadius(8)
-                              .focused($chatFocused)
+                              .font(.caption).padding(.horizontal, 8).padding(.vertical, 6).background(Color.black.opacity(0.3)).cornerRadius(8).focused($chatFocused)
                               .onSubmit { aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic) }
-                          Button {
-                              aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic)
-                              chatFocused = false
-                          } label: {
-                              Image(systemName: "paperplane.fill").foregroundColor(.blue)
-                                  .padding(6).background(Color.blue.opacity(0.2)).cornerRadius(6)
+                          Button { aiVM.sendChat(fen: engine.currentFEN, isArabic: language.isArabic); chatFocused = false } label: {
+                              Image(systemName: "paperplane.fill").foregroundColor(.blue).padding(6).background(Color.blue.opacity(0.2)).cornerRadius(6)
                           }.disabled(aiVM.chatInput.trimmingCharacters(in: .whitespaces).isEmpty || aiVM.isLoadingChat)
-                          if !aiVM.chatMessages.isEmpty {
-                              Button { aiVM.clearChat() } label: {
-                                  Image(systemName: "trash").foregroundColor(.red.opacity(0.7)).font(.caption)
-                              }
-                          }
-                      }
-                      .padding(8).background(Color.black.opacity(0.2))
+                          if !aiVM.chatMessages.isEmpty { Button { aiVM.clearChat() } label: { Image(systemName: "trash").foregroundColor(.red.opacity(0.7)).font(.caption) } }
+                      }.padding(8).background(Color.black.opacity(0.2))
                   }
               }
           }
           '''
 
-          # ========== SettingsView ==========
+          files["Sources/ReviewView.swift"] = r'''
+          import SwiftUI
+          struct ReviewView: View {
+              @ObservedObject var recorder: GameRecorder
+              @ObservedObject var language: AppLanguage
+              @State private var showAIReview = false
+              @State private var aiReviewText = ""
+              @State private var isLoadingReview = false
+              @State private var showHistory = false
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(spacing: 12) { statsCard; accuracyBar; qualityBreakdown; aiReviewButton; if !aiReviewText.isEmpty { aiReviewCard }; movesListCard; actionButtons }
+                          .padding()
+                      }
+                      .navigationTitle(language.isArabic ? "المراجعة" : "Review")
+                      .toolbar { ToolbarItem(placement: .topBarTrailing) { Button { showHistory = true } label: { Image(systemName: "clock.arrow.circlepath") } } }
+                      .sheet(isPresented: $showHistory) { HistoryView(recorder: recorder, language: language) }
+                  }
+              }
+              private var statsCard: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      HStack { Image(systemName: "chart.bar.fill").foregroundColor(.green); Text(language.isArabic ? "إحصائيات اللعبة" : "Game Stats").font(.headline); Spacer(); Text("\(recorder.moves.count) " + (language.isArabic ? "نقلة" : "moves")).font(.caption).foregroundColor(.secondary) }
+                      HStack(spacing: 20) { statItem(value: "\(recorder.myMoveCount)", label: language.isArabic ? "نقلاتك" : "Your moves", color: .blue); statItem(value: "\(recorder.moves.count - recorder.myMoveCount)", label: language.isArabic ? "الخصم" : "Opponent", color: .gray) }
+                  }.padding().background(Color.gray.opacity(0.15)).cornerRadius(12)
+              }
+              private func statItem(value: String, label: String, color: Color) -> some View {
+                  VStack(alignment: .leading, spacing: 2) { Text(value).font(.title2.bold()).foregroundColor(color); Text(label).font(.caption).foregroundColor(.secondary) }
+              }
+              private var accuracyBar: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      HStack { Text(language.isArabic ? "الدقة" : "Accuracy").font(.subheadline.bold()); Spacer(); Text("\(Int(recorder.currentAccuracy))%").font(.title.bold()).foregroundColor(accuracyColor) }
+                      GeometryReader { geo in ZStack(alignment: .leading) { RoundedRectangle(cornerRadius: 6).fill(Color.gray.opacity(0.3)); RoundedRectangle(cornerRadius: 6).fill(accuracyColor).frame(width: geo.size.width * CGFloat(recorder.currentAccuracy / 100)) } }.frame(height: 12)
+                  }.padding().background(Color.gray.opacity(0.15)).cornerRadius(12)
+              }
+              private var accuracyColor: Color { if recorder.currentAccuracy >= 90 { return .green }; if recorder.currentAccuracy >= 75 { return .yellow }; if recorder.currentAccuracy >= 60 { return .orange }; return .red }
+              private var qualityBreakdown: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      Text(language.isArabic ? "تفاصيل جودة النقلات" : "Move Quality").font(.subheadline.bold())
+                      qualityRow(icon: "✨", label: language.isArabic ? "رائعة" : "Brilliant", count: recorder.brilliantCount, color: .cyan)
+                      qualityRow(icon: "⭐", label: language.isArabic ? "أفضل" : "Best", count: recorder.bestCount, color: .green)
+                      qualityRow(icon: "✓", label: language.isArabic ? "جيدة" : "Good", count: recorder.goodCount, color: Color.green.opacity(0.7))
+                      qualityRow(icon: "?!", label: language.isArabic ? "غير دقيقة" : "Inaccuracy", count: recorder.inaccuracyCount, color: .yellow)
+                      qualityRow(icon: "?", label: language.isArabic ? "خطأ" : "Mistake", count: recorder.mistakeCount, color: .orange)
+                      qualityRow(icon: "??", label: language.isArabic ? "خطأ فادح" : "Blunder", count: recorder.blunderCount, color: .red)
+                  }.padding().background(Color.gray.opacity(0.15)).cornerRadius(12)
+              }
+              private func qualityRow(icon: String, label: String, count: Int, color: Color) -> some View {
+                  HStack { Text(icon).frame(width: 30); Text(label).font(.caption); Spacer(); Text("\(count)").font(.caption.bold()).foregroundColor(color) }.padding(.vertical, 2)
+              }
+              private var aiReviewButton: some View {
+                  Button { requestAIReview() } label: {
+                      HStack {
+                          if isLoadingReview { ProgressView().scaleEffect(0.7); Text(language.isArabic ? "جاري التحليل..." : "Analyzing...").font(.subheadline.bold()) }
+                          else { Image(systemName: "sparkles"); Text(language.isArabic ? "طلب تحليل AI للعبة" : "Request AI Game Review").font(.subheadline.bold()) }
+                      }.frame(maxWidth: .infinity).padding().background(Color.purple.opacity(0.3)).foregroundColor(.purple).cornerRadius(10)
+                  }.disabled(isLoadingReview || recorder.moves.isEmpty)
+              }
+              private var aiReviewCard: some View {
+                  VStack(alignment: .leading, spacing: 8) {
+                      HStack { Image(systemName: "sparkles").foregroundColor(.purple); Text(language.isArabic ? "تحليل AI" : "AI Review").font(.headline) }
+                      Text(aiReviewText).font(.callout).foregroundColor(.white.opacity(0.9)).fixedSize(horizontal: false, vertical: true)
+                  }.padding().background(Color.purple.opacity(0.15)).cornerRadius(12)
+              }
+              private var movesListCard: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      Text(language.isArabic ? "قائمة النقلات" : "Move List").font(.subheadline.bold())
+                      if recorder.moves.isEmpty { Text(language.isArabic ? "لا توجد نقلات بعد" : "No moves yet").font(.caption).foregroundColor(.secondary).padding() }
+                      else { ForEach(recorder.moves) { move in moveRow(move) } }
+                  }.padding().background(Color.gray.opacity(0.15)).cornerRadius(12)
+              }
+              private func moveRow(_ move: GameRecorder.MoveRecord) -> some View {
+                  HStack {
+                      Text("\(move.ply).").font(.caption.monospaced()).foregroundColor(.secondary).frame(width: 30)
+                      Text(move.san.isEmpty ? move.uci : move.san).font(.callout.bold()).foregroundColor(move.wasMyMove ? .white : .gray)
+                      Spacer(); qualityBadge(move.quality)
+                      if move.cpLoss >= 30 { Text("-\(move.cpLoss)").font(.caption2.monospaced()).foregroundColor(.orange) }
+                      if let alt = move.bestAlternative, alt != move.uci { Text("→ \(alt)").font(.caption2.monospaced()).foregroundColor(.green) }
+                  }.padding(.vertical, 2)
+              }
+              private func qualityBadge(_ q: String) -> some View {
+                  let (label, color): (String, Color) = { switch q { case "brilliant": return ("!!", .cyan); case "best": return ("⭐", .green); case "good": return ("✓", .green.opacity(0.7)); case "inaccuracy": return ("?!", .yellow); case "mistake": return ("?", .orange); case "blunder": return ("??", .red); default: return ("", .gray) } }()
+                  return Text(label).font(.caption.bold()).foregroundColor(color).padding(.horizontal, 6).padding(.vertical, 2).background(color.opacity(0.2)).cornerRadius(4)
+              }
+              private var actionButtons: some View {
+                  HStack(spacing: 8) {
+                      Button { recorder.saveCurrentGame(); HapticManager.success() } label: { Label(language.isArabic ? "حفظ" : "Save", systemImage: "square.and.arrow.down").frame(maxWidth: .infinity).padding().background(Color.blue.opacity(0.3)).cornerRadius(8) }
+                      Button { recorder.startNewGame(); aiReviewText = ""; HapticManager.selection() } label: { Label(language.isArabic ? "لعبة جديدة" : "New Game", systemImage: "arrow.clockwise").frame(maxWidth: .infinity).padding().background(Color.red.opacity(0.3)).cornerRadius(8) }
+                  }
+              }
+              private func requestAIReview() {
+                  guard !recorder.moves.isEmpty else { return }; isLoadingReview = true; aiReviewText = ""
+                  let movesUCI = recorder.moves.map { $0.uci }
+                  Task {
+                      do { let r = try await GroqService.reviewGame(movesUCI: movesUCI, accuracy: recorder.currentAccuracy, blunders: recorder.blunderCount, mistakes: recorder.mistakeCount, isArabic: language.isArabic); await MainActor.run { aiReviewText = r; isLoadingReview = false } }
+                      catch { await MainActor.run { aiReviewText = "⚠️ \(error.localizedDescription)"; isLoadingReview = false } }
+                  }
+              }
+          }
+          struct HistoryView: View {
+              @ObservedObject var recorder: GameRecorder
+              @ObservedObject var language: AppLanguage
+              @Environment(\.dismiss) var dismiss
+              @State private var history: [GameHistoryEntry] = []
+              var body: some View {
+                  NavigationStack {
+                      List {
+                          if history.isEmpty { Text(language.isArabic ? "لا توجد ألعاب محفوظة" : "No saved games").foregroundColor(.secondary) }
+                          else { ForEach(history) { entry in VStack(alignment: .leading, spacing: 4) { HStack { Text(entry.date, style: .date).font(.caption); Spacer(); Text("\(Int(entry.accuracy))%").font(.caption.bold()).foregroundColor(.green) }; Text("\(entry.moves.count) " + (language.isArabic ? "نقلة" : "moves")).font(.caption2).foregroundColor(.secondary) } } }
+                      }
+                      .navigationTitle(language.isArabic ? "السجل" : "History")
+                      .toolbar {
+                          ToolbarItem(placement: .topBarTrailing) { Button(language.isArabic ? "مسح" : "Clear", role: .destructive) { recorder.clearHistory(); history = [] } }
+                          ToolbarItem(placement: .topBarLeading) { Button(language.isArabic ? "إغلاق" : "Close") { dismiss() } }
+                      }
+                      .onAppear { history = recorder.loadHistory() }
+                  }
+              }
+          }
+          '''
+
+          for path, content in files.items():
+              content = textwrap.dedent(content).strip() + "\n"
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w") as f: f.write(content)
+              print(f"  ✅ {path}")
+          print(f"\nWrote {len(files)} Swift files (Part 6 - More Views)")
+          PYEOF
+
+      - name: Generate Swift source files (Part 7 - Settings & WebView)
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import os, textwrap
+          files = {}
+
           files["Sources/SettingsView.swift"] = r'''
           import SwiftUI
           struct SettingsView: View {
@@ -2318,62 +2620,61 @@ jobs:
                                   ForEach(AppLanguage.Lang.allCases, id: \.self) { Text($0.display).tag($0) }
                               }.pickerStyle(.segmented)
                           }
-                          Section(header: HStack {
-                              Image(systemName: "sparkles").foregroundColor(.purple)
-                              Text(language.isArabic ? "الذكاء الاصطناعي" : "AI Assistant")
-                          }) {
+                          
+                          Section(header: HStack { Image(systemName: "person.fill"); Text(language.isArabic ? "لون اللاعب" : "Player Color") }) {
+                              HStack {
+                                  Text(language.isArabic ? "اللون الحالي:" : "Current color:")
+                                  Spacer()
+                                  Circle().fill(engine.effectivePlayerColor == "w" ? .white : .black).frame(width: 20, height: 20).overlay(Circle().stroke(Color.gray, lineWidth: 1))
+                                  Text(engine.effectivePlayerColor == "w" ? (language.isArabic ? "أبيض" : "White") : (language.isArabic ? "أسود" : "Black")).font(.subheadline.bold())
+                              }
+                              Button { engine.flipColor() } label: {
+                                  Label(language.isArabic ? "تبديل اللون 🔄" : "Flip Color 🔄", systemImage: "arrow.triangle.2.circlepath")
+                              }
+                              Button { engine.setManualColor(nil) } label: {
+                                  Label(language.isArabic ? "كشف تلقائي" : "Auto Detect", systemImage: "wand.and.stars")
+                              }
+                          }
+                          
+                          Section(header: HStack { Image(systemName: "sparkles").foregroundColor(.purple); Text(language.isArabic ? "الذكاء الاصطناعي" : "AI Assistant") }) {
                               if apiKeySaved {
-                                  HStack {
-                                      Image(systemName: "checkmark.seal.fill").foregroundColor(.green)
-                                      Text(language.isArabic ? "المفتاح مضاف ✓" : "API Key Saved ✓")
-                                      Spacer()
-                                      Button(language.isArabic ? "تعديل" : "Change") { showKeyInput = true }
-                                  }
-                                  Button(language.isArabic ? "حذف المفتاح" : "Remove Key", role: .destructive) {
-                                      KeychainStore.delete(account: KeychainStore.groqKeyAccount)
-                                      apiKeySaved = false; apiKeyInput = ""
-                                  }
+                                  HStack { Image(systemName: "checkmark.seal.fill").foregroundColor(.green); Text(language.isArabic ? "المفتاح مضاف ✓" : "API Key Saved ✓"); Spacer(); Button(language.isArabic ? "تعديل" : "Change") { showKeyInput = true } }
+                                  Button(language.isArabic ? "حذف المفتاح" : "Remove Key", role: .destructive) { KeychainStore.delete(account: KeychainStore.groqKeyAccount); apiKeySaved = false; apiKeyInput = "" }
                               } else {
-                                  Button { showKeyInput = true } label: {
-                                      Label(language.isArabic ? "إضافة مفتاح API" : "Add API Key", systemImage: "key.fill")
-                                  }
-                                  Link(destination: URL(string: "https://console.groq.com/keys")!) {
-                                      Label(language.isArabic ? "احصل على مفتاح مجاني" : "Get free key", systemImage: "arrow.up.right.square")
-                                  }
+                                  Button { showKeyInput = true } label: { Label(language.isArabic ? "إضافة مفتاح API" : "Add API Key", systemImage: "key.fill") }
+                                  Link(destination: URL(string: "https://console.groq.com/keys")!) { Label(language.isArabic ? "احصل على مفتاح مجاني" : "Get free key", systemImage: "arrow.up.right.square") }
                               }
                           }
                           if showKeyInput {
                               Section(language.isArabic ? "أدخل المفتاح" : "Enter API Key") {
                                   SecureField("gsk_...", text: $apiKeyInput).font(.caption.monospaced()).autocorrectionDisabled().textInputAutocapitalization(.never)
                                   HStack {
-                                      Button(language.isArabic ? "حفظ" : "Save") {
-                                          let t = apiKeyInput.trimmingCharacters(in: .whitespaces)
-                                          if !t.isEmpty && KeychainStore.save(t, account: KeychainStore.groqKeyAccount) {
-                                              apiKeySaved = true; showKeyInput = false; apiKeyInput = ""
-                                          }
-                                      }.buttonStyle(.borderedProminent)
-                                      Spacer()
-                                      Button(language.isArabic ? "إلغاء" : "Cancel") { showKeyInput = false; apiKeyInput = "" }
+                                      Button(language.isArabic ? "حفظ" : "Save") { let t = apiKeyInput.trimmingCharacters(in: .whitespaces); if !t.isEmpty && KeychainStore.save(t, account: KeychainStore.groqKeyAccount) { apiKeySaved = true; showKeyInput = false; apiKeyInput = "" } }.buttonStyle(.borderedProminent)
+                                      Spacer(); Button(language.isArabic ? "إلغاء" : "Cancel") { showKeyInput = false; apiKeyInput = "" }
                                   }
                               }
                           }
                           Section(language.isArabic ? "المساعد" : "Overlay") {
-                              Toggle(language.isArabic ? "وضع مضغوط" : "Compact", isOn: $overlayPos.isCompact)
-                                  .onChange(of: overlayPos.isCompact) { _ in overlayPos.save() }
+                              Toggle(language.isArabic ? "وضع مضغوط" : "Compact", isOn: $overlayPos.isCompact).onChange(of: overlayPos.isCompact) { _ in overlayPos.save() }
                               VStack(alignment: .leading) {
                                   Text("\(language.isArabic ? "الشفافية" : "Transparency"): \(Int(overlayPos.transparency * 100))%").font(.caption)
-                                  Slider(value: $overlayPos.transparency, in: 0.3...1.0)
-                                      .onChange(of: overlayPos.transparency) { _ in overlayPos.save() }
+                                  Slider(value: $overlayPos.transparency, in: 0.3...1.0).onChange(of: overlayPos.transparency) { _ in overlayPos.save() }
                               }
                               Button(language.isArabic ? "إعادة الموضع" : "Reset position") { overlayPos.reset() }
                               Toggle(language.isArabic ? "نقطة صغيرة" : "Tiny dot", isOn: $stealth.minimalMode)
                           }
+                          Section(header: HStack { Image(systemName: "book.fill").foregroundColor(.purple); Text(language.isArabic ? "الافتتاحيات" : "Opening Book") }) {
+                              Text(language.isArabic ? "📖 قاعدة بيانات ~50 افتتاحية" : "📖 Database with ~50 openings").font(.caption)
+                              Text(language.isArabic ? "⚡️ كشف فوري (0ms)" : "⚡️ Instant detection (0ms)").font(.caption)
+                          }
+                          Section(header: HStack { Image(systemName: "tablecells.fill").foregroundColor(.cyan); Text("Tablebase") }) {
+                              Text(language.isArabic ? "🏁 Lichess Tablebase API" : "🏁 Lichess Tablebase API").font(.caption)
+                              Text(language.isArabic ? "✅ دقة 100% مع ≤7 قطع" : "✅ 100% accuracy with ≤7 pieces").font(.caption)
+                          }
                           Section("Debug") {
                               Text(engine.currentFEN.isEmpty ? "(none)" : engine.currentFEN).font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(3)
                               Text("Cache: \(cacheCount)").font(.caption)
-                              Button(language.isArabic ? "مسح الذاكرة" : "Clear cache") {
-                                  Task { await AnalysisCache.shared.clear(); cacheCount = await AnalysisCache.shared.count() }
-                              }
+                              Button(language.isArabic ? "مسح الذاكرة" : "Clear cache") { Task { await AnalysisCache.shared.clear(); TablebaseService.clearCache(); cacheCount = await AnalysisCache.shared.count() } }
                               Button(language.isArabic ? "إعادة تعيين" : "Reset FEN") { engine.resetFenTracker() }
                           }
                           Section("Status") {
@@ -2382,21 +2683,18 @@ jobs:
                               Button(language.isArabic ? "إخفاء" : "Hide", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "5.2.0 Phase 4")
-                              LabeledContent("Features", value: "Timeout+Race+Voice+Review")
+                              LabeledContent("Version", value: "6.0.0")
+                              LabeledContent("Features", value: "OpeningBook+Tablebase+ColorFix")
                           }
                       }
                       .navigationTitle(language.isArabic ? "الإعدادات" : "Settings")
-                      .task {
-                          cacheCount = await AnalysisCache.shared.count()
-                          apiKeySaved = KeychainStore.load(account: KeychainStore.groqKeyAccount) != nil
-                      }
+                      .task { cacheCount = await AnalysisCache.shared.count(); apiKeySaved = KeychainStore.load(account: KeychainStore.groqKeyAccount) != nil }
                   }
               }
           }
           '''
 
-          # ========== ChessWebView ==========
+          # ========== ChessWebView - FIXED reader.js ==========
           files["Sources/ChessWebView.swift"] = r'''
           import SwiftUI
           import WebKit
@@ -2460,16 +2758,14 @@ jobs:
                       let js = "typeof window['\(StealthConfig.startFuncName)']==='function'&&window['\(StealthConfig.startFuncName)']();"
                       w.evaluateJavaScript(js, completionHandler: nil)
                   }
-                  func webView(_ w: WKWebView, createWebViewWith c: WKWebViewConfiguration,
-                               for a: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+                  func webView(_ w: WKWebView, createWebViewWith c: WKWebViewConfiguration, for a: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
                       if let url = a.request.url { w.load(URLRequest(url: url)) }; return nil
                   }
               }
           }
           extension Bundle {
               func loadResource(named name: String, ext: String) -> String? {
-                  if let url = url(forResource: name, withExtension: ext),
-                     let s = try? String(contentsOf: url) { return s }
+                  if let url = url(forResource: name, withExtension: ext), let s = try? String(contentsOf: url) { return s }
                   return nil
               }
           }
@@ -2480,7 +2776,7 @@ jobs:
               os.makedirs(os.path.dirname(path), exist_ok=True)
               with open(path, "w") as f: f.write(content)
               print(f"  ✅ {path}")
-          print(f"\nWrote {len(files)} Swift files (Part 2)")
+          print(f"\nWrote {len(files)} Swift files (Part 7 - Settings & WebView)")
           PYEOF
 
       - name: Write Info.plist
@@ -2497,8 +2793,8 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>5.2.0</string>
-            <key>CFBundleVersion</key><string>52</string>
+            <key>CFBundleShortVersionString</key><string>6.0.0</string>
+            <key>CFBundleVersion</key><string>60</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
             <key>UISupportedInterfaceOrientations</key>
@@ -2513,10 +2809,10 @@ jobs:
           </plist>
           EOF
 
-      - name: Write reader.js
+      - name: Write reader.js (FIXED - better color detection)
         run: |
           cat > Resources/reader.js <<'EOF'
-          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro>=0&&ro<=7){f=co2+1;r=8-ro;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dbc(grid){if(!grid)return"";var w=0,b=0;for(var r=6;r<=7;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;if(p===p.toUpperCase())w++;else b++;}if(w>b)return"w";if(b>w)return"b";return"";}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0)return{flipped:wkR<4,confident:true};if(bkR>=0)return{flipped:bkR>=4,confident:true};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var fi=dfl(g);var bc=dbc(g);var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:fi.flipped,flippedConfident:fi.confident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:bc};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
+          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro>=0&&ro<=7){f=co2+1;r=8-ro;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0)return{flipped:wkR<4,confident:true};if(bkR>=0)return{flipped:bkR>=4,confident:true};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null;function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null,f=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];if(ch[i].before!=="."&&ch[i].after===".")f=ch[i];}if(!t||!f)return null;var fr=String.fromCharCode(97+f.c)+(8-f.r),to=String.fromCharCode(97+t.c)+(8-t.r);var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:fr+to,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var fi=dfl(g);var bc=fi.flipped?"b":"w";var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:fi.flipped,flippedConfident:fi.confident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:bc};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
           EOF
 
       - name: Write adblock_css.css
@@ -2556,19 +2852,19 @@ jobs:
           [ -n "$APP" ] || { echo "Not found"; exit 1; }
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          zip -qr ChessHelper-v5.2-Phase4.ipa Payload
-          ls -lh ChessHelper-v5.2-Phase4.ipa
+          zip -qr ChessHelper-v6.0.ipa Payload
+          ls -lh ChessHelper-v6.0.ipa
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ChessHelper-v5.2-Phase4
-          path: ChessHelper-v5.2-Phase4.ipa
+          name: ChessHelper-v6.0
+          path: ChessHelper-v6.0.ipa
           retention-days: 90
 
       - name: Attach to Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ChessHelper-v5.2-Phase4.ipa
+          files: ChessHelper-v6.0.ipa
           generate_release_notes: true
