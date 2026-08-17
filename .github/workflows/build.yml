@@ -175,6 +175,14 @@ jobs:
                   await withCheckedContinuation { (cont: CheckedContinuation<(moves: [TopMove], ms: Int), Never>) in
                       queue.async { [weak self] in
                           guard let self = self else { cont.resume(returning: ([], 0)); return }
+                          // Defensive: if a previous search never finished, release
+                          // its continuation (prevents a leaked-continuation crash)
+                          // and stop the engine before starting a fresh search.
+                          if self.searchContinuation != nil {
+                              self.searchContinuation?.resume(returning: ([], 0))
+                              self.searchContinuation = nil
+                              self.send("stop\n")
+                          }
                           let effDepth = min(max(depth, 10), 30)
                           self.infos = [:]
                           self.searchContinuation = cont
@@ -432,9 +440,11 @@ jobs:
                               guard let self = self else { return }
                               if ok {
                                   self.status = .ready
+                                  CrashLog.shared.log("Local engine: READY")
                               } else {
                                   self.status = .failed
                                   self.statusDetail = "Engine handshake timeout"
+                                  CrashLog.shared.log("Local engine: HANDSHAKE TIMEOUT")
                               }
                           }
                       }
@@ -898,6 +908,9 @@ jobs:
           import SwiftUI
           @main
           struct ChessHelperApp: App {
+              init() {
+                  CrashLog.shared.install()
+              }
               var body: some Scene {
                   WindowGroup { ContentView().preferredColorScheme(.dark) }
               }
@@ -951,6 +964,7 @@ jobs:
               }
               final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
                   let engine: EngineViewModel; weak var webView: WKWebView?; var lastTrigger = 0
+                  var retryCount = 0
                   init(engine: EngineViewModel) { self.engine = engine }
                   func userContentController(_ u: WKUserContentController, didReceive m: WKScriptMessage) {
                       guard m.name == StealthConfig.bridgeName, let d = m.body as? [String: Any] else { return }
@@ -965,8 +979,30 @@ jobs:
                       Task { @MainActor [weak engine] in engine?.ingest(p) }
                   }
                   func webView(_ w: WKWebView, didFinish n: WKNavigation!) {
+                      retryCount = 0
+                      engine.clearWebError()
                       let js = "typeof window['\(StealthConfig.startFuncName)']==='function'&&window['\(StealthConfig.startFuncName)']();"
                       w.evaluateJavaScript(js, completionHandler: nil)
+                  }
+                  func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) {
+                      retryLoading(w, error: e)
+                  }
+                  func webView(_ w: WKWebView, didFail n: WKNavigation!, withError e: Error) {
+                      retryLoading(w, error: e)
+                  }
+                  private func retryLoading(_ w: WKWebView, error: Error) {
+                      // NSURLErrorCancelled happens on normal navigations, ignore it.
+                      let ns = error as NSError
+                      if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
+                      engine.reportWebError(error.localizedDescription)
+                      CrashLog.shared.log("WebView error: \(error.localizedDescription)")
+                      guard retryCount < 2 else { return }
+                      retryCount += 1
+                      let current = w.url ?? URL(string: "https://www.chess.com/")!
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak w] in
+                          guard let w = w else { return }
+                          w.load(URLRequest(url: current, cachePolicy: .reloadIgnoringLocalCacheData))
+                      }
                   }
                   func webView(_ w: WKWebView, createWebViewWith c: WKWebViewConfiguration,
                                for a: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -979,6 +1015,96 @@ jobs:
                   if let url = url(forResource: name, withExtension: ext),
                      let s = try? String(contentsOf: url) { return s }
                   return nil
+              }
+          }
+          '''
+
+          files["Sources/CrashLog.swift"] = r'''
+          import Foundation
+          import Darwin
+
+          // File-scoped global fd used by the async-signal-safe crash handler.
+          var ChessHelperCrashLogFD: Int32 = -1
+
+          /// Async-signal-safe handler: only calls write() + strlen() on static
+          /// strings (no allocation), so it is safe to run inside a signal.
+          func chessHelperCrashSignalHandler(_ sig: Int32) {
+              if ChessHelperCrashLogFD < 0 { return }
+              let msg: UnsafePointer<Int8>
+              switch sig {
+              case SIGSEGV: msg = "\n===== CRASH =====\nSIGSEGV: bad memory access (dangling pointer / over-release)\n"
+              case SIGABRT: msg = "\n===== CRASH =====\nSIGABRT: abort (force-unwrap nil / index out of range / Swift fatalError)\n"
+              case SIGBUS:  msg = "\n===== CRASH =====\nSIGBUS: bus error (misaligned access)\n"
+              case SIGILL:  msg = "\n===== CRASH =====\nSIGILL: illegal instruction\n"
+              case SIGFPE:  msg = "\n===== CRASH =====\nSIGFPE: arithmetic error (divide by zero)\n"
+              default:      msg = "\n===== CRASH =====\nFatal signal\n"
+              }
+              _ = write(ChessHelperCrashLogFD, msg, Int(strlen(msg)))
+          }
+
+          /// Persistent, crash-safe log the user can inspect from Settings.
+          /// Captures: app launches, engine errors, position changes, and (via
+          /// signal/uncaught-exception handlers) the reason of a fatal crash.
+          final class CrashLog {
+              static let shared = CrashLog()
+              private let queue = DispatchQueue(label: "com.chesshelper.crashlog")
+              private var installed = false
+
+              var fileURL: URL {
+                  FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                      .appendingPathComponent("chesshelper_log.txt")
+              }
+
+              func install() {
+                  guard !installed else { return }
+                  installed = true
+                  let path = fileURL.path
+                  ChessHelperCrashLogFD = open(path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+                  if ChessHelperCrashLogFD >= 0 {
+                      signal(SIGSEGV, chessHelperCrashSignalHandler)
+                      signal(SIGABRT, chessHelperCrashSignalHandler)
+                      signal(SIGBUS,  chessHelperCrashSignalHandler)
+                      signal(SIGILL,  chessHelperCrashSignalHandler)
+                      signal(SIGFPE,  chessHelperCrashSignalHandler)
+                  }
+                  NSSetUncaughtExceptionHandler { ex in
+                      CrashLog.shared.log("UNCAUGHT EXCEPTION: \(ex.name.rawValue) — \(ex.reason ?? "")")
+                  }
+                  let ver = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+                  log("===== App launched v\(ver) =====")
+              }
+
+              private func timestamp() -> String {
+                  let df = DateFormatter()
+                  df.dateFormat = "yyyy-MM-dd HH:mm:ss"
+                  return df.string(from: Date())
+              }
+
+              func log(_ message: String) {
+                  queue.async { [weak self] in
+                      guard let self = self else { return }
+                      let line = "[\(self.timestamp())] \(message)\n"
+                      if ChessHelperCrashLogFD >= 0 {
+                          _ = line.withCString { write(ChessHelperCrashLogFD, $0, Int(strlen($0))) }
+                      }
+                  }
+              }
+
+              /// Returns the whole log as text (flushes queued writes first).
+              func read() -> String {
+                  queue.sync {}
+                  guard let data = try? Data(contentsOf: fileURL) else { return "(empty)" }
+                  let text = String(data: data, encoding: .utf8) ?? "(unreadable)"
+                  return text.isEmpty ? "(empty)" : text
+              }
+
+              func clear() {
+                  queue.async {
+                      if ChessHelperCrashLogFD >= 0 {
+                          ftruncate(ChessHelperCrashLogFD, 0)
+                          lseek(ChessHelperCrashLogFD, 0, SEEK_SET)
+                      }
+                  }
               }
           }
           '''
@@ -1417,9 +1543,12 @@ jobs:
               }
               @Published var showBlunderAlert = false
               @Published var blunderAlertText = ""
+              @Published var webViewError: String = ""
               @Published var useRemoteCrossCheck: Bool {
                   didSet { UserDefaults.standard.set(useRemoteCrossCheck, forKey: "remote_crosscheck") }
               }
+              func reportWebError(_ msg: String) { webViewError = msg }
+              func clearWebError() { webViewError = "" }
               var bestMove: TopMove? { topMoves.first }
               var effectivePlayerColor: String { manualPlayerColor ?? detectedPlayerColor }
               var isMyTurn: Bool { effectivePlayerColor == sideToMove }
@@ -1546,6 +1675,7 @@ jobs:
                   let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
                   if let _ = FenValidator.validate(fen) { return }
                   if fen != currentFEN {
+                      CrashLog.shared.log("Position: \(fen)")
                       previousFEN = currentFEN
                       currentFEN = fen; topMoves = []; evaluation = "—"; winChance = 50
                       errorMessage = ""; sourcesUsed = ""; engineConfidence = 0
@@ -1622,6 +1752,7 @@ jobs:
                       } catch {
                           if Task.isCancelled { return }
                           guard fen == self.currentFEN else { return }
+                          CrashLog.shared.log("Engine error: \(error) @ \(fen)")
                           await MainActor.run {
                               self.isThinking = false; self.isDeepAnalyzing = false
                               self.topMoves = []; self.evaluation = "—"; self.sourcesUsed = ""; self.engineConfidence = 0
@@ -2649,6 +2780,7 @@ jobs:
                           if aiPos.isVisible && engine.enabled { draggableAIPanel }
                           if aiVM.isPuzzleDetected && engine.enabled { puzzleBanner }
                           if engine.showBlunderAlert && engine.enabled { blunderAlertBanner }
+                          if !engine.webViewError.isEmpty { webErrorBanner }
                       }
                   }
                   .overlay(alignment: .center) {
@@ -2727,6 +2859,37 @@ jobs:
                       .transition(.move(edge: .bottom).combined(with: .opacity))
                   }
                   .animation(.spring(), value: engine.showBlunderAlert)
+              }
+              private var webErrorBanner: some View {
+                  VStack {
+                      Spacer()
+                      VStack(spacing: 8) {
+                          HStack(spacing: 6) {
+                              Image(systemName: "wifi.exclamationmark").foregroundColor(.red)
+                              Text(language.isArabic ? "مشكلة في الاتصال" : "Connection problem")
+                                  .font(.subheadline.bold()).foregroundColor(.red)
+                              Spacer()
+                              Text(engine.webViewError).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                          }
+                          Button {
+                              engine.clearWebError()
+                              router.openInPlay(router.chessURL.absoluteString)
+                              HapticManager.selection()
+                          } label: {
+                              Label(language.isArabic ? "إعادة المحاولة" : "Retry", systemImage: "arrow.clockwise")
+                                  .font(.subheadline.bold())
+                                  .frame(maxWidth: .infinity)
+                                  .padding(.vertical, 8)
+                                  .background(Color.blue).foregroundColor(.white).cornerRadius(8)
+                          }
+                      }
+                      .padding(14)
+                      .background(.ultraThinMaterial)
+                      .cornerRadius(14)
+                      .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.red.opacity(0.4), lineWidth: 1))
+                      .padding(.horizontal, 20)
+                      .padding(.bottom, 160)
+                  }
               }
               private var draggableOverlay: some View {
                   GeometryReader { geo in
@@ -3134,6 +3297,8 @@ jobs:
               @State private var apiKeyInput = ""
               @State private var apiKeySaved = false
               @State private var showKeyInput = false
+              @State private var showCrashLog = false
+              @State private var crashLogText = ""
               var body: some View {
                   NavigationStack {
                       Form {
@@ -3282,6 +3447,22 @@ jobs:
                               Button(language.isArabic ? "إعادة الموضع" : "Reset position") { overlayPos.reset() }
                               Toggle(language.isArabic ? "نقطة صغيرة" : "Tiny dot", isOn: $stealth.minimalMode)
                           }
+                          Section(header: HStack {
+                              Image(systemName: "ladybug").foregroundColor(.red)
+                              Text(language.isArabic ? "سجل الكراش والتشخيص" : "Crash & Diagnostic Log")
+                          }) {
+                              Button {
+                                  crashLogText = CrashLog.shared.read()
+                                  showCrashLog = true
+                              } label: {
+                                  Label(language.isArabic ? "عرض السجل" : "View log", systemImage: "doc.text.magnifyingglass")
+                              }
+                              Button(language.isArabic ? "مسح السجل" : "Clear log", role: .destructive) {
+                                  CrashLog.shared.clear()
+                              }
+                              Text(language.isArabic ? "السجل بيسجل الأخطاء وأسباب أي كراش قادم" : "Records errors and the cause of any future crash")
+                                  .font(.caption2).foregroundColor(.secondary)
+                          }
                           Section("Debug") {
                               Text(engine.currentFEN.isEmpty ? "(none)" : engine.currentFEN).font(.caption2.monospaced()).foregroundColor(.secondary).lineLimit(3)
                               Text("Cache: \(cacheCount)").font(.caption)
@@ -3301,9 +3482,34 @@ jobs:
                           }
                       }
                       .navigationTitle(language.isArabic ? "الإعدادات" : "Settings")
+                      .sheet(isPresented: $showCrashLog) {
+                          CrashLogView(text: crashLogText, language: language)
+                      }
                       .task {
                           cacheCount = await AnalysisCache.shared.count()
                           apiKeySaved = KeychainStore.load(account: KeychainStore.groqKeyAccount) != nil
+                      }
+                  }
+              }
+              struct CrashLogView: View {
+                  let text: String
+                  @ObservedObject var language: AppLanguage
+                  @Environment(\.dismiss) var dismiss
+                  var body: some View {
+                      NavigationStack {
+                          ScrollView {
+                              Text(text)
+                                  .font(.caption.monospaced())
+                                  .foregroundColor(.white.opacity(0.85))
+                                  .frame(maxWidth: .infinity, alignment: .leading)
+                                  .padding()
+                          }
+                          .navigationTitle(language.isArabic ? "سجل الكراش" : "Crash Log")
+                          .toolbar {
+                              ToolbarItem(placement: .navigationBarLeading) {
+                                  Button(language.isArabic ? "إغلاق" : "Close") { dismiss() }
+                              }
+                          }
                       }
                   }
               }
