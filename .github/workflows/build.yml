@@ -2141,6 +2141,12 @@ jobs:
                   case rateLimited
                   case parseError
                   case timeout
+                  var isInvalidOrRate: Bool {
+                      switch self {
+                      case .invalidKey, .rateLimited: return true
+                      default: return false
+                      }
+                  }
                   var errorDescription: String? {
                       switch self {
                       case .noKey:
@@ -2165,23 +2171,31 @@ jobs:
                   guard let url = URL(string: "https://api.groq.com/openai/v1/chat/completions") else {
                       throw GroqError.networkError("Bad URL")
                   }
-                  var req = URLRequest(url: url)
-                  req.httpMethod = "POST"
-                  req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                  req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-                  req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  req.timeoutInterval = 12
-                  let body: [String: Any] = [
-                      "model": "llama-3.3-70b-versatile",
-                      "messages": messages.map { ["role": $0.role, "content": $0.content] },
-                      "temperature": temperature,
-                      "max_tokens": 500,
-                      "top_p": 0.9
+                  // Ordered fallback list: if a model returns 404/400 (deprecated or
+                  // removed), we automatically try the next one. Kept current as of
+                  // 2026-08 (llama-3.3-70b-versatile was retired 2026-08-16).
+                  let modelFallbacks = [
+                      "openai/gpt-oss-120b",
+                      "qwen/qwen3.6-27b",
+                      "llama-3.1-8b-instant"
                   ]
-                  req.httpBody = try JSONSerialization.data(withJSONObject: body)
-                  var lastError: Error?
-                  for attempt in 0..<2 {
+                  var lastError: Error = GroqError.networkError("Unknown error")
+                  for model in modelFallbacks {
                       do {
+                          var req = URLRequest(url: url)
+                          req.httpMethod = "POST"
+                          req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                          req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                          req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
+                          req.timeoutInterval = 12
+                          let body: [String: Any] = [
+                              "model": model,
+                              "messages": messages.map { ["role": $0.role, "content": $0.content] },
+                              "temperature": temperature,
+                              "max_tokens": 500,
+                              "top_p": 0.9
+                          ]
+                          req.httpBody = try JSONSerialization.data(withJSONObject: body)
                           let (data, resp) = try await URLSession.shared.data(for: req)
                           guard let http = resp as? HTTPURLResponse else {
                               throw GroqError.networkError("No response")
@@ -2191,6 +2205,12 @@ jobs:
                           }
                           if http.statusCode == 429 {
                               throw GroqError.rateLimited
+                          }
+                          // 404 = model retired, 400 = model not available on this key:
+                          // try the next model in the fallback list.
+                          if http.statusCode == 404 || http.statusCode == 400 {
+                              lastError = GroqError.networkError("HTTP \(http.statusCode) (model \(model))")
+                              continue
                           }
                           guard (200..<300).contains(http.statusCode) else {
                               throw GroqError.networkError("HTTP \(http.statusCode)")
@@ -2205,20 +2225,15 @@ jobs:
                           return content.trimmingCharacters(in: .whitespacesAndNewlines)
                       } catch let error as URLError where error.code == .timedOut {
                           lastError = GroqError.timeout
-                          if attempt < 1 {
-                              try? await Task.sleep(nanoseconds: UInt64(pow(2.0, Double(attempt)) * 1_000_000_000))
-                              continue
-                          }
+                      } catch let e as GroqError where e.isInvalidOrRate {
+                          // Don't fall through on auth/rate errors — no model switch helps.
+                          throw e
                       } catch {
                           lastError = error
-                          if attempt < 1 && shouldRetry(error) {
-                              try? await Task.sleep(nanoseconds: 1_000_000_000)
-                              continue
-                          }
+                          if !shouldRetry(error) { break }
                       }
-                      break
                   }
-                  throw lastError ?? GroqError.networkError("Unknown error")
+                  throw lastError
               }
               private static func shouldRetry(_ error: Error) -> Bool {
                   if let urlError = error as? URLError {
