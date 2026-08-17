@@ -455,6 +455,13 @@ jobs:
                   return moves
               }
 
+              /// Search using the configured target depth. Reads `targetDepth` on
+              /// the main actor so callers never touch the @Published property
+              /// from a nonisolated context.
+              func searchWithTargetDepth(fen: String, multiPv: Int = 3) async -> [TopMove] {
+                  return await search(fen: fen, depth: targetDepth, multiPv: multiPv)
+              }
+
               // MARK: - Maintenance / diagnostics
 
               /// Human-readable detail about the downloaded NNUE files.
@@ -1143,8 +1150,8 @@ jobs:
               }
 
               // MARK: - Local on-device engine
-              static func callLocalEngine(_ local: LocalEngineService, fen: String, depth: Int, multiPv: Int = 3) async -> [TopMove]? {
-                  let ms = await local.search(fen: fen, depth: depth, multiPv: multiPv)
+              static func callLocalEngine(_ local: LocalEngineService, fen: String, multiPv: Int = 3) async -> [TopMove]? {
+                  let ms = await local.searchWithTargetDepth(fen: fen, multiPv: multiPv)
                   guard !ms.isEmpty else { return nil }
                   let filtered = ms.filter { MoveValidator.isPlausibleMove(uci: $0.uci, fen: fen) }
                   return filtered.isEmpty ? nil : filtered
@@ -1266,11 +1273,11 @@ jobs:
                   //    (fast), then optionally refine with the remote cross-check.
                   var sources: [(key: String, moves: [TopMove], weight: Int)] = []
                   if let local = local {
-                      let lr = await callLocalEngine(local, fen: fen, depth: local.targetDepth, multiPv: 3)
+                      let lr = await callLocalEngine(local, fen: fen, multiPv: 3)
                       try Task.checkCancellation()
                       if let lr = lr, !lr.isEmpty {
                           sources.append(("local", lr, 3))
-                          let ld = lr.map { $0.depth }.max() ?? local.targetDepth
+                          let ld = lr.map { $0.depth }.max() ?? 0
                           let quick = EngineAnalysis(topMoves: lr, bestMove: lr.first, depth: ld,
                                                      sourcesUsed: "🐟 Stockfish", confidence: 3, debugFen: fen)
                           await MainActor.run { onUpdate(quick) }
@@ -1472,28 +1479,22 @@ jobs:
                   let lastMoveUCI: String, plyCount: Int, detectionConfidence: String
                   let bottomColor: String, moveTimeMs: Int
               }
-              private func updateDetectedColor(bottomColor: String, flipped: Bool, flippedConfident: Bool, detConfidence: DetectionConfidence) {
+              // Authoritative color detection. reader.js sends `flipped` read from
+              // chess.com's own "flipped" class on <wc-chess-board> (confident),
+              // falling back to a king-row heuristic only when the class is absent.
+              // flipped == true  -> black is at the bottom -> you are Black.
+              // flipped == false -> you are White.
+              private func updateDetectedColor(flipped: Bool, flippedConfident: Bool) {
                   guard manualPlayerColor == nil else { return }
-                  var candidate: String? = nil
-                  var strong = false
-                  if bottomColor == "w" || bottomColor == "b" {
-                      candidate = bottomColor
-                      strong = true
-                  } else if flippedConfident {
-                      candidate = flipped ? "b" : "w"
-                  }
-                  var agree = false
-                  if flippedConfident, let cand = candidate {
-                      agree = ((flipped ? "b" : "w") == cand)
-                  }
-                  guard let cand = candidate else { return }
+                  guard flippedConfident else { return }
+                  let cand = flipped ? "b" : "w"
                   if pendingColor == cand {
                       pendingColorCount += 1
                   } else {
                       pendingColor = cand
                       pendingColorCount = 1
                   }
-                  if pendingColorCount >= colorCommitThreshold || (strong && agree) {
+                  if pendingColorCount >= colorCommitThreshold {
                       if detectedPlayerColor != cand {
                           detectedPlayerColor = cand
                           previousEvalWhitePOV = nil
@@ -1511,8 +1512,7 @@ jobs:
                   sideToMove = p.sideToMove; lastMoveUCI = p.lastMoveUCI; plyCount = p.plyCount
                   lastMoveThinkMs = p.moveTimeMs
                   confidence = DetectionConfidence(rawValue: p.detectionConfidence) ?? .unknown
-                  updateDetectedColor(bottomColor: p.bottomColor, flipped: p.flipped,
-                                      flippedConfident: p.flippedConfident, detConfidence: confidence)
+                  updateDetectedColor(flipped: p.flipped, flippedConfident: p.flippedConfident)
                   if p.plyCount >= 0 {
                       if p.plyCount == 0 || p.plyCount < lastKnownPly - 2 {
                           resetFenTracker()
@@ -3605,7 +3605,7 @@ jobs:
       - name: Write reader.js
         run: |
           cat > Resources/reader.js <<'EOF'
-          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro2=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function dbc(grid){if(!grid)return"";var w=0,b=0;for(var r=6;r<=7;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;if(p===p.toUpperCase())w++;else b++;}if(w>b)return"w";if(b>w)return"b";return"";}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0)return{flipped:wkR<4,confident:true};if(bkR>=0)return{flipped:bkR>=4,confident:true};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null,lastChangeTs=0,lastPlySent=-1;function sq(r,c){return String.fromCharCode(97+c)+(8-r);}function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];}if(!t)return null;var gone=[];for(var i=0;i<ch.length;i++){if(ch[i].before!=="."&&ch[i].after===".")gone.push(ch[i]);}var uci=null;if(ch.length===4){var kTo=null;for(var i=0;i<ch.length;i++){var e=ch[i];if(e.after==="K"||e.after==="k")kTo=e;}if(kTo){var kc=kTo.after==="K"?"w":"b";if(kc==="w"){if(kTo.r===7&&kTo.c===6)uci="e1g1";else if(kTo.r===7&&kTo.c===2)uci="e1c1";}else{if(kTo.r===0&&kTo.c===6)uci="e8g8";else if(kTo.r===0&&kTo.c===2)uci="e8c8";}}}if(!uci){var f=null;if(gone.length===1){f=gone[0];}else if(gone.length>1){for(var i=0;i<gone.length;i++){var g=gone[i];if(g.c!==t.c&&g.r!==t.r){f=g;break;}}if(!f)f=gone[0];}if(!f)return null;uci=sq(f.r,f.c)+sq(t.r,t.c);if((t.after==="P"&&t.r===0)||(t.after==="p"&&t.r===7))uci+="q";}var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:uci,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}if(p>=0&&p<lastPlySent){prevGrid=null;lastPayload="";lastPlySent=p;lastChangeTs=0;}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var now=Date.now();var moveTimeMs=0;if(m){moveTimeMs=lastChangeTs?now-lastChangeTs:0;lastChangeTs=now;}if(p>=0)lastPlySent=p;var fi=dfl(g);var bc=dbc(g);var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:fi.flipped,flippedConfident:fi.confident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:bc,moveTimeMs:moveTimeMs};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
+          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro2=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function flippedByClass(b){if(!b)return null;var tag=(b.tagName||"").toLowerCase();var isWC=tag==="wc-chess-board";var e=b;while(e){if(e.classList&&e.classList.contains("flipped"))return true;e=e.parentElement;}return isWC?false:null;}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0||bkR>=0)return{flipped:false,confident:false};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null,lastChangeTs=0,lastPlySent=-1;function sq(r,c){return String.fromCharCode(97+c)+(8-r);}function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];}if(!t)return null;var gone=[];for(var i=0;i<ch.length;i++){if(ch[i].before!=="."&&ch[i].after===".")gone.push(ch[i]);}var uci=null;if(ch.length===4){var kTo=null;for(var i=0;i<ch.length;i++){var e=ch[i];if(e.after==="K"||e.after==="k")kTo=e;}if(kTo){var kc=kTo.after==="K"?"w":"b";if(kc==="w"){if(kTo.r===7&&kTo.c===6)uci="e1g1";else if(kTo.r===7&&kTo.c===2)uci="e1c1";}else{if(kTo.r===0&&kTo.c===6)uci="e8g8";else if(kTo.r===0&&kTo.c===2)uci="e8c8";}}}if(!uci){var f=null;if(gone.length===1){f=gone[0];}else if(gone.length>1){for(var i=0;i<gone.length;i++){var g=gone[i];if(g.c!==t.c&&g.r!==t.r){f=g;break;}}if(!f)f=gone[0];}if(!f)return null;uci=sq(f.r,f.c)+sq(t.r,t.c);if((t.after==="P"&&t.r===0)||(t.after==="p"&&t.r===7))uci+="q";}var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:uci,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}if(p>=0&&p<lastPlySent){prevGrid=null;lastPayload="";lastPlySent=p;lastChangeTs=0;}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var now=Date.now();var moveTimeMs=0;if(m){moveTimeMs=lastChangeTs?now-lastChangeTs:0;lastChangeTs=now;}if(p>=0)lastPlySent=p;var cl=flippedByClass(b);var fi=dfl(g);var flipped,flippedConfident;if(cl!==null){flipped=cl;flippedConfident=true;}else{flipped=fi.flipped;flippedConfident=fi.confident;}var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:flipped,flippedConfident:flippedConfident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:"",moveTimeMs:moveTimeMs};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
           EOF
 
       - name: Write adblock_css.css
