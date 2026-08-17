@@ -42,7 +42,7 @@ jobs:
               platform: iOS
               sources:
                 - { path: Sources, excludes: [Engine] }
-                - { path: Sources/Engine/src, compilerFlags: "-std=c++17 -O3 -DNDEBUG -DIS_64BIT -DNO_PREFETCH -DNNUE_EMBEDDING_OFF" }
+                - { path: Sources/Engine/src, compilerFlags: "-std=c++17 -O3 -DNDEBUG -DIS_64BIT -DUSE_NEON -DUSE_POPCNT -DNNUE_EMBEDDING_OFF" }
                 - { path: Sources/Engine/bridge, compilerFlags: "-std=c++17 -O3" }
                 - { path: Resources }
               info:
@@ -102,6 +102,7 @@ jobs:
               private var outBuffer = ""
               private var lineHandler: ((String) -> Void)?
               private var pendingHandshake: ((Bool) -> Void)?
+              private var handshakeTimeout: DispatchWorkItem?
               private var started = false
               private var infos: [Int: EngineInfo] = [:]
               private var searchContinuation: CheckedContinuation<(moves: [TopMove], ms: Int), Never>?
@@ -124,11 +125,14 @@ jobs:
                       }
                       let inFd = self.inPipe
                       let outFd = self.outPipe
+                      // IMPORTANT: do NOT close inFd[0] / outFd[1] here. The engine
+                      // thread dup2()s them onto stdin/stdout inside
+                      // chesshelper_run_engine (which then closes the originals).
+                      // Closing them on this side races the thread and can hand it
+                      // a stale/reused descriptor -> crash or silent engine failure.
                       self.thread = Thread { chesshelper_run_engine(inFd[0], outFd[1]) }
                       self.thread?.name = "ChessHelperEngine"
                       self.thread?.start()
-                      close(inFd[0])
-                      close(outFd[1])
                       let readFd = outFd[0]
                       let src = DispatchSource.makeReadSource(fileDescriptor: readFd, queue: self.queue)
                       src.setEventHandler { [weak self] in self?.readAvailable(readFd) }
@@ -139,11 +143,16 @@ jobs:
                       let handshake: (@escaping (Bool) -> Void) -> Void = { [weak self] done in
                           guard let self = self else { done(false); return }
                           self.pendingHandshake = done
-                          self.queue.asyncAfter(deadline: .now() + 8) { [weak self] in
+                          // Cancel any previous timer so a stale timeout can never
+                          // fire a false "failed" during the next handshake.
+                          self.handshakeTimeout?.cancel()
+                          let wi = DispatchWorkItem { [weak self] in
                               guard let self = self, let h = self.pendingHandshake else { return }
                               self.pendingHandshake = nil
                               h(false)
                           }
+                          self.handshakeTimeout = wi
+                          self.queue.asyncAfter(deadline: .now() + 15, execute: wi)
                       }
 
                       handshake { [weak self] ok1 in
@@ -211,12 +220,16 @@ jobs:
                           self.send("quit\n")
                           self.started = false
                       }
+                      self.handshakeTimeout?.cancel()
+                      self.handshakeTimeout = nil
                       self.readSource?.cancel()
                       self.readSource = nil
                       self.lineHandler = nil
                       self.pendingHandshake = nil
+                      if self.inPipe[0] >= 0 { close(self.inPipe[0]) }
                       if self.inPipe[1] >= 0 { close(self.inPipe[1]) }
                       if self.outPipe[0] >= 0 { close(self.outPipe[0]) }
+                      if self.outPipe[1] >= 0 { close(self.outPipe[1]) }
                       self.inPipe = [-1, -1]
                       self.outPipe = [-1, -1]
                   }
@@ -244,6 +257,7 @@ jobs:
                   if line.hasPrefix("uciok") || line.hasPrefix("readyok") {
                       if let h = pendingHandshake {
                           pendingHandshake = nil
+                          handshakeTimeout?.cancel()
                           h(true)
                       }
                   }
@@ -2349,9 +2363,6 @@ jobs:
               let popularity: Int  // 1-100
           }
 
-          /// Lightweight in-app opening book. Instant (0ms), no network needed.
-          /// Lookup is done on FEN with only board + side-to-move (ignores castling
-          /// and en-passant), so names survive transpositions across the opening.
           actor OpeningBook {
               static let shared = OpeningBook()
               private var book: [String: OpeningInfo] = [:]
@@ -2361,11 +2372,8 @@ jobs:
                   guard !loaded else { return }
                   loaded = true
                   let openings: [(fen: String, name: String, eco: String, moves: [String], winRate: Double, pop: Int)] = [
-                      // ===== STARTING =====
                       ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w", "Starting Position", "A00", ["e4", "d4", "Nf3", "c4"], 0.50, 100),
-                      // ===== KING'S PAWN =====
                       ("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b", "King's Pawn Opening", "B00", ["e5", "c5", "e6", "c6", "Nf6", "d6"], 0.54, 95),
-                      // Sicilian
                       ("rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w", "Sicilian Defense", "B20", ["Nf3", "Nc3", "c3", "d4"], 0.52, 90),
                       ("rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b", "Sicilian: Open", "B30", ["d6", "Nc6", "e6", "g6", "a6", "Nf6"], 0.53, 88),
                       ("rnbqkbnr/pp2pppp/3p4/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R w", "Sicilian: Old", "B32", ["d4", "Bb5+", "c3"], 0.54, 85),
@@ -2379,49 +2387,38 @@ jobs:
                       ("r1bqk2r/pp1pppbp/2n2np1/8/3NP3/2N1B3/PPP2PPP/R2QKB1R w", "Sicilian Dragon: Yugoslav", "B77", ["Qd2", "f3", "Bc4"], 0.55, 75),
                       ("r1b1kb1r/ppqppppp/2n2n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w", "Sicilian Taimanov", "B46", ["Be2", "Be3", "Ndb5"], 0.52, 77),
                       ("r1bqkb1r/pp1ppppp/2n2n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w", "Sicilian Four Knights", "B45", ["Ndb5", "Be2", "Bb5"], 0.51, 70),
-                      // French
                       ("rnbqkbnr/pppp1ppp/4p3/8/4P3/8/PPPP1PPP/RNBQKBNR w", "French Defense", "C00", ["d4", "Nf3", "d3", "Nc3"], 0.53, 85),
                       ("rnbqkbnr/pppp1ppp/4p3/8/3PP3/8/PPP2PPP/RNBQKBNR b", "French: Advance", "C01", ["d5", "Nf6", "c5"], 0.52, 82),
                       ("rnbqkbnr/ppp2ppp/4p3/3p4/3PP3/8/PPP2PPP/RNBQKBNR w", "French: Normal", "C10", ["Nc3", "Nd2", "e5", "exd5"], 0.52, 80),
                       ("rnbqkbnr/ppp2ppp/4p3/3pP3/3P4/8/PPP2PPP/RNBQKBNR b", "French: Advance Var", "C02", ["c5", "Nc6", "Qb6"], 0.51, 78),
                       ("rnbqkb1r/ppp2ppp/4pn2/3p4/3PP3/2N5/PPP2PPP/R1BQKBNR w", "French: Classical", "C13", ["Bg5", "e5", "exd5"], 0.52, 75),
                       ("rnbqk1nr/ppp2ppp/4p3/3p4/1b1PP3/2N5/PPP2PPP/R1BQKBNR w", "French: Winawer", "C15", ["e5", "Bd2", "a3", "Qg4"], 0.52, 76),
-                      // Caro-Kann
                       ("rnbqkbnr/pp1ppppp/2p5/8/4P3/8/PPPP1PPP/RNBQKBNR w", "Caro-Kann Defense", "B10", ["d4", "Nc3", "c4", "Nf3"], 0.52, 82),
                       ("rnbqkbnr/pp1ppppp/2p5/8/3PP3/8/PPP2PPP/RNBQKBNR b", "Caro-Kann: Main", "B12", ["d5", "Nf6"], 0.51, 80),
                       ("rnbqkbnr/pp2pppp/2p5/3p4/3PP3/8/PPP2PPP/RNBQKBNR w", "Caro-Kann: Classical", "B18", ["Nc3", "Nf3", "exd5", "e5"], 0.51, 78),
-                      // Pirc / Modern
                       ("rnbqkbnr/ppp1pppp/3p4/8/4P3/8/PPPP1PPP/RNBQKBNR w", "Pirc Defense", "B07", ["d4", "Nc3", "Nf3"], 0.54, 70),
                       ("rnbqkbnr/pppppp1p/6p1/8/4P3/8/PPPP1PPP/RNBQKBNR w", "Modern Defense", "B06", ["d4", "Nc3", "c4"], 0.54, 65),
-                      // Scandinavian
                       ("rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w", "Scandinavian Defense", "B01", ["exd5", "Nc3", "e5"], 0.55, 72),
                       ("rnb1kbnr/ppp1pppp/8/3q4/8/8/PPPP1PPP/RNBQKBNR w", "Scandinavian: Main", "B01", ["Nc3", "Nf3", "d4"], 0.56, 70),
-                      // Alekhine
                       ("rnbqkb1r/pppppppp/5n2/8/4P3/8/PPPP1PPP/RNBQKBNR w", "Alekhine's Defense", "B02", ["e5", "Nc3", "d3"], 0.54, 65),
-                      // ===== 1.e4 e5 =====
                       ("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w", "King's Knight", "C40", ["Bc4", "Bb5", "d4", "Nc3"], 0.54, 90),
                       ("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b", "Italian Game", "C50", ["Bc5", "Nf6", "Be7", "d6"], 0.53, 88),
                       ("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w", "Italian: Two Knights", "C55", ["d3", "Nc3", "d4", "Ng5"], 0.52, 85),
                       ("r1bqk1nr/pppp1ppp/2n5/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w", "Giuoco Piano", "C53", ["c3", "d3", "b4", "Nc3"], 0.52, 83),
                       ("r1bqk2r/pppp1ppp/2n2n2/2b1p3/2B1P3/2P2N2/PP1P1PPP/RNBQK2R w", "Giuoco Pianissimo", "C54", ["d3", "d4", "O-O"], 0.51, 78),
                       ("r1bqkb1r/pppp1ppp/2n2n2/4p1N1/2B1P3/8/PPPP1PPP/RNBQK2R b", "Italian: Fried Liver", "C57", ["d5", "Na5", "Nxe4"], 0.48, 70),
-                      // Ruy Lopez
                       ("r1bqkbnr/pppp1ppp/2n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R b", "Ruy Lopez", "C60", ["a6", "Nf6", "d6", "Bc5"], 0.53, 90),
                       ("r1bqkbnr/1ppp1ppp/p1n5/1B2p3/4P3/5N2/PPPP1PPP/RNBQK2R w", "Ruy Lopez: Morphy", "C70", ["Ba4", "Bxc6", "d4"], 0.53, 88),
                       ("r1bqkbnr/1ppp1ppp/p1n5/4p3/B3P3/5N2/PPPP1PPP/RNBQK2R b", "Ruy Lopez: Morphy Def", "C77", ["Nf6", "d6", "b5", "Bc5"], 0.52, 85),
                       ("r1bqkb1r/1ppp1ppp/p1n2n2/4p3/B3P3/5N2/PPPP1PPP/RNBQK2R w", "Ruy Lopez: Berlin", "C65", ["O-O", "d3", "Nc3"], 0.51, 83),
                       ("r1bqkb1r/2pp1ppp/p1n2n2/1p2p3/4P3/1B3N2/PPPP1PPP/RNBQK2R w", "Ruy Lopez: Closed", "C84", ["O-O", "c3", "d4"], 0.52, 82),
                       ("r1bq1rk1/2p1bppp/p1np1n2/1p2p3/4P3/1BP2N2/PP1P1PPP/RNBQ1RK1 w", "Ruy Lopez: Marshall", "C89", ["h3", "d4", "c3", "a4"], 0.50, 75),
-                      // Scotch
                       ("r1bqkbnr/pppp1ppp/2n5/4p3/3PP3/5N2/PPP2PPP/RNBQKB1R b", "Scotch Game", "C44", ["exd4", "Nf6", "Bc5"], 0.53, 75),
                       ("r1bqkbnr/pppp1ppp/2n5/8/3pP3/5N2/PPP2PPP/RNBQKB1R w", "Scotch: Main", "C45", ["Nxd4", "Bc4", "c3"], 0.53, 73),
-                      // Petrov
                       ("rnbqkb1r/pppp1ppp/5n2/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w", "Petrov's Defense", "C42", ["Nxe5", "d3", "Nc3"], 0.51, 78),
                       ("rnbqkb1r/pppp1ppp/5n2/4N3/4P3/8/PPPP1PPP/RNBQKB1R b", "Petrov: Classical", "C42", ["d6", "Nxe4", "Qe7"], 0.51, 75),
-                      // Vienna / King's Gambit
                       ("rnbqkbnr/pppp1ppp/8/4p3/4P3/2N5/PPPP1PPP/R1BQKBNR b", "Vienna Game", "C25", ["Nf6", "Nc6", "Bc5", "d6"], 0.53, 65),
                       ("rnbqkbnr/pppp1ppp/8/4p3/4PP2/8/PPPP2PP/RNBQKBNR b", "King's Gambit", "C30", ["exf4", "d5", "Bc5"], 0.51, 60),
-                      // ===== 1.d4 =====
                       ("rnbqkbnr/pppppppp/8/8/3P4/8/PPP1PPPP/RNBQKBNR b", "Queen's Pawn", "A40", ["d5", "Nf6", "e6", "f5", "g6", "c5"], 0.52, 92),
                       ("rnbqkbnr/ppp1pppp/8/3p4/2PP4/8/PP2PPPP/RNBQKBNR b", "Queen's Gambit", "D06", ["e6", "c6", "dxc4", "Nf6"], 0.53, 88),
                       ("rnbqkbnr/ppp2ppp/4p3/3p4/2PP4/8/PP2PPPP/RNBQKBNR w", "Queen's Gambit Declined", "D30", ["Nc3", "Nf3", "Bg5", "e3"], 0.52, 85),
@@ -2429,7 +2426,6 @@ jobs:
                       ("rnbqkbnr/ppp2ppp/4p3/8/2pP4/8/PP2PPPP/RNBQKBNR w", "Queen's Gambit Accepted", "D20", ["e4", "e3", "Nf3"], 0.54, 75),
                       ("rnbqkbnr/pp2pppp/2p5/3p4/2PP4/8/PP2PPPP/RNBQKBNR w", "Slav Defense", "D10", ["Nc3", "Nf3", "cxd5", "e3"], 0.51, 82),
                       ("rnbqkb1r/pp3ppp/2p1pn2/3p4/2PP4/2N2N2/PP2PPPP/R1BQKB1R w", "Semi-Slav Defense", "D43", ["e3", "Bg5", "cxd5"], 0.51, 80),
-                      // Indian
                       ("rnbqkb1r/pppppppp/5n2/8/3P4/8/PPP1PPPP/RNBQKBNR w", "Indian Defense", "A45", ["c4", "Nf3", "Nc3", "Bg5"], 0.52, 90),
                       ("rnbqkb1r/pppppp1p/5np1/8/2PP4/8/PP2PPPP/RNBQKBNR w", "King's Indian Defense", "E60", ["Nc3", "Nf3", "g3"], 0.52, 85),
                       ("rnbqk2r/ppppppbp/5np1/8/2PP4/2N5/PP2PPPP/R1BQKBNR w", "King's Indian: Normal", "E70", ["e4", "Nf3", "Be2"], 0.53, 82),
@@ -2439,11 +2435,9 @@ jobs:
                       ("rnbqkb1r/p1pp1ppp/1p2pn2/8/2PP4/5N2/PP2PPPP/RNBQKB1R w", "Queen's Indian Defense", "E15", ["g3", "Nc3", "a3"], 0.51, 78),
                       ("rnbqkb1r/ppp1pp1p/5np1/3p4/2PP4/2N5/PP2PPPP/R1BQKBNR w", "Grünfeld Defense", "D80", ["cxd5", "Bf4", "Nf3"], 0.52, 78),
                       ("rnbqkb1r/pppp1ppp/4pn2/8/2PP4/6P1/PP2PP1P/RNBQKBNR b", "Catalan Opening", "E01", ["d5", "Be7", "c5"], 0.52, 75),
-                      // London / Trompowsky / Torre
                       ("rnbqkbnr/ppp1pppp/8/3p4/3P1B2/8/PPP1PPPP/RN1QKBNR b", "London System", "D00", ["Nf6", "c5", "e6", "Bf5"], 0.50, 78),
                       ("rnbqkb1r/pppppppp/5n2/6B1/3P4/8/PPP1PPPP/RN1QKBNR b", "Trompowsky Attack", "A45", ["e6", "Ne4", "c5"], 0.52, 65),
                       ("rnbqkb1r/ppp1pppp/5n2/3p4/3P4/5NB1/PPP1PPPP/RN1QKB1R b", "Torre Attack", "D03", ["e6", "Ne4", "Nbd7"], 0.51, 60),
-                      // ===== English / flank =====
                       ("rnbqkbnr/pppppppp/8/8/2P5/8/PP1PPPPP/RNBQKBNR b", "English Opening", "A10", ["e5", "c5", "Nf6", "e6", "g6"], 0.52, 78),
                       ("rnbqkbnr/pppp1ppp/8/4p3/2P5/8/PP1PPPPP/RNBQKBNR w", "English: Reversed Sicilian", "A20", ["Nc3", "g3", "Nf3", "d3"], 0.51, 75),
                       ("rnbqkbnr/pp1ppppp/8/2p5/2P5/8/PP1PPPPP/RNBQKBNR w", "English: Symmetrical", "A30", ["Nc3", "Nf3", "g3", "d4"], 0.51, 72),
@@ -3392,6 +3386,11 @@ jobs:
               dup2(inFD, STDIN_FILENO);
               dup2(outFD, STDOUT_FILENO);
               dup2(outFD, STDERR_FILENO);
+              // Close the original descriptors now that they're duplicated; the
+              // Swift side keeps only its own pipe ends. Doing the close HERE
+              // (not in the Swift spawner) removes the close-after-spawn race.
+              if (inFD > STDERR_FILENO) close(inFD);
+              if (outFD > STDERR_FILENO) close(outFD);
               char prog[] = "stockfish";
               char* argv[] = { prog, nullptr };
               chesshelper_engine_main(1, argv);
