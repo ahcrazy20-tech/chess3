@@ -211,6 +211,7 @@ jobs:
                           self.send("setoption name MultiPV value \(multiPv)\n")
                           self.send("position fen \(fen)\n")
                           self.send("go depth \(effDepth) movetime \(moveTimeMs)\n")
+                          CrashLog.shared.log("Local engine: search depth=\(effDepth) movetime=\(moveTimeMs)")
                           self.queue.asyncAfter(deadline: .now() + .milliseconds(moveTimeMs + 1500)) { [weak self] in
                               guard let self = self, self.searchContinuation != nil else { return }
                               self.send("stop\n")
@@ -250,12 +251,31 @@ jobs:
               private func readAvailable(_ fd: Int32) {
                   var buf = [UInt8](repeating: 0, count: 8192)
                   let n = read(fd, &buf, 8192)
-                  guard n > 0 else { return }
+                  guard n > 0 else {
+                      // EOF / engine died: release anything that is waiting so the
+                      // UI never hangs on a dead engine.
+                      handleEngineDeath()
+                      return
+                  }
                   outBuffer += String(decoding: buf[0..<n], as: UTF8.self)
                   while let idx = outBuffer.firstIndex(of: "\n") {
                       let line = String(outBuffer[..<idx]).trimmingCharacters(in: .whitespacesAndNewlines)
                       outBuffer = String(outBuffer[outBuffer.index(after: idx)...])
                       if !line.isEmpty { handleLine(line) }
+                  }
+              }
+
+              private func handleEngineDeath() {
+                  CrashLog.shared.log("Local engine: pipe closed (engine exited)")
+                  if let h = pendingHandshake {
+                      pendingHandshake = nil
+                      handshakeTimeout?.cancel()
+                      h(false)
+                  }
+                  if let c = searchContinuation {
+                      searchContinuation = nil
+                      lineHandler = nil
+                      c.resume(returning: ([], 0))
                   }
               }
 
@@ -1320,13 +1340,18 @@ jobs:
                       guard MoveValidator.isPlausibleMove(uci: m.uci, fen: fen) else { continue }
                       var cp: Int? = nil
                       var mate: Int? = nil
+                      // Full set of lichess tablebase categories (defensive:
+                      // unknown categories fall through to "draw" instead of
+                      // being silently dropped, so endgames never show no move).
                       switch m.category {
-                      case "win": if tb.checkmate { mate = sign * 1 } else { cp = sign * 9900 }
-                      case "loss": cp = -sign * 9900
-                      case "draw": cp = 0
-                      case "cursed": cp = sign * 60
-                      case "blessed": cp = -sign * 60
-                      default: continue
+                      case "win":        if tb.checkmate { mate = sign * 1 } else { cp = sign * 9900 }
+                      case "loss":       cp = -sign * 9900
+                      case "draw":       cp = 0
+                      case "cursed-win": cp = sign * 50
+                      case "blessed-loss": cp = -sign * 50
+                      case "maybe-win":  cp = sign * 3000
+                      case "maybe-loss": cp = -sign * 3000
+                      default:           cp = 0
                       }
                       out.append(TopMove(rank: 0, uci: m.uci, san: m.uci, evaluationCp: cp, mateIn: mate, depth: 999, source: "tb", votes: 3))
                   }
@@ -1763,7 +1788,14 @@ jobs:
                                   case .badFen(let m): self.errorMessage = "Bad FEN: \(m)"
                                   case .cancelled: break
                                   }
-                              } else { self.isOffline = true; self.errorMessage = "Error"; self.scheduleRetry(fen: fen) }
+                              } else {
+                                  // Any unexpected (non-EngineError) failure: log it
+                                  // and stay usable instead of crashing.
+                                  CrashLog.shared.log("Unexpected analysis failure: \(type(of: error)) \(error)")
+                                  self.isOffline = false
+                                  self.errorMessage = "Analysis failed"
+                                  self.scheduleRetry(fen: fen)
+                              }
                           }
                       }
                   }
