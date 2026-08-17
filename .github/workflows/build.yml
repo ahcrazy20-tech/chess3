@@ -1046,20 +1046,21 @@ jobs:
           // File-scoped global fd used by the async-signal-safe crash handler.
           var ChessHelperCrashLogFD: Int32 = -1
 
-          /// Async-signal-safe handler: only calls write() + strlen() on static
-          /// strings (no allocation), so it is safe to run inside a signal.
+          /// Async-signal-safe handler: only calls write() on static strings
+          /// (no allocation), so it is safe to run inside a signal.
           func chessHelperCrashSignalHandler(_ sig: Int32) {
               if ChessHelperCrashLogFD < 0 { return }
-              let msg: UnsafePointer<Int8>
-              switch sig {
-              case SIGSEGV: msg = "\n===== CRASH =====\nSIGSEGV: bad memory access (dangling pointer / over-release)\n"
-              case SIGABRT: msg = "\n===== CRASH =====\nSIGABRT: abort (force-unwrap nil / index out of range / Swift fatalError)\n"
-              case SIGBUS:  msg = "\n===== CRASH =====\nSIGBUS: bus error (misaligned access)\n"
-              case SIGILL:  msg = "\n===== CRASH =====\nSIGILL: illegal instruction\n"
-              case SIGFPE:  msg = "\n===== CRASH =====\nSIGFPE: arithmetic error (divide by zero)\n"
-              default:      msg = "\n===== CRASH =====\nFatal signal\n"
-              }
-              _ = write(ChessHelperCrashLogFD, msg, Int(strlen(msg)))
+              let msg: StaticString = {
+                  switch sig {
+                  case SIGSEGV: return "\n===== CRASH =====\nSIGSEGV: bad memory access (dangling pointer / over-release)\n"
+                  case SIGABRT: return "\n===== CRASH =====\nSIGABRT: abort (force-unwrap nil / index out of range / Swift fatalError)\n"
+                  case SIGBUS:  return "\n===== CRASH =====\nSIGBUS: bus error (misaligned access)\n"
+                  case SIGILL:  return "\n===== CRASH =====\nSIGILL: illegal instruction\n"
+                  case SIGFPE:  return "\n===== CRASH =====\nSIGFPE: arithmetic error (divide by zero)\n"
+                  default:      return "\n===== CRASH =====\nFatal signal\n"
+                  }
+              }()
+              _ = write(ChessHelperCrashLogFD, msg.utf8Start, Int(msg.utf8CodeUnitCount))
           }
 
           /// Persistent, crash-safe log the user can inspect from Settings.
