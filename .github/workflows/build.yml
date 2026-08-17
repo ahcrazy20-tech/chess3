@@ -158,11 +158,25 @@ jobs:
                       handshake { [weak self] ok1 in
                           guard let self = self, ok1 else { onReady(false); return }
                           self.send("setoption name Threads value 2\n")
+                          self.send("setoption name Hash value 64\n")
                           self.send("setoption name MultiPV value 3\n")
                           if let p = bigNetPath { self.send("setoption name EvalFile value \(p)\n") }
                           if let p = smallNetPath { self.send("setoption name EvalFileSmall value \(p)\n") }
                           self.send("isready\n")
-                          handshake { ok2 in onReady(ok2) }
+                          handshake { [weak self] ok2 in
+                              guard let self = self, ok2 else { onReady(false); return }
+                              // Warm start: run a 1-ply search on the start position so the
+                              // NNUE weights are loaded and the hash is primed. This makes
+                              // the first real search return instantly instead of stalling
+                              // while the net loads.
+                              self.send("position startpos\n")
+                              self.send("go depth 1\n")
+                              self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                                  guard let self = self else { return }
+                                  self.send("stop\n")
+                              }
+                              onReady(true)
+                          }
                       }
                       self.send("uci\n")
                   }
@@ -418,26 +432,29 @@ jobs:
               }
 
               private func downloadOne(url: URL, name: String) async -> Bool {
-                  guard let data = try? await downloadData(url: url) else { return false }
                   let dest = netDirectory.appendingPathComponent(name)
                   do {
-                      try? FileManager.default.removeItem(at: dest)
-                      try data.write(to: dest, options: .atomic)
+                      try await downloadTo(url: url, dest: dest)
                       return true
                   } catch {
+                      CrashLog.shared.log("Net download failed (\(name)): \(error)")
                       return false
                   }
               }
 
-              private func downloadData(url: URL) async throws -> Data {
+              // Streams the file straight to disk (never holds the ~50MB big net
+              // in memory), which avoids the memory-pressure crash that happened
+              // when re-downloading with URLSession.shared.data(for:).
+              private func downloadTo(url: URL, dest: URL) async throws {
                   var req = URLRequest(url: url)
                   req.timeoutInterval = 600
                   req.setValue(StealthConfig.randomUserAgent(), forHTTPHeaderField: "User-Agent")
-                  let (data, resp) = try await URLSession.shared.data(for: req)
-                  guard let http = resp as? HTTPURLResponse, http.statusCode == 200, !data.isEmpty else {
+                  let (tmp, resp) = try await URLSession.shared.download(for: req)
+                  guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
                       throw URLError(.badServerResponse)
                   }
-                  return data
+                  try? FileManager.default.removeItem(at: dest)
+                  try FileManager.default.moveItem(at: tmp, to: dest)
               }
 
               // MARK: - Engine lifecycle
@@ -2173,11 +2190,12 @@ jobs:
                   }
                   // Ordered fallback list: if a model returns 404/400 (deprecated or
                   // removed), we automatically try the next one. Kept current as of
-                  // 2026-08 (llama-3.3-70b-versatile was retired 2026-08-16).
+                  // 2026-08-17. (llama-3.3-70b-versatile AND llama-3.1-8b-instant
+                  // were both retired on 2026-08-16.)
                   let modelFallbacks = [
-                      "openai/gpt-oss-120b",
-                      "qwen/qwen3.6-27b",
-                      "llama-3.1-8b-instant"
+                      "openai/gpt-oss-120b",      // production, strongest free
+                      "openai/gpt-oss-20b",       // production, fast fallback
+                      "qwen/qwen3.6-27b"          // preview, multimodal fallback
                   ]
                   var lastError: Error = GroqError.networkError("Unknown error")
                   for model in modelFallbacks {
