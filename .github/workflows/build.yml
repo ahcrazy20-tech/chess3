@@ -169,7 +169,9 @@ jobs:
               }
 
               /// Runs a UCI search to completion. Returns the moves and elapsed ms.
-              func search(fen: String, depth: Int, multiPv: Int) async -> (moves: [TopMove], ms: Int) {
+              /// `moveTimeMs` caps the search so results always appear in bounded
+              /// time (whichever comes first: the requested depth OR the time cap).
+              func search(fen: String, depth: Int, multiPv: Int, moveTimeMs: Int) async -> (moves: [TopMove], ms: Int) {
                   await withCheckedContinuation { (cont: CheckedContinuation<(moves: [TopMove], ms: Int), Never>) in
                       queue.async { [weak self] in
                           guard let self = self else { cont.resume(returning: ([], 0)); return }
@@ -200,8 +202,8 @@ jobs:
                           }
                           self.send("setoption name MultiPV value \(multiPv)\n")
                           self.send("position fen \(fen)\n")
-                          self.send("go depth \(effDepth)\n")
-                          self.queue.asyncAfter(deadline: .now() + 45) { [weak self] in
+                          self.send("go depth \(effDepth) movetime \(moveTimeMs)\n")
+                          self.queue.asyncAfter(deadline: .now() + .milliseconds(moveTimeMs + 1500)) { [weak self] in
                               guard let self = self, self.searchContinuation != nil else { return }
                               self.send("stop\n")
                               self.queue.asyncAfter(deadline: .now() + 3) { [weak self] in
@@ -297,6 +299,15 @@ jobs:
           }
 
           /// SwiftUI-facing service. All engine plumbing lives in EngineProcess.
+          struct EngineDiagnostic {
+              var netsPresent = false
+              var netsDetail = ""
+              var engineReady = false
+              var responded = false
+              var bestMove = ""
+              var searchMs = 0
+          }
+
           @MainActor
           final class LocalEngineService: ObservableObject {
               enum Status: String {
@@ -312,11 +323,15 @@ jobs:
               @Published var targetDepth: Int {
                   didSet { UserDefaults.standard.set(targetDepth, forKey: "local_engine_depth") }
               }
+              @Published var moveTimeMs: Int {
+                  didSet { UserDefaults.standard.set(moveTimeMs, forKey: "local_engine_movetime") }
+              }
               @Published private(set) var status: Status = .off
               @Published private(set) var statusDetail: String = ""
               @Published private(set) var isDownloading = false
               @Published private(set) var lastSearchMs: Int = 0
               @Published private(set) var lastSearchDepth: Int = 0
+              @Published private(set) var diagnostic: EngineDiagnostic? = nil
 
               static let bigNetURL = URL(string: "https://tests.stockfishchess.org/api/nn/nn-b1a57edbea57.nnue")!
               static let smallNetURL = URL(string: "https://tests.stockfishchess.org/api/nn/nn-baff1ede1f90.nnue")!
@@ -329,7 +344,9 @@ jobs:
               init() {
                   isEnabled = UserDefaults.standard.bool(forKey: "local_engine_enabled")
                   let d = UserDefaults.standard.integer(forKey: "local_engine_depth")
-                  targetDepth = (d >= 10 && d <= 30) ? d : 22
+                  targetDepth = (d >= 10 && d <= 30) ? d : 18
+                  let m = UserDefaults.standard.integer(forKey: "local_engine_movetime")
+                  moveTimeMs = (m >= 300 && m <= 10000) ? m : 1500
               }
 
               // MARK: - Net files (downloaded data, not code)
@@ -432,10 +449,65 @@ jobs:
 
               func search(fen: String, depth: Int, multiPv: Int = 3) async -> [TopMove] {
                   guard await ensureReady() else { return [] }
-                  let (moves, ms) = await process.search(fen: fen, depth: depth, multiPv: multiPv)
+                  let (moves, ms) = await process.search(fen: fen, depth: depth, multiPv: multiPv, moveTimeMs: moveTimeMs)
                   lastSearchMs = ms
                   lastSearchDepth = min(max(depth, 10), 30)
                   return moves
+              }
+
+              // MARK: - Maintenance / diagnostics
+
+              /// Human-readable detail about the downloaded NNUE files.
+              func netsInfo() -> String {
+                  func sizeMB(_ path: String) -> Int64 {
+                      guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                            let sz = attrs[.size] as? NSNumber else { return 0 }
+                      return sz.int64Value / (1024 * 1024)
+                  }
+                  var parts: [String] = []
+                  if let p = bigNetPath { parts.append("big \(sizeMB(p))MB") } else { parts.append("big ✗") }
+                  if let p = smallNetPath { parts.append("small \(sizeMB(p))MB") } else { parts.append("small ✗") }
+                  return parts.joined(separator: " · ")
+              }
+
+              /// Runs a full self-test: checks nets, handshake, and asks the engine
+              /// for a move at a shallow depth. Populates `diagnostic`.
+              func runDiagnostic() async {
+                  var d = EngineDiagnostic()
+                  d.netsPresent = netsReady
+                  d.netsDetail = netsInfo()
+                  guard isEnabled else {
+                      diagnostic = d
+                      return
+                  }
+                  let ok = await ensureReady()
+                  d.engineReady = ok
+                  if ok {
+                      let res = await process.search(fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+                                                     depth: 12, multiPv: 2, moveTimeMs: 1500)
+                      if let b = res.moves.first {
+                          d.responded = true
+                          d.bestMove = b.uci
+                          d.searchMs = res.ms
+                      }
+                  }
+                  diagnostic = d
+              }
+
+              /// Fully restarts the engine process (clears any stuck state).
+              func restartEngine() {
+                  process.stop()
+                  processStarted = false
+                  status = .off
+                  diagnostic = nil
+              }
+
+              /// Deletes the downloaded nets and re-downloads them fresh
+              /// (use when the engine misbehaves / to force a clean reinstall).
+              func resetAndRedownload() async -> Bool {
+                  restartEngine()
+                  try? FileManager.default.removeItem(at: netDirectory)
+                  return await downloadNets()
               }
 
               func stopEngine() {
@@ -634,6 +706,7 @@ jobs:
               @Published var threatAnalysis: String = ""
               @Published var isLoadingThreats = false
               @Published var isPuzzleDetected = false
+              @Published var puzzleIsThreat = false
               @Published var puzzleHint: String = ""
               struct ChatEntry: Identifiable, Equatable {
                   let id = UUID()
@@ -721,17 +794,38 @@ jobs:
                       }
                   }
               }
-              func checkForPuzzle(topMoves: [TopMove]) {
-                  guard topMoves.count >= 2 else { isPuzzleDetected = false; puzzleHint = ""; return }
+              func checkForPuzzle(topMoves: [TopMove], isMyTurn: Bool) {
+                  guard topMoves.count >= 2 else {
+                      isPuzzleDetected = false; puzzleIsThreat = false; puzzleHint = ""
+                      return
+                  }
                   let best = topMoves[0]; let second = topMoves[1]
                   let gap = best.rankScore - second.rankScore
-                  if gap >= 150 || best.mateIn != nil {
+                  // A real tactic means the side-to-move has ONE clearly strong
+                  // move. Two guards kill false positives:
+                  //  1. the best move must itself be winning/strong (not just a
+                  //     big gap inside an already-lost position), and
+                  //  2. the gap to the 2nd-best move must be large enough that
+                  //     only one move "works" (fork/pin/mate pattern).
+                  let bestIsStrong = best.mateIn != nil || (best.evaluationCp ?? 0) >= 150
+                  let onlyOneWorks = gap >= 200
+                  let isTactic = bestIsStrong && onlyOneWorks
+                  if isTactic {
                       isPuzzleDetected = true
-                      if let mate = best.mateIn { puzzleHint = "🧩 M\(abs(mate))!" }
-                      else { puzzleHint = "🧩 +\(Int(gap))cp!" }
+                      puzzleIsThreat = !isMyTurn
+                      if let mate = best.mateIn {
+                          puzzleHint = isMyTurn ? "🧩 M\(abs(mate))!" : "⚠️ M\(abs(mate))!"
+                      } else {
+                          puzzleHint = isMyTurn ? "🧩 +\(Int(gap))cp" : "⚠️ +\(Int(gap))cp"
+                      }
                   } else {
-                      isPuzzleDetected = false; puzzleHint = ""
+                      isPuzzleDetected = false; puzzleIsThreat = false; puzzleHint = ""
                   }
+              }
+              func dismissPuzzle() {
+                  isPuzzleDetected = false
+                  puzzleIsThreat = false
+                  puzzleHint = ""
               }
           }
           '''
@@ -1168,11 +1262,24 @@ jobs:
                       return a
                   }
 
-                  // 1. Kick off every source concurrently
+                  // 1. LOCAL engine first: show its result the moment it is ready
+                  //    (fast), then optionally refine with the remote cross-check.
                   var sources: [(key: String, moves: [TopMove], weight: Int)] = []
-                  var lt: Task<[TopMove]?, Never>? = nil
                   if let local = local {
-                      lt = Task { await callLocalEngine(local, fen: fen, depth: local.targetDepth, multiPv: 3) }
+                      let lr = await callLocalEngine(local, fen: fen, depth: local.targetDepth, multiPv: 3)
+                      try Task.checkCancellation()
+                      if let lr = lr, !lr.isEmpty {
+                          sources.append(("local", lr, 3))
+                          let ld = lr.map { $0.depth }.max() ?? local.targetDepth
+                          let quick = EngineAnalysis(topMoves: lr, bestMove: lr.first, depth: ld,
+                                                     sourcesUsed: "🐟 Stockfish", confidence: 3, debugFen: fen)
+                          await MainActor.run { onUpdate(quick) }
+                          if !deep {
+                              await AnalysisCache.shared.set(fen: fen, moves: lr, depth: ld, sources: "local", confidence: 3)
+                          }
+                          // Fast path: no remote cross-check requested -> return now.
+                          if !remoteCheck { return quick }
+                      }
                   }
                   var t1: Task<[TopMove]?, Never>? = nil
                   var t2: Task<TopMove?, Never>? = nil
@@ -1182,8 +1289,6 @@ jobs:
                       t2 = Task { await callChessApi(fen: fen, deep: deep) }
                       t3 = Task { await callStockfishOnline(fen: fen, deep: deep) }
                   }
-                  if let r = await lt?.value, !r.isEmpty { sources.append(("local", r, 3)) }
-                  try Task.checkCancellation()
                   if let r = await t1?.value, !r.isEmpty { sources.append(("lc", r, 1)) }
                   try Task.checkCancellation()
                   if let r = await t2?.value { sources.append(("cA", [r], 1)) }
@@ -1333,7 +1438,7 @@ jobs:
               weak var localEngine: LocalEngineService?
               init() {
                   enabled = UserDefaults.standard.object(forKey: "assistant_enabled") as? Bool ?? true
-                  useRemoteCrossCheck = UserDefaults.standard.object(forKey: "remote_crosscheck") as? Bool ?? true
+                  useRemoteCrossCheck = UserDefaults.standard.object(forKey: "remote_crosscheck") as? Bool ?? false
               }
               func setManualColor(_ c: String?) {
                   manualPlayerColor = c
@@ -2552,7 +2657,7 @@ jobs:
                       }
                   }
                   .onChange(of: engine.topMoves.count) { _ in
-                      aiVM.checkForPuzzle(topMoves: engine.topMoves)
+                      aiVM.checkForPuzzle(topMoves: engine.topMoves, isMyTurn: engine.isMyTurn)
                       if !engine.topMoves.isEmpty && engine.isMyTurn {
                           HapticManager.moveReady()
                       }
@@ -2569,20 +2674,37 @@ jobs:
                           }
                       } label: {
                           HStack(spacing: 8) {
-                              Image(systemName: "puzzlepiece.fill").foregroundColor(.yellow)
-                              Text(language.isArabic ? "🧩 فرصة تكتيكية! (اضغط للشرح)" : "🧩 Tactical opportunity! (tap for AI)")
-                                  .font(.caption.bold()).foregroundColor(.yellow)
+                              Image(systemName: aiVM.puzzleIsThreat ? "exclamationmark.shield.fill" : "puzzlepiece.fill")
+                                  .foregroundColor(aiVM.puzzleIsThreat ? .orange : .yellow)
+                              Text(aiVM.puzzleIsThreat
+                                   ? (language.isArabic ? "⚠️ تهديد من الخصم! (اضغط للتفاصيل)" : "⚠️ Opponent threat! (tap for details)")
+                                   : (language.isArabic ? "🧩 فرصة تكتيكية! (اضغط للشرح)" : "🧩 Tactical opportunity! (tap for AI)"))
+                                  .font(.caption.bold())
+                                  .foregroundColor(aiVM.puzzleIsThreat ? .orange : .yellow)
                               Spacer()
-                              Text(aiVM.puzzleHint).font(.caption.bold().monospaced()).foregroundColor(.yellow)
+                              Text(aiVM.puzzleHint).font(.caption.bold().monospaced())
+                                  .foregroundColor(aiVM.puzzleIsThreat ? .orange : .yellow)
                               Image(systemName: "sparkles").foregroundColor(.purple).font(.caption)
                           }
                           .padding(.horizontal, 12).padding(.vertical, 8)
-                          .background(Color.yellow.opacity(0.25))
+                          .background((aiVM.puzzleIsThreat ? Color.orange : Color.yellow).opacity(0.22))
                           .cornerRadius(10)
-                          .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.yellow.opacity(0.6), lineWidth: 1))
+                          .overlay(RoundedRectangle(cornerRadius: 10)
+                              .stroke((aiVM.puzzleIsThreat ? Color.orange : Color.yellow).opacity(0.6), lineWidth: 1))
                       }
                       .padding(.horizontal, 20).padding(.top, 6)
                       Spacer()
+                  }
+                  .overlay(alignment: .topTrailing) {
+                      Button {
+                          aiVM.dismissPuzzle()
+                          HapticManager.selection()
+                      } label: {
+                          Image(systemName: "xmark.circle.fill")
+                              .font(.caption)
+                              .foregroundColor(.white.opacity(0.6))
+                      }
+                      .padding(.top, 12).padding(.trailing, 26)
                   }
               }
               private var blunderAlertBanner: some View {
@@ -2681,7 +2803,7 @@ jobs:
                       ✅ تقييم بنِسَب الفوز (win%) - دقة حقيقية
                       ✅ حارس الافتتاحيات - بلا أخطاء كاذبة
                       ✅ جدول نهايات Syzygy - دقة 100%
-                      ✅ محرك Stockfish محلي - عمق 22+ بدون إنترنت
+                      ✅ محرك Stockfish محلي - عمق 18+ بدون إنترنت
                       ✅ كشف Brilliant حقيقي + زمن النقلات
                       ✅ متوسط المحركات + استبعاد الشواذ
                       """ : """
@@ -2690,7 +2812,7 @@ jobs:
                       ✅ Win% based eval - real accuracy
                       ✅ Opening book guard - no fake errors
                       ✅ Syzygy tablebases - 100% endgames
-                      ✅ Local Stockfish - depth 22+ offline
+                      ✅ Local Stockfish - depth 18+ offline
                       ✅ True Brilliant + move timing
                       ✅ Engine median + outlier rejection
                       """)
@@ -3036,7 +3158,7 @@ jobs:
                                           get: { Double(localEngine.targetDepth) },
                                           set: { localEngine.targetDepth = Int($0.rounded()) }
                                       ), in: 10...30, step: 1)
-                                      Text(language.isArabic ? "عمق 22+ = دقة أعلى بكثير من المحركات السحابية" : "Depth 22+ = far stronger than cloud engines")
+                                      Text(language.isArabic ? "عمق 18+ = أسرع وأقوى من المحركات السحابية" : "Depth 18+ = faster & stronger than cloud engines")
                                           .font(.caption2).foregroundColor(.secondary)
                                   }
                                   HStack(spacing: 6) {
@@ -3073,13 +3195,36 @@ jobs:
                                       .onChange(of: engine.useRemoteCrossCheck) { _ in
                                           if !engine.currentFEN.isEmpty { engine.deepAnalyze() }
                                       }
-                                  Button(language.isArabic ? "اختبار المحرك" : "Test engine") {
-                                      Task {
-                                          let startPos = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
-                                          let _ = await localEngine.search(fen: startPos, depth: 14, multiPv: 2)
+                                  VStack(alignment: .leading, spacing: 4) {
+                                      HStack {
+                                          Text(language.isArabic ? "أقصى زمن للبحث" : "Max search time")
+                                          Spacer()
+                                          Text("\(localEngine.moveTimeMs)ms").font(.callout.bold().monospaced()).foregroundColor(.green)
                                       }
+                                      Slider(value: Binding(
+                                          get: { Double(localEngine.moveTimeMs) },
+                                          set: { localEngine.moveTimeMs = Int($0.rounded()) }
+                                      ), in: 500...5000, step: 100)
+                                      Text(language.isArabic ? "النتيجة تظهر خلال هذا الزمن كحد أقصى" : "Results always appear within this time")
+                                          .font(.caption2).foregroundColor(.secondary)
                                   }
-                                  .disabled(localEngine.status != .ready)
+                                  Button(language.isArabic ? "تشخيص المحرك" : "Diagnose engine") {
+                                      Task { await localEngine.runDiagnostic() }
+                                  }
+                                  if let d = localEngine.diagnostic {
+                                      diagnosticView(d)
+                                  }
+                                  Button {
+                                      Task { let _ = await localEngine.resetAndRedownload() }
+                                  } label: {
+                                      Label(language.isArabic ? "إعادة تحميل المحرك من الصفر" : "Re-download engine from scratch", systemImage: "arrow.clockwise.circle")
+                                  }
+                                  .disabled(localEngine.isDownloading)
+                                  Button {
+                                      localEngine.restartEngine()
+                                  } label: {
+                                      Label(language.isArabic ? "إعادة تشغيل المحرك" : "Restart engine", systemImage: "restart.circle")
+                                  }
                               }
                           }
                           Section(header: HStack {
@@ -3152,7 +3297,7 @@ jobs:
                           }
                           Section("About") {
                               LabeledContent("Version", value: "5.3.0 Phase 5")
-                              LabeledContent("Features", value: "win%+Tablebase+Local SF22")
+                              LabeledContent("Features", value: "win%+Tablebase+Local SF18")
                           }
                       }
                       .navigationTitle(language.isArabic ? "الإعدادات" : "Settings")
@@ -3162,6 +3307,35 @@ jobs:
                       }
                   }
               }
+              private func diagnosticView(_ d: EngineDiagnostic) -> some View {
+                  VStack(alignment: .leading, spacing: 4) {
+                      HStack(spacing: 4) {
+                          Image(systemName: (d.netsPresent && d.engineReady && d.responded) ? "checkmark.circle.fill" : "xmark.circle.fill")
+                              .foregroundColor((d.netsPresent && d.engineReady && d.responded) ? .green : .red)
+                          Text(language.isArabic ? "نتيجة التشخيص" : "Diagnostic result").font(.subheadline.bold())
+                      }
+                      Text(d.netsDetail).font(.caption.monospaced()).foregroundColor(.secondary)
+                      Text(language.isArabic ? "الشبكات: \(d.netsPresent ? "✓" : "✗")" : "Networks: \(d.netsPresent ? "✓" : "✗")")
+                          .font(.caption).foregroundColor(d.netsPresent ? .green : .red)
+                      Text(language.isArabic ? "التشغيل: \(d.engineReady ? "✓" : "✗")" : "Engine: \(d.engineReady ? "✓" : "✗")")
+                          .font(.caption).foregroundColor(d.engineReady ? .green : .red)
+                      if d.responded {
+                          Text(language.isArabic ? "رد المحرك: \(d.bestMove) في \(d.searchMs)ms ✓" : "Reply: \(d.bestMove) in \(d.searchMs)ms ✓")
+                              .font(.caption).foregroundColor(.green)
+                      } else {
+                          Text(language.isArabic ? "المحرك لم يرجع أي نقلة" : "Engine returned no move")
+                              .font(.caption).foregroundColor(.red)
+                      }
+                      if d.netsPresent && d.engineReady && d.responded {
+                          Text(language.isArabic ? "✅ المحرك سليم ويعمل بكفاءة" : "✅ Engine healthy and working")
+                              .font(.caption.bold()).foregroundColor(.green)
+                      }
+                  }
+                  .padding(8)
+                  .background(Color.gray.opacity(0.12))
+                  .cornerRadius(8)
+              }
+
               private var localEngineStatusText: String {
                   if !localEngine.netsReady {
                       return language.isArabic ? "يحتاج تحميل الشبكات (~66MB)" : "Needs download (~66MB)"
