@@ -225,7 +225,6 @@ jobs:
                           self.send("setoption name MultiPV value \(multiPv)\n")
                           self.send("position fen \(fen)\n")
                           self.send("go depth \(effDepth) movetime \(moveTimeMs)\n")
-                          CrashLog.shared.log("Local engine: search depth=\(effDepth) movetime=\(moveTimeMs)")
                           self.queue.asyncAfter(deadline: .now() + .milliseconds(moveTimeMs + 1500)) { [weak self] in
                               guard let self = self, self.searchContinuation != nil else { return }
                               self.send("stop\n")
@@ -399,7 +398,17 @@ jobs:
               }
               var bigNetPath: String? { pathFor(Self.bigNetName) }
               var smallNetPath: String? { pathFor(Self.smallNetName) }
-              var netsReady: Bool { bigNetPath != nil && smallNetPath != nil }
+              var netsReady: Bool {
+                  // Validate SIZE too, so a truncated/partial download is never
+                  // treated as "ready" (that caused engine load failures and, in
+                  // turn, repeated re-downloads that ate disk space).
+                  guard let big = bigNetPath, let small = smallNetPath else { return false }
+                  func size(_ p: String) -> Int64 {
+                      let s = (try? FileManager.default.attributesOfItem(atPath: p)[.size] as? NSNumber)?.int64Value ?? 0
+                      return s ?? 0
+                  }
+                  return size(big) > 1_000_000 && size(small) > 100_000
+              }
               private func pathFor(_ name: String) -> String? {
                   let u = netDirectory.appendingPathComponent(name)
                   return FileManager.default.fileExists(atPath: u.path) ? u.path : nil
@@ -1118,6 +1127,8 @@ jobs:
                   return df.string(from: Date())
               }
 
+              private var logCounter = 0
+
               func log(_ message: String) {
                   queue.async { [weak self] in
                       guard let self = self else { return }
@@ -1125,6 +1136,23 @@ jobs:
                       if ChessHelperCrashLogFD >= 0 {
                           _ = line.withCString { write(ChessHelperCrashLogFD, $0, Int(strlen($0))) }
                       }
+                      // Keep the log BOUNDED so it can never fill the device.
+                      // Every 200 lines we check its size; past 2 MB we truncate.
+                      self.logCounter += 1
+                      if self.logCounter >= 200 {
+                          self.logCounter = 0
+                          self.capIfHuge()
+                      }
+                  }
+              }
+
+              private func capIfHuge() {
+                  let path = fileURL.path
+                  guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+                        let size = (attrs[.size] as? NSNumber)?.int64Value, size > 2 * 1024 * 1024 else { return }
+                  if ChessHelperCrashLogFD >= 0 {
+                      ftruncate(ChessHelperCrashLogFD, 0)
+                      lseek(ChessHelperCrashLogFD, 0, SEEK_SET)
                   }
               }
 
@@ -1143,6 +1171,98 @@ jobs:
                           lseek(ChessHelperCrashLogFD, 0, SEEK_SET)
                       }
                   }
+              }
+          }
+          '''
+
+          files["Sources/StorageManager.swift"] = r'''
+          import Foundation
+
+          /// Walks the app sandbox and reports exactly what is using disk space,
+          /// plus cleans up the things that can grow unbounded: the engine NNUE
+          /// nets, leftover temp downloads, and an oversized crash log.
+          final class StorageManager {
+              static let shared = StorageManager()
+              private var fm: FileManager { .default }
+
+              private var docDir: URL { fm.urls(for: .documentDirectory, in: .userDomainMask)[0] }
+              private var appSupport: URL { fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0] }
+              private var tmpDir: URL { fm.temporaryDirectory }
+
+              private func sizeOf(_ url: URL) -> Int64 {
+                  guard let e = fm.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
+                  var total: Int64 = 0
+                  for case let f as URL in e {
+                      let sz = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                      total += Int64(sz)
+                  }
+                  return total
+              }
+
+              private func fmt(_ b: Int64) -> String {
+                  let mb = Double(b) / (1024.0 * 1024.0)
+                  if mb >= 1024 { return String(format: "%.2f GB", mb / 1024.0) }
+                  if mb >= 1 { return String(format: "%.1f MB", mb) }
+                  return "\(b) B"
+              }
+
+              private func largestFiles(limit: Int) -> [(name: String, size: Int64)] {
+                  var files: [(String, Int64)] = []
+                  for root in [docDir, appSupport, tmpDir] {
+                      guard let e = fm.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey]) else { continue }
+                      for case let f as URL in e {
+                          let sz = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                          files.append((f.lastPathComponent, Int64(sz)))
+                      }
+                  }
+                  return files.sorted { $0.1 > $1.1 }.prefix(limit).map { ($0.0, $0.1) }
+              }
+
+              /// Full textual report of every directory + the largest files,
+              /// so the user can see at a glance what is consuming storage.
+              func report() -> String {
+                  let engineDir = appSupport.appendingPathComponent("ChessHelperEngine")
+                  var lines: [String] = []
+                  lines.append("Documents: \(fmt(sizeOf(docDir)))")
+                  lines.append("Application Support: \(fmt(sizeOf(appSupport)))")
+                  lines.append("Temp: \(fmt(sizeOf(tmpDir)))")
+                  lines.append("Engine nets: \(fmt(sizeOf(engineDir)))")
+                  lines.append("")
+                  lines.append("Largest files:")
+                  for f in largestFiles(limit: 15) {
+                      lines.append("• \(f.name) — \(fmt(f.size))")
+                  }
+                  return lines.joined(separator: "\n")
+              }
+
+              /// Deletes leftover temp files and truncates an oversized crash log.
+              /// Returns the number of bytes freed.
+              func cleanUp() -> Int64 {
+                  var freed: Int64 = 0
+                  // 1. Temp directory (orphaned downloads from interrupted transfers)
+                  freed += sizeOf(tmpDir)
+                  if let e = fm.enumerator(at: tmpDir, includingPropertiesForKeys: nil) {
+                      for case let f as URL in e {
+                          try? fm.removeItem(at: f)
+                      }
+                  }
+                  // 2. Crash log if it ballooned
+                  let logURL = CrashLog.shared.fileURL
+                  let logSize = ((try? fm.attributesOfItem(atPath: logURL.path)[.size] as? NSNumber)?.int64Value) ?? 0
+                  if logSize > 1 * 1024 * 1024 {
+                      freed += logSize
+                      CrashLog.shared.clear()
+                  }
+                  return freed
+              }
+
+              /// Deletes ONLY the downloaded engine nets (so they can be
+              /// re-downloaded cleanly), without touching anything else.
+              func deleteEngineNets() -> Int64 {
+                  let dir = appSupport.appendingPathComponent("ChessHelperEngine")
+                  let sz = sizeOf(dir)
+                  try? fm.removeItem(at: dir)
+                  return sz
               }
           }
           '''
@@ -1718,7 +1838,6 @@ jobs:
                   let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
                   if let _ = FenValidator.validate(fen) { return }
                   if fen != currentFEN {
-                      CrashLog.shared.log("Position: \(fen)")
                       previousFEN = currentFEN
                       currentFEN = fen; topMoves = []; evaluation = "—"; winChance = 50
                       errorMessage = ""; sourcesUsed = ""; engineConfidence = 0
@@ -3365,6 +3484,9 @@ jobs:
               @State private var showKeyInput = false
               @State private var showCrashLog = false
               @State private var crashLogText = ""
+              @State private var showStorage = false
+              @State private var storageText = ""
+              @State private var storageCleanupMsg = ""
               var body: some View {
                   NavigationStack {
                       Form {
@@ -3514,6 +3636,27 @@ jobs:
                               Toggle(language.isArabic ? "نقطة صغيرة" : "Tiny dot", isOn: $stealth.minimalMode)
                           }
                           Section(header: HStack {
+                              Image(systemName: "internaldrive").foregroundColor(.blue)
+                              Text(language.isArabic ? "التخزين" : "Storage")
+                          }) {
+                              Button {
+                                  storageText = StorageManager.shared.report()
+                                  showStorage = true
+                              } label: {
+                                  Label(language.isArabic ? "فحص المساحة المستخدمة" : "Inspect storage usage", systemImage: "magnifyingglass")
+                              }
+                              Button {
+                                  let freed = StorageManager.shared.cleanUp()
+                                  storageCleanupMsg = String(format: (language.isArabic ? "تم تحرير %.1f MB ✓" : "Freed %.1f MB ✓"), Double(freed) / (1024.0 * 1024.0))
+                                  HapticManager.success()
+                              } label: {
+                                  Label(language.isArabic ? "تنظيف الملفات المؤقتة" : "Clean temp files", systemImage: "trash.circle")
+                              }
+                              if !storageCleanupMsg.isEmpty {
+                                  Text(storageCleanupMsg).font(.caption).foregroundColor(.green)
+                              }
+                          }
+                          Section(header: HStack {
                               Image(systemName: "ladybug").foregroundColor(.red)
                               Text(language.isArabic ? "سجل الكراش والتشخيص" : "Crash & Diagnostic Log")
                           }) {
@@ -3551,9 +3694,34 @@ jobs:
                       .sheet(isPresented: $showCrashLog) {
                           CrashLogView(text: crashLogText, language: language)
                       }
+                      .sheet(isPresented: $showStorage) {
+                          StorageView(text: storageText, language: language)
+                      }
                       .task {
                           cacheCount = await AnalysisCache.shared.count()
                           apiKeySaved = KeychainStore.load(account: KeychainStore.groqKeyAccount) != nil
+                      }
+                  }
+              }
+              struct StorageView: View {
+                  let text: String
+                  @ObservedObject var language: AppLanguage
+                  @Environment(\.dismiss) var dismiss
+                  var body: some View {
+                      NavigationStack {
+                          ScrollView {
+                              Text(text)
+                                  .font(.caption.monospaced())
+                                  .foregroundColor(.white.opacity(0.85))
+                                  .frame(maxWidth: .infinity, alignment: .leading)
+                                  .padding()
+                          }
+                          .navigationTitle(language.isArabic ? "استخدام التخزين" : "Storage Usage")
+                          .toolbar {
+                              ToolbarItem(placement: .navigationBarLeading) {
+                                  Button(language.isArabic ? "إغلاق" : "Close") { dismiss() }
+                              }
+                          }
                       }
                   }
               }
