@@ -1,4 +1,4 @@
-name: Build ChessHelper v5.3
+name: Build ChessHelper v5.4
 
 on:
   push:
@@ -31,8 +31,8 @@ jobs:
             createIntermediateGroups: true
           settings:
             base:
-              MARKETING_VERSION: "5.3.0"
-              CURRENT_PROJECT_VERSION: "53"
+              MARKETING_VERSION: "5.4.0"
+              CURRENT_PROJECT_VERSION: "54"
               SWIFT_VERSION: "5.9"
               IPHONEOS_DEPLOYMENT_TARGET: "16.0"
               TARGETED_DEVICE_FAMILY: "1,2"
@@ -956,6 +956,18 @@ jobs:
           struct ChessHelperApp: App {
               init() {
                   CrashLog.shared.install()
+                  // Keep the URL cache in RAM only — engine API calls must
+                  // never grow on-disk caches (part of the >5 GB bloat).
+                  URLCache.shared = URLCache(memoryCapacity: 8 << 20, diskCapacity: 0, diskPath: nil)
+                  // Purge WebKit's cache-class data every launch (cookies
+                  // and the chess.com login survive) so the app can never
+                  // creep back to multi-GB "Documents & Data".
+                  Task.detached(priority: .utility) {
+                      let freed = await StorageManager.shared.cleanWebKitCaches()
+                      if freed > 50_000_000 {
+                          CrashLog.shared.log("WebKit auto-clean: \(freed / 1_000_000) MB reclaimed")
+                      }
+                  }
               }
               var body: some Scene {
                   WindowGroup { ContentView().preferredColorScheme(.dark) }
@@ -1177,10 +1189,13 @@ jobs:
 
           files["Sources/StorageManager.swift"] = r'''
           import Foundation
+          import WebKit
 
-          /// Walks the app sandbox and reports exactly what is using disk space,
-          /// plus cleans up the things that can grow unbounded: the engine NNUE
-          /// nets, leftover temp downloads, and an oversized crash log.
+          /// Walks the app sandbox and reports exactly what is using disk
+          /// space, plus cleans up the things that can grow unbounded:
+          /// the WKWebView website data (the multi-GB silent eater under
+          /// Library/WebKit + Library/Caches), the engine NNUE nets,
+          /// leftover temp downloads, and an oversized crash log.
           final class StorageManager {
               static let shared = StorageManager()
               private var fm: FileManager { .default }
@@ -1188,6 +1203,11 @@ jobs:
               private var docDir: URL { fm.urls(for: .documentDirectory, in: .userDomainMask)[0] }
               private var appSupport: URL { fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0] }
               private var tmpDir: URL { fm.temporaryDirectory }
+              /// <sandbox>/Library — WKWebView persists website data here and
+              /// nothing outside this class ever looked at it before.
+              private var libraryDir: URL { docDir.deletingLastPathComponent().appendingPathComponent("Library", isDirectory: true) }
+              private var webKitDir: URL { libraryDir.appendingPathComponent("WebKit", isDirectory: true) }
+              private var cachesDir: URL { libraryDir.appendingPathComponent("Caches", isDirectory: true) }
 
               private func sizeOf(_ url: URL) -> Int64 {
                   guard let e = fm.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
@@ -1208,7 +1228,7 @@ jobs:
 
               private func largestFiles(limit: Int) -> [(name: String, size: Int64)] {
                   var files: [(String, Int64)] = []
-                  for root in [docDir, appSupport, tmpDir] {
+                  for root in [docDir, appSupport, tmpDir, webKitDir, cachesDir] {
                       guard let e = fm.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey]) else { continue }
                       for case let f as URL in e {
                           let sz = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
@@ -1217,6 +1237,9 @@ jobs:
                   }
                   return files.sorted { $0.1 > $1.1 }.prefix(limit).map { ($0.0, $0.1) }
               }
+
+              /// Everything WKWebView persists on disk for the chess sites.
+              func webDataSize() -> Int64 { sizeOf(webKitDir) + sizeOf(cachesDir) }
 
               /// Full textual report of every directory + the largest files,
               /// so the user can see at a glance what is consuming storage.
@@ -1227,6 +1250,7 @@ jobs:
                   lines.append("Application Support: \(fmt(sizeOf(appSupport)))")
                   lines.append("Temp: \(fmt(sizeOf(tmpDir)))")
                   lines.append("Engine nets: \(fmt(sizeOf(engineDir)))")
+                  lines.append("Web data (WebKit): \(fmt(webDataSize()))")
                   lines.append("")
                   lines.append("Largest files:")
                   for f in largestFiles(limit: 15) {
@@ -1254,6 +1278,43 @@ jobs:
                       CrashLog.shared.clear()
                   }
                   return freed
+              }
+
+              // MARK: - WKWebView data (the multi-GB problem)
+
+              /// Cache-class website data only — disk/memory/fetch caches,
+              /// service workers and HTML app-storage. Cookies and login
+              /// survive. Runs automatically at every launch so the app can
+              /// never creep back to multi-GB usage.
+              @discardableResult
+              func cleanWebKitCaches() async -> Int64 {
+                  let before = webDataSize()
+                  let types: Set<String> = [
+                      WKWebsiteDataTypeDiskCache,
+                      WKWebsiteDataTypeMemoryCache,
+                      WKWebsiteDataTypeFetchCache,
+                      WKWebsiteDataTypeServiceWorkerRegistrations,
+                      WKWebsiteDataTypeOfflineWebApplicationStorageCache
+                  ]
+                  await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                      WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: .distantPast) {
+                          cont.resume()
+                      }
+                  }
+                  return before
+              }
+
+              /// Nukes ALL website data (caches, cookies, local storage...).
+              /// You will be logged out of chess.com — manual button only.
+              @discardableResult
+              func wipeAllWebsiteData() async -> Int64 {
+                  let before = webDataSize()
+                  await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                      WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {
+                          cont.resume()
+                      }
+                  }
+                  return before
               }
 
               /// Deletes ONLY the downloaded engine nets (so they can be
@@ -1827,16 +1888,23 @@ jobs:
                           lastKnownPly = p.plyCount
                       }
                   }
+                  // reader.js now ALWAYS sends an absolute board (white on
+                  // ranks 1-2): viewport-relative coords (lichess) are
+                  // un-flipped on the JS side, and chess.com's square-XY
+                  // classes were already absolute. The old 180° mirror here
+                  // corrupted the FEN every time we played Black on
+                  // chess.com -> engine advice for the wrong position.
                   let chars = Array(p.grid); guard chars.count == 64 else { return }
                   var grid: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
                   for r in 0..<8 { for c in 0..<8 { grid[r][c] = chars[r * 8 + c] } }
-                  if p.flipped {
-                      var f: [[Character]] = Array(repeating: Array(repeating: ".", count: 8), count: 8)
-                      for r in 0..<8 { for c in 0..<8 { f[r][c] = grid[7 - r][7 - c] } }
-                      grid = f
-                  }
                   let fen = fenBuilder.build(grid: grid, sideToMove: p.sideToMove, plyCount: p.plyCount)
-                  if let _ = FenValidator.validate(fen) { return }
+                  if let issue = FenValidator.validate(fen) {
+                      // Mid-drag / mid-animation frame: keep the last good
+                      // analysis but surface a warning, so a stale suggestion
+                      // is never trusted blindly.
+                      if fen != currentFEN { errorMessage = "Board read unstable (\(issue))" }
+                      return
+                  }
                   if fen != currentFEN {
                       previousFEN = currentFEN
                       currentFEN = fen; topMoves = []; evaluation = "—"; winChance = 50
@@ -2058,6 +2126,10 @@ jobs:
                   else {
                       if let old = lastGrid, plyCount >= lastPly && plyCount <= lastPly + 2 {
                           detect(old: old, new: grid)
+                      } else if lastGrid != nil && plyCount > lastPly + 2 {
+                          // Frames were skipped: the en-passant right and the
+                          // halfmove clock cannot be reconstructed anymore.
+                          lastEP = nil; hmc = 0
                       }
                       lastGrid = grid; lastPly = plyCount
                   }
@@ -2136,24 +2208,48 @@ jobs:
           files["Sources/FenValidator.swift"] = r'''
           import Foundation
           enum FenValidator {
+              /// Structural sanity + checks that catch a misread board early
+              /// (mirrored grids, mid-drag frames, duplicated pieces), so a
+              /// bad FEN is rejected loudly instead of being silently
+              /// analyzed by the engine.
               static func validate(_ fen: String) -> String? {
                   let parts = fen.split(separator: " ").map(String.init)
                   guard parts.count >= 4 else { return "not enough FEN fields" }
+                  guard parts[1] == "w" || parts[1] == "b" else { return "bad side-to-move field" }
+                  guard parts[2] == "-" || parts[2].allSatisfy({ "KQkq".contains($0) }) else { return "bad castling field" }
                   let ranks = parts[0].split(separator: "/").map(String.init)
                   guard ranks.count == 8 else { return "not 8 ranks" }
-                  var wK = 0, bK = 0, total = 0
-                  for rank in ranks {
-                      var count = 0
+                  var wK = 0, bK = 0, total = 0, wP = 0, bP = 0, wTot = 0, bTot = 0
+                  var wkR = -1, wkC = -1, bkR = -1, bkC = -1
+                  for (rIdx, rank) in ranks.enumerated() {
+                      var count = 0, col = 0
                       for ch in rank {
-                          if let d = ch.wholeNumberValue { count += d }
-                          else { count += 1; total += 1; if ch == "K" { wK += 1 }; if ch == "k" { bK += 1 } }
+                          if let d = ch.wholeNumberValue { count += d; col += d; continue }
+                          guard "KQRBNPkqrbnp".contains(ch) else { return "bad piece char \(ch)" }
+                          count += 1; col += 1; total += 1
+                          if ch.isUppercase { wTot += 1 } else { bTot += 1 }
+                          switch ch {
+                          case "K": wK += 1; wkR = rIdx; wkC = col - 1
+                          case "k": bK += 1; bkR = rIdx; bkC = col - 1
+                          case "P": wP += 1; if rIdx == 7 { return "white pawn on rank 1" }
+                          case "p": bP += 1; if rIdx == 0 { return "black pawn on rank 8" }
+                          default: break
+                          }
                       }
                       if count != 8 { return "rank has \(count) squares" }
                   }
                   if wK != 1 { return "\(wK) white kings" }
                   if bK != 1 { return "\(bK) black kings" }
+                  if wP > 8 { return "\(wP) white pawns" }
+                  if bP > 8 { return "\(bP) black pawns" }
+                  if wTot > 16 { return "\(wTot) white pieces" }
+                  if bTot > 16 { return "\(bTot) black pieces" }
                   if total < 4 { return "only \(total) pieces" }
                   if total > 32 { return "\(total) pieces" }
+                  // Adjacent kings = corrupted read (mid-drag frame / mirror glitch).
+                  if wkR >= 0, bkR >= 0, abs(wkR - bkR) <= 1, abs(wkC - bkC) <= 1 {
+                      return "kings adjacent"
+                  }
                   return nil
               }
           }
@@ -3144,7 +3240,7 @@ jobs:
               var body: some View {
                   VStack(spacing: 14) {
                       Image(systemName: "shield.checkerboard").font(.system(size: 40)).foregroundColor(.green)
-                      Text("Chess Helper v5.3").font(.title2.bold())
+                      Text("Chess Helper v5.4").font(.title2.bold())
                       Text(language.isArabic ? """
                       الدقة القصوى - Phase 5!
 
@@ -3652,6 +3748,23 @@ jobs:
                               } label: {
                                   Label(language.isArabic ? "تنظيف الملفات المؤقتة" : "Clean temp files", systemImage: "trash.circle")
                               }
+                              Button(role: .destructive) {
+                                  Task {
+                                      let freed = await StorageManager.shared.wipeAllWebsiteData()
+                                      let mb = Double(freed) / (1024.0 * 1024.0)
+                                      let amount = mb >= 1024 ? String(format: "%.2f GB", mb / 1024.0) : String(format: "%.1f MB", mb)
+                                      storageCleanupMsg = language.isArabic
+                                          ? "تم تحرير \(amount) من بيانات التصفح ✓ (هتسجل خروج من الموقع)"
+                                          : "Freed \(amount) of browsing data ✓ (site login cleared)"
+                                      HapticManager.success()
+                                  }
+                              } label: {
+                                  Label(language.isArabic ? "مسح بيانات المتصفح (المساحة الكبيرة)" : "Wipe browsing data (the big one)", systemImage: "externaldrive.badge.trash")
+                              }
+                              Text(language.isArabic
+                                   ? "أكبر مساحة هي كاش الموقع (WebKit) وبتتنضف تلقائياً عند كل فتح للبرنامج — زر المسح الكامل بيمسح كل حاجة حتى تسجيل الدخول."
+                                   : "The biggest consumer is the WebKit site cache — auto-purged at every launch. Full wipe clears everything incl. login.")
+                                  .font(.caption2).foregroundColor(.secondary)
                               if !storageCleanupMsg.isEmpty {
                                   Text(storageCleanupMsg).font(.caption).foregroundColor(.green)
                               }
@@ -3686,8 +3799,8 @@ jobs:
                               Button(language.isArabic ? "إخفاء" : "Hide", role: .destructive) { stealth.hide(reason: "manual") }
                           }
                           Section("About") {
-                              LabeledContent("Version", value: "5.3.0 Phase 5")
-                              LabeledContent("Features", value: "win%+Tablebase+Local SF18")
+                              LabeledContent("Version", value: "5.4.0 Phase 6")
+                              LabeledContent("Features", value: "OrientFix+WebKitClean+Local SF18")
                           }
                       }
                       .navigationTitle(language.isArabic ? "الإعدادات" : "Settings")
@@ -4026,7 +4139,7 @@ jobs:
             <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
             <key>CFBundleDisplayName</key><string>Chess Helper</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleShortVersionString</key><string>5.3.0</string>
+            <key>CFBundleShortVersionString</key><string>5.4.0</string>
             <key>CFBundleVersion</key><string>53</string>
             <key>LSRequiresIPhoneOS</key><true/>
             <key>UILaunchScreen</key><dict/>
@@ -4045,7 +4158,7 @@ jobs:
       - name: Write reader.js
         run: |
           cat > Resources/reader.js <<'EOF'
-          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)%?\s*,\s*(-?\d+(?:\.\d+)?)%?/.exec(st);if(m2){var co2=Math.round(parseFloat(m2[1])/12.5),ro2=Math.round(parseFloat(m2[2])/12.5);if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function flippedByClass(b){if(!b)return null;var tag=(b.tagName||"").toLowerCase();var isWC=tag==="wc-chess-board";var e=b;while(e){if(e.classList&&e.classList.contains("flipped"))return true;e=e.parentElement;}return isWC?false:null;}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0||bkR>=0)return{flipped:false,confident:false};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null,lastChangeTs=0,lastPlySent=-1;function sq(r,c){return String.fromCharCode(97+c)+(8-r);}function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];}if(!t)return null;var gone=[];for(var i=0;i<ch.length;i++){if(ch[i].before!=="."&&ch[i].after===".")gone.push(ch[i]);}var uci=null;if(ch.length===4){var kTo=null;for(var i=0;i<ch.length;i++){var e=ch[i];if(e.after==="K"||e.after==="k")kTo=e;}if(kTo){var kc=kTo.after==="K"?"w":"b";if(kc==="w"){if(kTo.r===7&&kTo.c===6)uci="e1g1";else if(kTo.r===7&&kTo.c===2)uci="e1c1";}else{if(kTo.r===0&&kTo.c===6)uci="e8g8";else if(kTo.r===0&&kTo.c===2)uci="e8c8";}}}if(!uci){var f=null;if(gone.length===1){f=gone[0];}else if(gone.length>1){for(var i=0;i<gone.length;i++){var g=gone[i];if(g.c!==t.c&&g.r!==t.r){f=g;break;}}if(!f)f=gone[0];}if(!f)return null;uci=sq(f.r,f.c)+sq(t.r,t.c);if((t.after==="P"&&t.r===0)||(t.after==="p"&&t.r===7))uci+="q";}var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:uci,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}if(p>=0&&p<lastPlySent){prevGrid=null;lastPayload="";lastPlySent=p;lastChangeTs=0;}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var now=Date.now();var moveTimeMs=0;if(m){moveTimeMs=lastChangeTs?now-lastChangeTs:0;lastChangeTs=now;}if(p>=0)lastPlySent=p;var cl=flippedByClass(b);var fi=dfl(g);var flipped,flippedConfident;if(cl!==null){flipped=cl;flippedConfident=true;}else{flipped=fi.flipped;flippedConfident=fi.confident;}var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:flipped,flippedConfident:flippedConfident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:"",moveTimeMs:moveTimeMs};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
+          (function(){if(window.__READER_FLAG__)return;Object.defineProperty(window,"__READER_FLAG__",{value:true,enumerable:false,writable:false,configurable:false});var PM={wp:"P",wn:"N",wb:"B",wr:"R",wq:"Q",wk:"K",bp:"p",bn:"n",bb:"b",br:"r",bq:"q",bk:"k"};var PN={king:"K",queen:"Q",rook:"R",bishop:"B",knight:"N",pawn:"P"};var RGTR=false,RGCLS=false;function fb(){return document.querySelector("wc-chess-board,chess-board,cg-board,.board-layout-chessboard");}function rg(b){RGTR=false;RGCLS=false;var g=[[],[],[],[],[],[],[],[]];for(var i=0;i<8;i++)g[i]=[".",".",".",".",".",".",".","."];var ns=b.querySelectorAll(".piece,piece,[data-piece]");if(!ns.length)return null;var bw=0;try{bw=b.offsetWidth||b.clientWidth||0;}catch(e){bw=0;}for(var k=0;k<ns.length;k++){var n=ns[k],p=null,f=null,r=null;var c=(n.className||"").toString();var parts=c.split(/\s+/);for(var i=0;i<parts.length;i++)if(PM[parts[i]])p=PM[parts[i]];if(!p){var dp=n.getAttribute&&n.getAttribute("data-piece");if(dp&&PM[dp])p=PM[dp];}if(!p){var lp=c.toLowerCase().split(/\s+/);var co=null,na=null;for(var i=0;i<lp.length;i++){if(lp[i]==="white"||lp[i]==="black")co=lp[i];if(PN[lp[i]])na=lp[i];}if(co&&na){var l=PN[na];p=co==="white"?l:l.toLowerCase();}}for(var i=0;i<parts.length;i++){var m=/^square-(\d)(\d)$/.exec(parts[i]);if(m){f=+m[1];r=+m[2];RGCLS=true;}}if(f===null){var ds=n.getAttribute&&n.getAttribute("data-square");if(ds&&ds.length===2){f=ds.charCodeAt(0)-96;r=parseInt(ds[1],10);RGCLS=true;}}if(f===null){var st=(n.getAttribute&&n.getAttribute("style"))||"";var m2=/translate\(\s*(-?\d+(?:\.\d+)?)(%|px)?\s*,\s*(-?\d+(?:\.\d+)?)(%|px)?/.exec(st);if(m2){var vx=parseFloat(m2[1]),vy=parseFloat(m2[3]),ux=m2[2]||"",uy=m2[4]||"",co2=-1,ro2=-1;if(ux==="%"&&uy==="%"){co2=Math.round(vx/100);ro2=Math.round(vy/100);}else if((ux===""||ux==="px")&&(uy===""||uy==="px")&&bw>0){var sq=bw/8;co2=Math.round(vx/sq);ro2=Math.round(vy/sq);}if(co2>=0&&co2<=7&&ro2>=0&&ro2<=7){f=co2+1;r=8-ro2;RGTR=true;}}}if(p&&f&&r&&r>=1&&r<=8&&f>=1&&f<=8)g[8-r][f-1]=p;}return g;}function flipAbs(g){var m=[[],[],[],[],[],[],[],[]];for(var r=0;r<8;r++)for(var c=0;c<8;c++)m[r][c]=g[7-r][7-c];return m;}function flippedByClass(b){if(!b)return null;var tag=(b.tagName||"").toLowerCase();var isWC=tag==="wc-chess-board";var e=b;while(e){if(e.classList&&e.classList.contains("flipped"))return true;e=e.parentElement;}return isWC?false:null;}function dfl(grid){if(!grid)return{flipped:false,confident:false};var wkR=-1,bkR=-1;for(var r=0;r<8;r++)for(var c=0;c<8;c++){if(grid[r][c]==="K")wkR=r;if(grid[r][c]==="k")bkR=r;}if(wkR>=0&&bkR>=0)return{flipped:wkR<bkR,confident:true};if(wkR>=0||bkR>=0)return{flipped:false,confident:false};return{flipped:false,confident:false};}function igv(grid){if(!grid)return false;var wk=0,bk=0,t=0;for(var r=0;r<8;r++)for(var c=0;c<8;c++){var p=grid[r][c];if(p===".")continue;t++;if(p==="K")wk++;if(p==="k")bk++;}return wk===1&&bk===1&&t>=4&&t<=32;}function dp(){var pn=document.querySelectorAll("[data-ply]");if(pn.length){var m=-1;for(var i=0;i<pn.length;i++){var p=parseInt(pn[i].getAttribute("data-ply"),10);if(!isNaN(p)&&p>m)m=p;}if(m>=0)return m;}return -1;}var prevGrid=null,lastPayload="",lastSide="w",tickTimer=null,lastChangeTs=0,lastPlySent=-1;function sq(r,c){return String.fromCharCode(97+c)+(8-r);}function diff(p,c){if(!p||!c)return null;var ch=[];for(var r=0;r<8;r++)for(var x=0;x<8;x++)if(p[r][x]!==c[r][x])ch.push({r:r,c:x,before:p[r][x],after:c[r][x]});if(ch.length<2||ch.length>4)return null;var t=null;for(var i=0;i<ch.length;i++){if(ch[i].after!=="."&&ch[i].after!==ch[i].before)t=ch[i];}if(!t)return null;var gone=[];for(var i=0;i<ch.length;i++){if(ch[i].before!=="."&&ch[i].after===".")gone.push(ch[i]);}var uci=null;if(ch.length===4){var kTo=null;for(var i=0;i<ch.length;i++){var e=ch[i];if(e.after==="K"||e.after==="k")kTo=e;}if(kTo){var kc=kTo.after==="K"?"w":"b";if(kc==="w"){if(kTo.r===7&&kTo.c===6)uci="e1g1";else if(kTo.r===7&&kTo.c===2)uci="e1c1";}else{if(kTo.r===0&&kTo.c===6)uci="e8g8";else if(kTo.r===0&&kTo.c===2)uci="e8c8";}}}if(!uci){var f=null;if(gone.length===1){f=gone[0];}else if(gone.length>1){for(var i=0;i<gone.length;i++){var g=gone[i];if(g.c!==t.c&&g.r!==t.r){f=g;break;}}if(!f)f=gone[0];}if(!f)return null;uci=sq(f.r,f.c)+sq(t.r,t.c);if((t.after==="P"&&t.r===0)||(t.after==="p"&&t.r===7))uci+="q";}var mc=t.after===t.after.toUpperCase()?"w":"b";return{uci:uci,movedColor:mc};}function tick(){var b=fb();if(!b)return;var g=rg(b);if(!g)return;if(!igv(g))return;var side=null,cf="low";var p=dp();if(p>=0){side=(p%2===0)?"w":"b";cf="high";}if(p>=0&&p<lastPlySent){prevGrid=null;lastPayload="";lastPlySent=p;lastChangeTs=0;}var cl=flippedByClass(b);var fi=dfl(g);var flipped,flippedConfident;if(cl!==null){flipped=cl;flippedConfident=true;}else{flipped=fi.flipped;flippedConfident=fi.confident;}if(flipped&&RGTR&&!RGCLS){g=flipAbs(g);}var m=diff(prevGrid,g);if(m&&!side){side=(m.movedColor==="w")?"b":"w";cf="low";}if(!side)side=lastSide;lastSide=side;var now=Date.now();var moveTimeMs=0;if(m){moveTimeMs=lastChangeTs?now-lastChangeTs:0;lastChangeTs=now;}if(p>=0)lastPlySent=p;var gs="";for(var r=0;r<8;r++)for(var c=0;c<8;c++)gs+=g[r][c];var py={grid:gs,sideToMove:side,flipped:flipped,flippedConfident:flippedConfident,lastMoveUCI:m?m.uci:"",plyCount:p,detectionConfidence:cf,bottomColor:"",moveTimeMs:moveTimeMs};var k=JSON.stringify(py);if(k!==lastPayload){lastPayload=k;try{window.webkit.messageHandlers["__BRIDGE_NAME__"].postMessage(py);}catch(e){}prevGrid=g;}}Object.defineProperty(window,"__START_FUNC__",{value:function(){if(tickTimer)return;var iv=__READER_INTERVAL__+Math.floor(Math.random()*150);tickTimer=setInterval(tick,iv);},enumerable:false,writable:false,configurable:false});var lastMutTick=0;try{var mo=new MutationObserver(function(){var now=Date.now();if(now-lastMutTick<400)return;lastMutTick=now;try{tick();}catch(e){}});mo.observe(document.documentElement,{childList:true,subtree:true});}catch(e){}setTimeout(function(){try{window["__START_FUNC__"]();}catch(e){}},400);})();
           EOF
 
       - name: Write adblock_css.css
@@ -4085,19 +4198,19 @@ jobs:
           [ -n "$APP" ] || { echo "Not found"; exit 1; }
           rm -rf Payload && mkdir Payload
           cp -R "$APP" Payload/
-          zip -qr ChessHelper-v5.3-Phase5.ipa Payload
-          ls -lh ChessHelper-v5.3-Phase5.ipa
+          zip -qr ChessHelper-v5.4-Phase6.ipa Payload
+          ls -lh ChessHelper-v5.4-Phase6.ipa
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ChessHelper-v5.3-Phase5
-          path: ChessHelper-v5.3-Phase5.ipa
+          name: ChessHelper-v5.4-Phase6
+          path: ChessHelper-v5.4-Phase6.ipa
           retention-days: 90
 
       - name: Attach to Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ChessHelper-v5.3-Phase5.ipa
+          files: ChessHelper-v5.4-Phase6.ipa
           generate_release_notes: true
