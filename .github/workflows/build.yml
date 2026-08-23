@@ -404,8 +404,7 @@ jobs:
                   // turn, repeated re-downloads that ate disk space).
                   guard let big = bigNetPath, let small = smallNetPath else { return false }
                   func size(_ p: String) -> Int64 {
-                      let s = (try? FileManager.default.attributesOfItem(atPath: p)[.size] as? NSNumber)?.int64Value ?? 0
-                      return s ?? 0
+                      (try? FileManager.default.attributesOfItem(atPath: p)[.size] as? NSNumber)?.int64Value ?? 0
                   }
                   return size(big) > 1_000_000 && size(small) > 100_000
               }
@@ -1282,25 +1281,34 @@ jobs:
 
               // MARK: - WKWebView data (the multi-GB problem)
 
-              /// Cache-class website data only — disk/memory/fetch caches,
-              /// service workers and HTML app-storage. Cookies and login
-              /// survive. Runs automatically at every launch so the app can
-              /// never creep back to multi-GB usage.
-              @discardableResult
-              func cleanWebKitCaches() async -> Int64 {
-                  let before = webDataSize()
-                  let types: Set<String> = [
-                      WKWebsiteDataTypeDiskCache,
-                      WKWebsiteDataTypeMemoryCache,
-                      WKWebsiteDataTypeFetchCache,
-                      WKWebsiteDataTypeServiceWorkerRegistrations,
-                      WKWebsiteDataTypeOfflineWebApplicationStorageCache
-                  ]
+              // WKWebsiteDataStore is @MainActor-isolated; hop there for the
+              // actual removal (sizes are still measured off-main).
+              @MainActor
+              private func removeWebsiteData(_ types: Set<String>) async {
                   await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                       WKWebsiteDataStore.default().removeData(ofTypes: types, modifiedSince: .distantPast) {
                           cont.resume()
                       }
                   }
+              }
+
+              /// Cache-class website data only — disk/memory/fetch caches,
+              /// service workers and the filesystem cache. Cookies and login
+              /// survive. Runs automatically at every launch so the app can
+              /// never creep back to multi-GB usage.
+              /// (OfflineWebApplicationStorageCache is gone from the iOS 18
+              /// SDK — AppCache was removed from WebKit — so it must not be
+              /// referenced or the build fails.)
+              @discardableResult
+              func cleanWebKitCaches() async -> Int64 {
+                  let before = webDataSize()
+                  await removeWebsiteData([
+                      WKWebsiteDataTypeDiskCache,
+                      WKWebsiteDataTypeMemoryCache,
+                      WKWebsiteDataTypeFetchCache,
+                      WKWebsiteDataTypeServiceWorkerRegistrations,
+                      WKWebsiteDataTypeFileSystemCache
+                  ])
                   return before
               }
 
@@ -1309,11 +1317,7 @@ jobs:
               @discardableResult
               func wipeAllWebsiteData() async -> Int64 {
                   let before = webDataSize()
-                  await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                      WKWebsiteDataStore.default().removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) {
-                          cont.resume()
-                      }
-                  }
+                  await removeWebsiteData(WKWebsiteDataStore.allWebsiteDataTypes())
                   return before
               }
 
