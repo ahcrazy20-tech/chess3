@@ -1292,13 +1292,14 @@ jobs:
                   }
               }
 
-              /// Cache-class website data only — disk/memory/fetch caches,
-              /// service workers and the filesystem cache. Cookies and login
-              /// survive. Runs automatically at every launch so the app can
-              /// never creep back to multi-GB usage.
-              /// (OfflineWebApplicationStorageCache is gone from the iOS 18
-              /// SDK — AppCache was removed from WebKit — so it must not be
-              /// referenced or the build fails.)
+              /// Cache-class website data only — disk/memory/fetch caches
+              /// and service workers. Cookies and login survive. Runs
+              /// automatically at every launch so the app can never creep
+              /// back to multi-GB usage.
+              /// (WKWebsiteDataTypeFileSystemCache is macOS-only and is NOT
+              /// declared in the iOS SDK, so it must not be referenced or the
+              /// build fails with "cannot find ... in scope". The iOS
+              /// WKWebsiteDataTypeDiskCache already covers the on-disk cache.)
               @discardableResult
               func cleanWebKitCaches() async -> Int64 {
                   let before = webDataSize()
